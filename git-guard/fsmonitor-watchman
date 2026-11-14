@@ -1,0 +1,5 @@
+#!/bin/sh
+if [ -n "$OMP_HOME_REPO_HOOKS" ] && [ -x "$OMP_HOME_REPO_HOOKS/fsmonitor-watchman" ]; then
+	exec "$OMP_HOME_REPO_HOOKS/fsmonitor-watchman" "$@"
+fi
+exit 0

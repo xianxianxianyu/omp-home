@@ -1,0 +1,3 @@
+#!/bin/sh
+# Launch omp-home from anywhere: builds the UI, starts the hub, opens the browser.
+cd "$(dirname "$0")/.." && exec pnpm --silent start "$@"

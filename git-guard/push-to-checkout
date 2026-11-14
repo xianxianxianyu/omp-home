@@ -1,0 +1,5 @@
+#!/bin/sh
+if [ -n "$OMP_HOME_REPO_HOOKS" ] && [ -x "$OMP_HOME_REPO_HOOKS/push-to-checkout" ]; then
+	exec "$OMP_HOME_REPO_HOOKS/push-to-checkout" "$@"
+fi
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+if [ -n "$OMP_HOME_REPO_HOOKS" ] && [ -x "$OMP_HOME_REPO_HOOKS/pre-merge-commit" ]; then
+	exec "$OMP_HOME_REPO_HOOKS/pre-merge-commit" "$@"
+fi
+exit 0

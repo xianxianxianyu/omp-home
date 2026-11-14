@@ -1,0 +1,135 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { escalationResolution, foldTask, INITIAL, NOTICE_POLICY, noticeFor, renderEnvelope, type TaskEvent, type TaskState } from "../server/core/task.ts";
+
+/** Replay events from a fresh task; returns the final state and the notice each event produced. */
+function replay(events: TaskEvent[], from: TaskState = INITIAL): { state: TaskState; notices: (string | null)[] } {
+	let state = from;
+	const notices: (string | null)[] = [];
+	for (const e of events) {
+		const next = foldTask(state, e);
+		notices.push(noticeFor(state, next, e));
+		state = next;
+	}
+	return { state, notices };
+}
+
+const run = (seq: number): TaskEvent => ({ kind: "run_started", seq });
+const end = (seq: number, stop: "completed" | "aborted" | "error" = "completed", text = "final words"): TaskEvent => ({ kind: "run_ended", seq, stop, text, error: stop === "error" ? "boom" : null });
+const report = (status: "done" | "blocked" | "question" | "progress", summary = `${status} summary`): TaskEvent => ({ kind: "reported", status, summary, details: null });
+const delivered: TaskEvent = { kind: "delivered", outbox: 1, what: "brief" };
+
+test("a report filed during the run is applied when the run ends, with one notice", () => {
+	const { state, notices } = replay([delivered, run(1), report("done"), end(1)]);
+	assert.deepEqual(state, { status: { s: "done" }, runOpen: false, runReport: null });
+	assert.deepEqual(notices, [null, null, null, "done"]);
+});
+
+test("question and blocked reports wait with the worker's summary", () => {
+	const q = replay([delivered, run(1), report("question", "A or B?"), end(1)]);
+	assert.deepEqual(q.state.status, { s: "awaiting", wait: { kind: "question", text: "A or B?" } });
+	assert.equal(q.notices.at(-1), "question");
+	const b = replay([delivered, run(1), report("blocked", "no creds"), end(1)]);
+	assert.deepEqual(b.state.status, { s: "awaiting", wait: { kind: "blocked", text: "no creds" } });
+	assert.equal(NOTICE_POLICY.question.priority, "urgent");
+});
+
+test("a run without a report waits as no_report with the final text; aborts and errors are distinct", () => {
+	assert.deepEqual(replay([delivered, run(1), end(1, "completed", "I stopped here")]).state.status, { s: "awaiting", wait: { kind: "no_report", text: "I stopped here" } });
+	assert.deepEqual(replay([delivered, run(1), end(1, "aborted")]).state.status.s, "awaiting");
+	assert.equal(replay([delivered, run(1), end(1, "aborted")]).notices.at(-1), "stopped");
+	const err = replay([delivered, run(1), end(1, "error")]);
+	assert.deepEqual(err.state.status, { s: "awaiting", wait: { kind: "error", text: "boom" } });
+	assert.equal(err.notices.at(-1), "error");
+});
+
+test("progress mid-run is an info notice; the run end still needs an outcome", () => {
+	const { state, notices } = replay([delivered, run(1), report("progress", "half way"), end(1, "completed", "pausing")]);
+	assert.deepEqual(notices, [null, null, "progress", "stopped"]);
+	assert.equal(state.status.s, "awaiting");
+	assert.match(state.status.s === "awaiting" ? state.status.wait.text : "", /half way[\s\S]*pausing/);
+	assert.equal(NOTICE_POLICY.progress.priority, "info");
+});
+
+test("a late report after the run ended applies immediately", () => {
+	const waiting = replay([delivered, run(1), end(1)]).state;
+	const { state, notices } = replay([report("done")], waiting);
+	assert.equal(state.status.s, "done");
+	assert.deepEqual(notices, ["done"]);
+});
+
+test("human input and a new run reopen a done task; cancelled stays cancelled through a run end", () => {
+	const done = replay([delivered, run(1), report("done"), end(1)]).state;
+	assert.equal(foldTask(done, { kind: "human_input", text: "one more thing" }).status.s, "working");
+	assert.equal(foldTask(done, run(2)).status.s, "working");
+	assert.equal(foldTask(done, { kind: "message_sent", by: "main", text: "fix x", mode: "next", decision: null }).status.s, "working");
+	const cancelled = replay([delivered, run(1), { kind: "cancelled", by: "main", reason: "obsolete" }, end(1, "aborted")]);
+	assert.equal(cancelled.state.status.s, "cancelled");
+	assert.deepEqual(cancelled.notices, [null, null, null, null]);
+});
+
+test("accepting a task mid-run is not undone by the run ending", () => {
+	const { state } = replay([delivered, run(1), { kind: "accepted", reason: "good enough", decision: "D-1" }, end(1)]);
+	assert.equal(state.status.s, "done");
+});
+
+test("process loss interrupts working and approval states only", () => {
+	const lost: TaskEvent = { kind: "process_lost", reason: "hub restarted" };
+	const working = replay([delivered, run(1), lost]);
+	assert.deepEqual(working.state.status, { s: "awaiting", wait: { kind: "interrupted", text: "hub restarted" } });
+	assert.equal(working.notices.at(-1), "interrupted");
+	const question = replay([delivered, run(1), report("question"), end(1), lost]);
+	assert.equal(question.state.status.s === "awaiting" && question.state.status.wait.kind, "question");
+	assert.equal(question.notices.at(-1), null);
+	const approval = replay([delivered, run(1), { kind: "approval_requested", tool: "bash", summary: "rm -rf build" }, lost]);
+	assert.equal(approval.state.status.s === "awaiting" && approval.state.status.wait.kind, "interrupted");
+});
+
+test("approval waits are auto-escalated info notices and resolve back to working", () => {
+	const { state, notices } = replay([delivered, run(1), { kind: "approval_requested", tool: "bash", summary: "git reset --hard" }]);
+	assert.deepEqual(state.status, { s: "awaiting", wait: { kind: "approval", text: "bash: git reset --hard" } });
+	assert.equal(notices.at(-1), "approval");
+	assert.deepEqual(NOTICE_POLICY.approval, { priority: "info", autoEscalate: true });
+	assert.equal(foldTask(state, { kind: "approval_resolved", approved: true }).status.s, "working");
+});
+
+test("provisioning failures wait and a retry returns the task to pending", () => {
+	const failed = replay([{ kind: "provision_failed", step: "env", message: "setup exited 1" }]);
+	assert.deepEqual(failed.state.status, { s: "awaiting", wait: { kind: "provision_failed", text: "env: setup exited 1" } });
+	assert.equal(failed.notices[0], "provision_failed");
+	assert.equal(foldTask(failed.state, { kind: "provision_retry", text: "fixed the recipe" }).status.s, "pending");
+});
+
+test("escalations resolve as human_replied on human action and task_moved otherwise", () => {
+	assert.equal(escalationResolution({ kind: "human_input", text: "yes" }), "human_replied");
+	assert.equal(escalationResolution({ kind: "approval_resolved", approved: false }), "human_replied");
+	assert.equal(escalationResolution({ kind: "message_sent", by: "main", text: "x", mode: "next", decision: null }), "task_moved");
+	assert.equal(escalationResolution({ kind: "message_sent", by: "human", text: "x", mode: "next", decision: null }), "human_replied");
+	assert.equal(escalationResolution({ kind: "cancelled", by: "human", reason: "x" }), "task_moved");
+	assert.equal(escalationResolution(run(1)), null);
+});
+
+test("the envelope names the worktree, env, playbook skills and the rules", () => {
+	const text = renderEnvelope({
+		task: { id: "T-45", title: "Fix login timeout", playbook: "bug-fix", continues: "T-31" },
+		where: { workspace: "deckhand", path: "/r/deckhand.worktrees/task-x", branch: "task/x", base: "main", readonly: false, protectedBranches: ["main"] },
+		env: { vars: { PORT: "41023" }, services: ["postgres"], pools: ["staging-users"], test: { e2e: "pnpm test:e2e" } },
+		pstack: true,
+	});
+	assert.match(text, /^\[omp-home task T-45 · Fix login timeout\]/);
+	assert.match(text, /branch task\/x \(base main\)/);
+	assert.match(text, /PORT=41023/);
+	assert.match(text, /home_lease\(\{pool:"staging-users"\}\)/);
+	assert.match(text, /skill:\/\/pstack-omp, then skill:\/\/poteto-mode and skill:\/\/poteto-mode\/playbooks\/bug-fix\.md/);
+	assert.match(text, /no git push/);
+	assert.match(text, /home_report\(\{status:"question"\}\)/);
+	assert.match(text, /Continues: T-31/);
+	const readonly = renderEnvelope({
+		task: { id: "T-1", title: "Look", playbook: null, continues: null },
+		where: { workspace: "w", path: "/r/w", branch: null, base: null, readonly: true, protectedBranches: ["main"] },
+		env: { vars: {}, services: [], pools: [], test: {} },
+		pstack: false,
+	});
+	assert.match(readonly, /read-only investigation/);
+	assert.doesNotMatch(readonly, /poteto-mode/);
+});

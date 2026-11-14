@@ -1,0 +1,3 @@
+# Worker git hooks
+
+The hub sets worker-only `GIT_CONFIG_*` values for `core.hooksPath` to this directory and exports `OMP_HOME_REPO_HOOKS` as the repository's original, absolute hooks directory (including a custom or Husky hooksPath). `pre-push` always refuses; the other client hooks execute the matching original hook when executable, preserving arguments, input, exit status and normal Git working directory. No repository config is changed. These hooks and the bridge command checks are guardrails, not containment; workers must report a question rather than bypass them. The human retains push/merge/deletion authority.
