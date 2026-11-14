@@ -9,6 +9,7 @@ import type { Language, StateDTO } from "../shared/api.ts";
 import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId } from "../shared/ids.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError, localizeFieldErrors } from "./errors.ts";
+import { pickFolder } from "./folder-picker.ts";
 import { GitError } from "./git.ts";
 import type { Resources } from "./resources.ts";
 import { Hub } from "./hub.ts";
@@ -62,6 +63,11 @@ const setupSchema = z.strictObject({
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(2000).optional() });
 const textSchema = z.object({ text: z.string().min(1).max(20_000) });
 const recipeSchema = z.object({ text: z.string().max(200_000) });
+const inspectSchema = z.object({ path: z.string().min(1).refine(p => path.isAbsolute(p), localizedCheck(validationMessages.absolutePath())) });
+const pickFolderSchema = z.strictObject({
+	title: z.string().max(200).optional(),
+	defaultPath: z.string().refine(p => path.isAbsolute(p), localizedCheck(validationMessages.absolutePath())).optional(),
+});
 const taskStatusFilter = z.enum(["pending", "working", "awaiting", "done", "cancelled", "open", "closed"]);
 const promptSchema = z.strictObject({ text: z.string().min(1).max(20_000), mode: z.enum(["auto", "steer", "followUp"]).optional() });
 const respondSchema = z.strictObject({
@@ -508,7 +514,9 @@ export class HubServer {
 		r("POST", "/api/decisions/:id/revert", ({ params, language }) => hub().revertDecision(parseDecisionId(params[0]), language));
 
 		r("GET", "/api/workspaces", () => hub().workspaces.list(true).map(w => hub().workspaces.dto(w)));
-		r("POST", "/api/workspaces/scan", () => hub().workspaces.scan());
+		r("GET", "/api/workspaces/suggestions", () => hub().workspaces.suggestions());
+		r("GET", "/api/workspaces/inspect", ({ url }) => hub().workspaces.inspect(parse(inspectSchema, { path: url.searchParams.get("path") }).path));
+		r("POST", "/api/pick-folder", ({ body, language }) => pickFolder(parse(pickFolderSchema, body), language));
 		r("POST", "/api/workspaces", async ({ body }) => {
 			const h = hub();
 			const w = await h.workspaces.create(body);

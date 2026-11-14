@@ -79,7 +79,7 @@ export class Hub {
 		this.settings = new SettingsStore(this.db, this.paths);
 		this.ledger = new Ledger(this.db);
 		this.indexer = new Indexer(this.db);
-		this.workspaces = new Workspaces(this.db, this.paths);
+		this.workspaces = new Workspaces(this.db, this.paths, () => this.settings.get().worktreeRoot);
 		this.worktrees = new Worktrees(this.db);
 		this.env = new Env(this.db, this.paths, this.settings, this.workspaces, this.worktrees, () => this.changed("resources"));
 		this.pool = new Pool({

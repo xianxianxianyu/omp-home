@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useHub } from "./hub.tsx";
 import { RuntimePanel } from "./panels/Runtime.tsx";
 import { SettingsPanel } from "./panels/Settings.tsx";
@@ -20,10 +21,20 @@ const SECTIONS = [
 export function SettingsSheet() {
 	const t = useT().shell;
 	const { settingsSection, openSettings, closeSettings } = useHub();
+	const [maximized, setMaximized] = useState(() => localStorage.getItem("omp-home-settings-maximized") === "true");
 	if (settingsSection === null) return null;
 
 	return (
-		<Modal title={t.settings} onClose={closeSettings} wide>
+		<Modal title={t.settings} onClose={closeSettings} wide className={`settings-dialog${maximized ? " maximized" : ""}`} headerActions={
+			<button type="button" className="icon-button settings-maximize" aria-label={maximized ? t.restoreSettings : t.maximizeSettings} title={maximized ? t.restoreSettings : t.maximizeSettings} aria-pressed={maximized} onClick={() => {
+				localStorage.setItem("omp-home-settings-maximized", String(!maximized));
+				setMaximized(!maximized);
+			}}>
+				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true">
+					{maximized ? <><path d="M5 3V1h10v10h-2" /><rect x="1" y="5" width="10" height="10" rx="1" /></> : <rect x="2" y="2" width="12" height="12" rx="1" />}
+				</svg>
+			</button>
+		}>
 			<div className="settings-sheet">
 				<nav className="settings-sheet-nav" aria-label={t.preferences.sectionsLabel}>
 					{SECTIONS.map(({ name }) => (

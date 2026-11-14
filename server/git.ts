@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { RepoInspection } from "../shared/api.ts";
 import type { Db } from "./db.ts";
 import { envMessages } from "./i18n-env.ts";
 import { render, type Message } from "./i18n.ts";
@@ -18,9 +19,9 @@ export class GitError extends Error {
 	}
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
+async function git(cwd: string, args: string[], timeout?: number): Promise<string> {
 	try {
-		const { stdout } = await run("git", args, { cwd, maxBuffer: 16 * 1024 * 1024 });
+		const { stdout } = await run("git", args, { cwd, timeout, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
 		return stdout.trim();
 	} catch (err) {
 		const e = err as { stderr?: string; message: string };
@@ -30,7 +31,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
 
 /** Absolute top-level directory of the repository containing `dir`. Throws when `dir` is not in a git repo. */
 export async function repoRoot(dir: string): Promise<string> {
-	return git(dir, ["rev-parse", "--show-toplevel"]);
+	return git(dir, ["rev-parse", "--show-toplevel"], 5_000);
 }
 
 /** The branch new worktrees fork from: the remote HEAD when known, else the current branch. */
@@ -38,6 +39,50 @@ export async function defaultBase(root: string): Promise<string> {
 	const remoteHead = await git(root, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]).catch(() => "");
 	if (remoteHead) return remoteHead.replace(/^origin\//, "");
 	return git(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+}
+
+type RepoGitInfo = Pick<RepoInspection, "root" | "currentBranch" | "defaultBase" | "branches" | "worktrees" | "remoteUrl" | "dirty">;
+
+export async function inspectGit(dir: string): Promise<RepoGitInfo> {
+	const root = await repoRoot(dir).then(p => fsSync.realpathSync(p), () => null);
+	const empty: RepoGitInfo = { root, currentBranch: null, defaultBase: null, branches: [], worktrees: [], remoteUrl: null, dirty: false };
+	if (!root) return empty;
+	const query = (args: string[]) => git(root, args, 5_000).catch(() => "");
+	const [current, remoteHead, refs, worktrees, remote, status] = await Promise.all([
+		query(["symbolic-ref", "--quiet", "--short", "HEAD"]),
+		query(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]),
+		query(["for-each-ref", "--sort=-committerdate", "--format=%(refname)%09%(committerdate:unix)%09%(symref)", "refs/heads", "refs/remotes"]),
+		query(["worktree", "list", "--porcelain", "-z"]),
+		query(["remote", "get-url", "origin"]),
+		query(["status", "--porcelain"]),
+	]);
+	const branches: RepoInspection["branches"] = [];
+	for (const line of refs.split("\n")) {
+		const [ref, timestamp, symref] = line.split("\t");
+		if (!ref || symref) continue;
+		const isRemote = ref.startsWith("refs/remotes/");
+		const name = ref.replace(/^refs\/(?:heads|remotes)\//, "");
+		branches.push({ name, remote: isRemote, current: !isRemote && name === current, lastCommitAt: Number(timestamp) ? Number(timestamp) * 1000 : null });
+	}
+	const locals = new Set(branches.filter(b => !b.remote).map(b => b.name));
+	const ordered = branches.filter(b => !b.remote || !locals.has(b.name.slice(b.name.indexOf("/") + 1)))
+		.sort((a, b) => Number(a.remote) - Number(b.remote) || Number(b.current) - Number(a.current) || (b.lastCommitAt ?? 0) - (a.lastCommitAt ?? 0));
+	const trees: RepoInspection["worktrees"] = [];
+	for (const block of worktrees.split("\0\0").slice(1)) {
+		const fields = block.split("\0");
+		const treePath = fields.find(f => f.startsWith("worktree "))?.slice(9);
+		if (!treePath) continue;
+		trees.push({ path: treePath, branch: fields.find(f => f.startsWith("branch refs/heads/"))?.slice(18) ?? null, head: fields.find(f => f.startsWith("HEAD "))?.slice(5) ?? "" });
+	}
+	return {
+		root,
+		currentBranch: current || null,
+		defaultBase: remoteHead.replace(/^origin\//, "") || ["main", "master", "trunk", "develop"].find(b => locals.has(b)) || current || null,
+		branches: ordered.slice(0, 50),
+		worktrees: trees,
+		remoteUrl: remote || null,
+		dirty: !!status,
+	};
 }
 
 export interface WorktreeInfo {

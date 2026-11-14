@@ -1,9 +1,10 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeDTO, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
+import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { createMockSessions } from "./mock-sessions.ts";
+import { getT } from "./i18n/runtime.ts";
 
 export function installMock() {
 const now = Date.now();
@@ -24,6 +25,28 @@ const catalog: ModelCatalogDTO = {
 	],
 };
 const workspaces: WorkspaceDTO[] = ["atlas", "console"].map((id, index) => ({ id, name: index ? "Console" : "Atlas", repoPath: `${root}/${id}`, defaultBase: "main", workerModel: null, notesPath: `${home}/repos/${id}.md`, recipePath: `${home}/repos/${id}.env.yaml`, recipeStatus: index ? "missing" : "ok", liveSessions: 1, totalSessions: 1, openTasks: index ? 1 : 3, archived: false }));
+const recipeDraft = 'version: 1\nports: [web]\nenv:\n  PORT: "{port.web}"\nsetup:\n  - pnpm install --frozen-lockfile\ntest:\n  full: pnpm test\n';
+function inspectRepo(path: string): RepoInspection {
+	const name = path.split("/").filter(Boolean).at(-1) ?? "repository";
+	const workspace = workspaces.find(item => item.repoPath === path);
+	const isGit = name !== "documents";
+	return {
+		path, root: isGit ? path : null, name, id: workspace?.id ?? name, registeredAs: workspace?.id ?? null,
+		currentBranch: isGit ? "feature/search" : null, defaultBase: isGit ? "main" : null,
+		branches: isGit ? [
+			{ name: "feature/search", remote: false, current: true, lastCommitAt: now - 3600000 },
+			{ name: "main", remote: false, current: false, lastCommitAt: now - 86400000 },
+			{ name: "origin/release", remote: true, current: false, lastCommitAt: now - 172800000 },
+		] : [],
+		worktrees: isGit ? [{ path: `${root}/${name}-preview`, branch: "preview/layout", head: "a1b2c3d4" }] : [],
+		remoteUrl: isGit ? `git@github.com:demo/${name}.git` : null, dirty: isGit,
+		omp: { sessions: isGit ? 8 : 0, lastUsedAt: isGit ? now - 3 * 86400000 : null, lastTitle: isGit ? "Refine the search experience" : null },
+		stack: isGit ? ["pnpm", "node", "TypeScript"] : [],
+		commands: { install: isGit ? "pnpm install --frozen-lockfile" : null, test: isGit ? "pnpm test" : null, dev: isGit ? "pnpm dev" : null },
+		recipeDraft: isGit ? recipes.get(workspace?.id ?? "")?.text || recipeDraft : null,
+		hasRecipe: workspace?.recipeStatus === "ok",
+	};
+}
 const escalation: EscalationDTO = { id: "E-3", taskId: "T-12", taskTitle: "Choose the account migration strategy", sessionId: "W-12", reason: "The account migration removes a legacy column. I need your approval before changing the data contract.", openedBy: "main", openedAt: now - 180000, seenAt: null, resolvedAt: null, resolution: null };
 const decisions: DecisionDTO[] = [{ id: "D-7", taskId: "T-11", at: now - 420000, summary: "Keep the search index local to each worktree", why: "Isolation makes parallel tests deterministic and avoids shared writes.", revert: "Point SEARCH_DB at the shared development index and restart the service.", reverts: null, revertRequestedAt: null, revertedBy: null }, { id: "D-6", taskId: "T-9", at: now - 3600000, summary: "Use the existing retry policy for transient reads", why: "The established boundary already distinguishes transient errors.", revert: "Revert commit a1b2c3d on task/search-timeouts.", reverts: null, revertRequestedAt: null, revertedBy: null }];
 const tasks: TaskDetail[] = [
@@ -114,6 +137,7 @@ window.setInterval(() => {
 				settings.homePath = text(body, "homePath", home); settings.pstackRoot = body.pstackRoot === null ? null : text(body, "pstackRoot"); setupDone = true; invalidate(["state", "settings"]); return response(state());
 			}
 			if (route === "models") { if (url.searchParams.get("refresh") === "1") catalog.fetchedAt = Date.now(); return response(catalog); }
+			if (route === "pick-folder") return response({ path: `${root}/website` });
 			if (route === "settings") {
 				if (method === "PUT") {
 					const nextAppearance = body.appearance === undefined ? settings.appearance : { ...settings.appearance, ...bodySchema.parse(body.appearance) };
@@ -162,9 +186,26 @@ window.setInterval(() => {
 			}
 			if (route === "decisions") { if (!id) return response(decisions.filter(item => !url.searchParams.get("task") || item.taskId === url.searchParams.get("task"))); const decision = decisions.find(item => item.id === id); if (!decision) return response({ error: "Decision not found" }, 404); decision.revertRequestedAt = Date.now(); invalidate(["decisions", ...(decision.taskId ? [`task:${decision.taskId}` as Topic] : [])]); return response(decision); }
 			if (route === "workspaces") {
-				if (id === "scan") return response(["atlas", "console", "notes", "website"].map(name => ({ name, repoPath: `${root}/${name}`, alreadyAdded: workspaces.some(item => item.repoPath === `${root}/${name}`), isGitRepo: true })));
+				if (id === "suggestions") return response([
+					{ path: `${root}/website`, name: "website", source: "omp" as const, ompSessions: 8, lastUsedAt: now - 3 * 86400000, lastTitle: "Refine the search experience", registeredAs: null },
+					{ path: `${root}/notes`, name: "notes", source: "home" as const, ompSessions: 0, lastUsedAt: null, lastTitle: null, registeredAs: null },
+					{ path: `${root}/atlas`, name: "Atlas", source: "omp" as const, ompSessions: 24, lastUsedAt: now - 3600000, lastTitle: "Incremental search indexing", registeredAs: "atlas" },
+				].map(suggestion => ({ ...suggestion, registeredAs: workspaces.find(workspace => workspace.repoPath === suggestion.path)?.id ?? null })) satisfies RepoSuggestion[]);
+				if (id === "inspect") return response(inspectRepo(url.searchParams.get("path") ?? ""));
 				if (!id && method === "GET") return response(workspaces);
-				if (!id) { const repoPath = text(body, "repoPath"); const workspaceId = text(body, "id") || repoPath.split("/").filter(Boolean).at(-1) || "workspace"; if (workspaces.some(item => item.id === workspaceId)) return response({ error: "Workspace already exists" }, 409); const workspace: WorkspaceDTO = { id: workspaceId, name: text(body, "name", workspaceId), repoPath, defaultBase: text(body, "defaultBase", "main"), workerModel: body.workerModel === null ? null : text(body, "workerModel") || null, notesPath: `${home}/repos/${workspaceId}.md`, recipePath: `${home}/repos/${workspaceId}.env.yaml`, recipeStatus: "missing", liveSessions: 0, totalSessions: 0, openTasks: 0, archived: false }; workspaces.push(workspace); invalidate(["workspaces"]); return response(workspace); }
+				if (!id) {
+					const repoPath = text(body, "repoPath");
+					const workspaceId = text(body, "id") || repoPath.split("/").filter(Boolean).at(-1) || "workspace";
+					if (workspaces.some(item => item.id === workspaceId || item.repoPath === repoPath)) return response({ error: getT().panels.workspaces.alreadyRegistered }, 409);
+					const yaml = text(body, "recipe");
+					if (yaml) {
+						try { const parsed: unknown = parseYaml(yaml); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(); }
+						catch { return response({ error: getT().panels.workspaces.recipeSaveError }, 422); }
+					}
+					const workspace: WorkspaceDTO = { id: workspaceId, name: text(body, "name", workspaceId), repoPath, defaultBase: text(body, "defaultBase", "main"), workerModel: body.workerModel === null ? null : text(body, "workerModel") || null, notesPath: `${home}/repos/${workspaceId}.md`, recipePath: `${home}/repos/${workspaceId}.env.yaml`, recipeStatus: yaml ? "ok" : "missing", liveSessions: 0, totalSessions: 0, openTasks: 0, archived: false };
+					if (yaml) recipes.set(workspaceId, { workspace: workspaceId, path: workspace.recipePath, text: yaml, status: "ok", errors: [] });
+					workspaces.push(workspace); invalidate(["workspaces"]); return response(workspace);
+				}
 				const workspace = workspaces.find(item => item.id === id); if (!workspace) return response({ error: "Workspace not found" }, 404);
 				if (action === "recipe") {
 					const recipe = recipes.get(id) ?? { workspace: id, path: workspace.recipePath, text: "", status: "missing", errors: [] };

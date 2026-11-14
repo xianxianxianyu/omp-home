@@ -45,7 +45,10 @@
  *   POST /api/workspaces/:id/archive        → WorkspaceDTO
  *   GET  /api/workspaces/:id/recipe         → RecipeDTO
  *   PUT  /api/workspaces/:id/recipe {text}  → RecipeDTO          (422 with errors when invalid)
- *   POST /api/workspaces/scan               → ScanCandidate[]    (repo paths named in the home AGENTS.md)
+ *   GET  /api/workspaces/suggestions        → RepoSuggestion[]   (repos named in the home AGENTS.md + git repos you used omp in, newest first)
+ *   GET  /api/workspaces/inspect ?path      → RepoInspection     (any folder; resolves to the git root; never writes)
+ *   POST /api/pick-folder     {title?, defaultPath?} → { path: string | null }  (macOS folder chooser run by the hub; null = cancelled.
+ *                                                      The desktop app uses its native dialog instead.)
  *   GET  /api/resources                     → ResourcesDTO
  *   POST /api/services/:id/start | /stop | /check → ServiceDTO
  *   POST /api/leases/:id/release            → LeaseDTO
@@ -163,15 +166,53 @@ export interface WorkspaceCreate {
 	id?: string;
 	defaultBase?: string;
 	workerModel?: string | null;
+	/** Environment recipe YAML to write when the workspace has none yet (e.g. RepoInspection.recipeDraft, possibly edited). */
+	recipe?: string;
 }
 
 export type WorkspacePatch = Partial<Pick<WorkspaceDTO, "name" | "defaultBase" | "workerModel">>;
 
-export interface ScanCandidate {
-	repoPath: string;
+export interface RepoSuggestion {
+	/** Git root. */
+	path: string;
 	name: string;
-	alreadyAdded: boolean;
-	isGitRepo: boolean;
+	source: "home" | "omp";
+	/** Your own omp sessions whose cwd is inside this repo (from omp's session store); 0 for home-only entries. */
+	ompSessions: number;
+	lastUsedAt: number | null;
+	/** Title of the most recent of those sessions, when omp recorded one. */
+	lastTitle: string | null;
+	/** Workspace id when already registered. */
+	registeredAs: string | null;
+}
+
+export interface RepoInspection {
+	/** The folder as chosen. */
+	path: string;
+	/** Git root containing it; null when it is not inside a git repository. */
+	root: string | null;
+	/** Suggested workspace name (root folder name) and id (slug, unique among workspaces). */
+	name: string;
+	id: string;
+	registeredAs: string | null;
+	currentBranch: string | null;
+	/** Detected default base: origin/HEAD, else main/master/trunk/develop that exists, else the current branch. */
+	defaultBase: string | null;
+	/** Local branches first (current first), then remote-only ones as "origin/x"; newest commit first within each group; at most 50. */
+	branches: { name: string; remote: boolean; current: boolean; lastCommitAt: number | null }[];
+	/** `git worktree list` minus the main checkout. */
+	worktrees: { path: string; branch: string | null; head: string }[];
+	remoteUrl: string | null;
+	dirty: boolean;
+	omp: { sessions: number; lastUsedAt: number | null; lastTitle: string | null };
+	/** Detected toolchain, e.g. ["pnpm", "node"], ["cargo"], ["uv", "python"]. */
+	stack: string[];
+	/** Detected commands, used for the recipe draft. */
+	commands: { install: string | null; test: string | null; dev: string | null };
+	/** A valid environment recipe YAML derived from the above (null when nothing was detected); the repo's existing recipe wins if one exists. */
+	recipeDraft: string | null;
+	/** True when <home>/repos/<id>.env.yaml already exists for the suggested id. */
+	hasRecipe: boolean;
 }
 
 export interface RecipeDTO {

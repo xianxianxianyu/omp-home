@@ -37,7 +37,7 @@ export function RelativeTime({ at }: { at: number | null }) {
 	if (at === null) return <span className="dim">{t.never}</span>;
 	return <time title={format.dateTime(at)} dateTime={new Date(at).toISOString()}>{format.relativeTime(at, now)}</time>;
 }
-export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
+export function Modal({ title, onClose, children, wide, className = "", headerActions }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean; className?: string; headerActions?: ReactNode }) {
 	const t = useT().common;
 	const id = useId();
 	const dialog = useRef<HTMLDivElement>(null);
@@ -63,7 +63,7 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
 		document.addEventListener("keydown", key, true);
 		return () => { document.removeEventListener("keydown", key, true); if (previous?.isConnected) previous.focus(); };
 	}, []);
-	return createPortal(<div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><div data-modal ref={dialog} role="dialog" aria-modal="true" aria-labelledby={id} tabIndex={-1} className={`dialog ${wide ? "wide" : ""}`}><header className="dialog-head"><h2 id={id}>{title}</h2><button className="icon-button" onClick={onClose} aria-label={t.closeDialog}>×</button></header>{children}</div></div>, document.body);
+	return createPortal(<div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><div data-modal ref={dialog} role="dialog" aria-modal="true" aria-labelledby={id} tabIndex={-1} className={`dialog ${wide ? "wide" : ""} ${className}`}><header className="dialog-head"><h2 id={id}>{title}</h2><div className="row">{headerActions}<button className="icon-button" onClick={onClose} aria-label={t.closeDialog}>×</button></div></header>{children}</div></div>, document.body);
 }
 export function Confirm({ title, description, confirmLabel, danger = false, onConfirm, onClose }: { title: string; description: ReactNode; confirmLabel?: string; danger?: boolean; onConfirm: () => Promise<unknown>; onClose: () => void }) {
 	const t = useT().common;

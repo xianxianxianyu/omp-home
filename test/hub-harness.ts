@@ -47,7 +47,7 @@ export interface Hub {
 
 function spawnHub(configDir: string, env: Record<string, string>): ChildProcess {
 	return spawn(process.execPath, [path.join(repoDir, "server/main.ts"), "--port", "0", "--no-open"], {
-		env: { ...process.env, ...env, OMP_HOME_CONFIG_DIR: configDir, OMP_HOME_OMP_BIN: path.join(repoDir, "test/fake-omp.ts") },
+		env: { ...process.env, HOME: path.join(configDir, "user-home"), PI_CODING_AGENT_DIR: path.join(configDir, "agent"), ...env, OMP_HOME_CONFIG_DIR: configDir, OMP_HOME_OMP_BIN: path.join(repoDir, "test/fake-omp.ts") },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 }

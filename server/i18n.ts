@@ -42,6 +42,9 @@ export class LanguageTracker {
 
 const en = {
 	badRequest: () => "bad request",
+	chooseRepositoryFolder: () => "Choose a repository folder",
+	folderPickerUnsupported: () => "The folder picker is only available on macOS. Enter the folder path instead.",
+	folderPickerFailed: () => "Could not open the folder picker. Try again or enter the folder path.",
 	forbiddenHost: () => "forbidden host",
 	unauthorized: () => "missing or wrong token; open the URL the hub printed at startup",
 	noRoute: (method: string, pathname: string) => `no route ${method} ${pathname}`,
@@ -104,6 +107,9 @@ const taskStates: Record<string, string> = { pending: "排队中", working: "进
 
 export const messages = defineMessages(en, {
 	badRequest: () => "请求无效",
+	chooseRepositoryFolder: () => "选择仓库文件夹",
+	folderPickerUnsupported: () => "文件夹选择器仅支持 macOS。也可以直接输入文件夹路径。",
+	folderPickerFailed: () => "无法打开文件夹选择器。重试或直接输入文件夹路径。",
 	forbiddenHost: () => "不允许访问此主机",
 	unauthorized: () => "访问令牌缺失或错误；打开中枢启动时显示的链接",
 	noRoute: (method, pathname) => `找不到接口 ${method} ${pathname}`,

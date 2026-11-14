@@ -21,6 +21,17 @@ export const appearance = z.object({ theme: z.enum(THEMES), accent: z.enum(ACCEN
 const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.enum(THINKING_LEVELS), workerModel: nullableText, workerThinking: z.enum(THINKING_LEVELS), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText, appearance, language: z.enum(LANGUAGE_SETTINGS) });
 const modelCatalog = z.object({ models: z.array(z.object({ selector: z.string(), provider: z.string(), id: z.string(), name: z.string(), contextWindow: z.number().nullable(), maxTokens: z.number().nullable(), reasoning: z.boolean(), thinking: z.array(z.enum(THINKING_LEVELS)), input: z.array(z.string()), cost: z.object({ input: z.number(), output: z.number() }).nullable() })), defaultModel: nullableText, fetchedAt: z.number(), error: nullableText });
 const recipe = z.object({ workspace: z.string(), path: z.string(), text: z.string(), status: z.enum(["missing", "ok", "invalid"]), errors: z.array(fieldError) });
+const repoSuggestion = z.object({ path: z.string(), name: z.string(), source: z.enum(["home", "omp"]), ompSessions: z.number(), lastUsedAt: z.number().nullable(), lastTitle: nullableText, registeredAs: nullableText });
+const repoInspection = z.object({
+	path: z.string(), root: nullableText, name: z.string(), id: z.string(), registeredAs: nullableText,
+	currentBranch: nullableText, defaultBase: nullableText,
+	branches: z.array(z.object({ name: z.string(), remote: z.boolean(), current: z.boolean(), lastCommitAt: z.number().nullable() })),
+	worktrees: z.array(z.object({ path: z.string(), branch: nullableText, head: z.string() })),
+	remoteUrl: nullableText, dirty: z.boolean(),
+	omp: z.object({ sessions: z.number(), lastUsedAt: z.number().nullable(), lastTitle: nullableText }),
+	stack: z.array(z.string()), commands: z.object({ install: nullableText, test: nullableText, dev: nullableText }),
+	recipeDraft: nullableText, hasRecipe: z.boolean(),
+});
 const topic = z.union([z.enum(["state", "tasks", "sessions", "inbox", "decisions", "workspaces", "resources", "settings"]), z.templateLiteral(["task:", z.string()])]);
 export const uiEvent = z.discriminatedUnion("t", [z.object({ t: z.literal("invalidate"), topics: z.array(topic) }), z.object({ t: z.literal("focus"), sessionId: z.string(), escalationId: nullableText, reason: z.string() }), z.object({ t: z.literal("toast"), level: z.enum(["info", "error"]), text: z.string() })]);
 
@@ -42,7 +53,9 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p.startsWith("/api/escalations/")) schema = escalation;
 	else if (p === "/api/decisions") schema = z.array(decision);
 	else if (p.startsWith("/api/decisions/")) schema = decision;
-	else if (p === "/api/workspaces/scan") schema = z.array(z.object({ repoPath: z.string(), name: z.string(), alreadyAdded: z.boolean(), isGitRepo: z.boolean() }));
+	else if (p === "/api/pick-folder") schema = z.object({ path: nullableText });
+	else if (p === "/api/workspaces/suggestions") schema = z.array(repoSuggestion);
+	else if (p === "/api/workspaces/inspect") schema = repoInspection;
 	else if (p.endsWith("/recipe")) schema = recipe;
 	else if (p === "/api/workspaces") schema = Array.isArray(data) ? z.array(workspace) : workspace;
 	else if (p.startsWith("/api/workspaces/")) schema = workspace;

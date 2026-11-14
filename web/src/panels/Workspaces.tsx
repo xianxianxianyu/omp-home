@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import type { FieldError, RecipeDTO, ScanCandidate, SettingsDTO, WorkspaceCreate, WorkspaceDTO, WorkspacePatch } from "../../../shared/api.ts";
+import type { FieldError, RecipeDTO, RepoInspection, SettingsDTO, WorkspaceDTO, WorkspacePatch } from "../../../shared/api.ts";
 import { api, ApiError } from "../api.ts";
 import { useHub, useResource } from "../hub.tsx";
 import { useI18n, useT } from "../i18n/index.tsx";
@@ -8,38 +8,35 @@ import { getT } from "../i18n/runtime.ts";
 import { Button, Confirm, CopyButton, Empty, ErrorState, Field, Loading, Modal, Section, Status } from "../ui.tsx";
 import { ModelPicker, useModelCatalog } from "../ModelPicker.tsx";
 
-const RECIPE_EXAMPLE = `# Environment recipe for this workspace.
-# Uncomment and adapt only the settings your project needs.
-version: 1
-# env:
-#   NODE_ENV: test
-#   PROJECT_DIR: "{worktree}"
-# setup:
-#   - "cd {worktree} && npm ci"
-# teardown:
-#   - "echo Cleaning up {branch}"
-`;
+import { AddRepository, BranchPicker } from "./AddRepository.tsx";
+import { RecipeSummary } from "../RecipeSummary.tsx";
 
 export function WorkspacesPanel() {
 	const t = useT().panels;
 	const { format } = useI18n();
 	const { data, error, loading, reload } = useResource<WorkspaceDTO[]>("workspaces", "/api/workspaces");
 	const { mutate, toast } = useHub();
-	const [editor, setEditor] = useState<WorkspaceDTO | "new" | null>(null);
+	const [editor, setEditor] = useState<WorkspaceDTO | null>(null);
+	const [adding, setAdding] = useState(false);
+	const [highlighted, setHighlighted] = useState<string | null>(null);
+	const highlightedRow = useRef<HTMLElement>(null);
 	const [recipe, setRecipe] = useState<WorkspaceDTO | null>(null);
 	const [archive, setArchive] = useState<WorkspaceDTO | null>(null);
+	useEffect(() => { highlightedRow.current?.scrollIntoView({ block: "nearest" }); }, [highlighted, data]);
+
+	if (adding) return <AddRepository onClose={() => setAdding(false)} onAdded={workspace => { setAdding(false); setHighlighted(workspace.id); reload(); }} onOpen={id => { setAdding(false); setHighlighted(id); setEditor(data?.find(workspace => workspace.id === id) ?? null); }} />;
 
 	return (
 		<div className="stack">
 			<div className="panel-heading">
 				<div><h2>{t.workspaces.title}</h2><p className="muted">{t.workspaces.description}</p></div>
-				<Button className="primary" onClick={() => setEditor("new")}>{t.workspaces.add}</Button>
+				<Button className="primary add-repository-trigger" onClick={() => setAdding(true)}>{t.workspaces.add}</Button>
 			</div>
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data?.length === 0 && <Empty title={t.workspaces.empty}>{t.workspaces.emptyDescription}</Empty>}
 			{data?.map((workspace) => (
-				<article className="card" key={workspace.id}>
+				<article className={`card workspace-row${highlighted === workspace.id ? " highlighted" : ""}`} data-workspace={workspace.id} ref={highlighted === workspace.id ? highlightedRow : undefined} key={workspace.id}>
 					<div className="row wrap">
 						<h3 className="grow">{workspace.name} <span className="muted mono">{workspace.id}</span></h3>
 						{workspace.archived && <Status value="archived" />}
@@ -59,7 +56,7 @@ export function WorkspacesPanel() {
 					</div>
 				</article>
 			))}
-			{editor && <WorkspaceEditor workspace={editor === "new" ? undefined : editor} onClose={() => setEditor(null)} />}
+			{editor && <WorkspaceEditor workspace={editor} onClose={() => setEditor(null)} />}
 			{recipe && <RecipeEditor workspace={recipe} onClose={() => setRecipe(null)} />}
 			{archive && (
 				<Confirm
@@ -79,156 +76,52 @@ export function WorkspacesPanel() {
 	);
 }
 
-function WorkspaceEditor({ workspace, onClose }: { workspace?: WorkspaceDTO; onClose: () => void }) {
+function WorkspaceEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose: () => void }) {
 	const t = useT().panels;
-	const { format } = useI18n();
 	const { mutate, toast } = useHub();
 	const catalog = useModelCatalog();
 	const settings = useResource<SettingsDTO>("settings", "/api/settings");
-	const [repoPath, setRepoPath] = useState(workspace?.repoPath ?? "");
-	const [name, setName] = useState(workspace?.name ?? "");
-	const [id, setId] = useState("");
-	const [defaultBase, setDefaultBase] = useState(workspace?.defaultBase ?? "");
-	const [workerModel, setWorkerModel] = useState(workspace?.workerModel ?? "");
+	const inspection = useResource<RepoInspection>("workspaces", `/api/workspaces/inspect?path=${encodeURIComponent(workspace.repoPath)}`);
+	const [name, setName] = useState(workspace.name);
+	const [defaultBase, setDefaultBase] = useState(workspace.defaultBase);
+	const [workerModel, setWorkerModel] = useState(workspace.workerModel);
 	const [saving, setSaving] = useState(false);
 	const [formError, setFormError] = useState<string | null>(null);
 	const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
-	const [candidates, setCandidates] = useState<ScanCandidate[] | null>(null);
-	const [selected, setSelected] = useState<Set<string>>(new Set());
-	const [scanning, setScanning] = useState(false);
-	const [adding, setAdding] = useState(false);
-	const [scanError, setScanError] = useState<string | null>(null);
-	const busy = saving || scanning || adding;
 
 	async function save(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
-		if (busy) return;
+		if (saving) return;
 		setSaving(true);
 		setFormError(null);
 		setFieldErrors([]);
 		try {
-			if (workspace) {
-				const patch: WorkspacePatch = { name: name.trim(), defaultBase: defaultBase.trim(), workerModel: workerModel.trim() || null };
-				await mutate(`/api/workspaces/${encodeURIComponent(workspace.id)}`, patch, "PATCH");
-			} else {
-				const body: WorkspaceCreate = {
-					repoPath: repoPath.trim(),
-					...(name.trim() ? { name: name.trim() } : {}),
-					...(id.trim() ? { id: id.trim() } : {}),
-					...(defaultBase.trim() ? { defaultBase: defaultBase.trim() } : {}),
-					...(workerModel.trim() ? { workerModel: workerModel.trim() } : {}),
-				};
-				await mutate("/api/workspaces", body);
-			}
-			toast(t => workspace ? t.panels.workspaces.updated : t.panels.workspaces.added);
+			const patch: WorkspacePatch = { name: name.trim(), defaultBase, workerModel };
+			await mutate(`/api/workspaces/${encodeURIComponent(workspace.id)}`, patch, "PATCH");
+			toast(t => t.panels.workspaces.updated);
 			onClose();
 		} catch (error) {
 			setFormError(error instanceof Error ? error.message : t.workspaces.saveError);
 			if (error instanceof ApiError) setFieldErrors(error.errors);
-		} finally {
-			setSaving(false);
-		}
+		} finally { setSaving(false); }
 	}
 
-	async function scan() {
-		setScanning(true);
-		setScanError(null);
-		try {
-			const found = await mutate<ScanCandidate[]>("/api/workspaces/scan");
-			setCandidates(found);
-			setSelected(new Set(found.filter((candidate) => candidate.isGitRepo && !candidate.alreadyAdded).map((candidate) => candidate.repoPath)));
-		} catch (error) {
-			setScanError(error instanceof Error ? error.message : t.workspaces.scanError);
-		} finally {
-			setScanning(false);
-		}
-	}
-
-	async function addSelected() {
-		setAdding(true);
-		setScanError(null);
-		let added = 0;
-		let failed = 0;
-		try {
-			for (const candidate of candidates ?? []) {
-				if (!selected.has(candidate.repoPath) || candidate.alreadyAdded || !candidate.isGitRepo) continue;
-				try {
-					await mutate("/api/workspaces", { repoPath: candidate.repoPath, name: candidate.name } satisfies WorkspaceCreate);
-					added++;
-					setCandidates((current) => current?.map((item) => item.repoPath === candidate.repoPath ? { ...item, alreadyAdded: true } : item) ?? null);
-					setSelected((current) => {
-						const next = new Set(current);
-						next.delete(candidate.repoPath);
-						return next;
-					});
-				} catch {
-					failed++;
-				}
-			}
-			if (added) toast((t, format) => t.panels.workspaces.addedCount(added, format.number(added)));
-			if (failed) setScanError(t.workspaces.failedCount(failed, format.number(failed)));
-		} finally {
-			setAdding(false);
-		}
-	}
-
-	return (
-		<Modal title={workspace ? t.workspaces.editTitle(workspace.name) : t.workspaces.add} onClose={onClose}>
-			<form onSubmit={(event) => { void save(event); }}>
-				{workspace ? (
-					<p className="muted prewrap"><code>{workspace.id}</code> · <code>{workspace.repoPath}</code><br />{t.workspaces.immutableIdentity}</p>
-				) : (
-					<Field label={t.workspaces.repositoryPath} hint={t.workspaces.repositoryHint}>
-						<input autoFocus required value={repoPath} onChange={(event) => setRepoPath(event.target.value)} placeholder="/path/to/repository" disabled={busy} />
-					</Field>
-				)}
-				<div className="two-col">
-					<Field label={workspace ? t.workspaces.name : t.workspaces.optionalName} hint={workspace ? undefined : t.workspaces.nameHint}>
-						<input autoFocus={!!workspace} required={!!workspace} value={name} onChange={(event) => setName(event.target.value)} disabled={busy} />
-					</Field>
-					{!workspace && <Field label={t.workspaces.optionalId} hint={t.workspaces.idHint}><input value={id} onChange={(event) => setId(event.target.value)} disabled={busy} /></Field>}
-					<Field label={workspace ? t.workspaces.defaultBase : t.workspaces.optionalBase} hint={t.workspaces.baseHint}>
-						<input required={!!workspace} value={defaultBase} onChange={(event) => setDefaultBase(event.target.value)} placeholder={t.workspaces.repositoryDefault} disabled={busy} />
-					</Field>
-					<ModelPicker label={t.models.workerModel} value={workerModel || null} storedValue={workspace?.workerModel} onChange={selector => setWorkerModel(selector ?? "")} catalog={catalog.data} disabled={busy} defaultLabel={t.workspaces.workersDefault} defaultModel={settings.data?.workerModel ?? catalog.data?.defaultModel} />
-				</div>
-				<p className="hint">{t.workspaces.workersHint}</p>
-				{catalog.error && <ErrorState error={catalog.error} retry={catalog.reload} />}
-				{catalog.data?.error && <p className="error-text" role="alert">{catalog.data.error}</p>}
-				{formError && <div className="error-box" role="alert"><p>{formError}</p>{fieldErrors.length > 0 && <ul>{fieldErrors.map((error, index) => <li key={`${error.path}:${index}`}><code>{error.path || t.common.workspace}</code>: {error.message}</li>)}</ul>}</div>}
-				<div className="dialog-actions">
-					<Button onClick={onClose} disabled={busy}>{t.common.cancel}</Button>
-					<Button type="submit" className="primary" disabled={busy}>{saving ? t.common.saving : workspace ? t.workspaces.save : t.workspaces.add}</Button>
-				</div>
-			</form>
-			{!workspace && <Section title={t.workspaces.discover}>
-				<p className="muted">{t.workspaces.discoverHint}</p>
-				<Button onClick={scan} disabled={busy}>{scanning ? t.workspaces.scanning : t.workspaces.scan}</Button>
-				{scanError && <p className="error-box" role="alert">{scanError}</p>}
-				{candidates?.length === 0 && <Empty title={t.workspaces.noRepositories}>{t.workspaces.noRepositoriesHint}</Empty>}
-				{candidates && candidates.length > 0 && <div className="stack">
-					{candidates.map((candidate) => <label className="card row" key={candidate.repoPath}>
-						<input
-							type="checkbox"
-							checked={selected.has(candidate.repoPath)}
-							disabled={busy || candidate.alreadyAdded || !candidate.isGitRepo}
-							onChange={(event) => {
-								const checked = event.target.checked;
-								setSelected((current) => {
-									const next = new Set(current);
-									if (checked) next.add(candidate.repoPath); else next.delete(candidate.repoPath);
-									return next;
-								});
-							}}
-						/>
-						<span className="grow"><strong>{candidate.name}</strong><br /><code className="prewrap muted">{candidate.repoPath}</code></span>
-						{candidate.alreadyAdded ? <span className="pill ok">{t.workspaces.candidateAdded}</span> : !candidate.isGitRepo ? <span className="pill warn">{t.workspaces.notGit}</span> : null}
-					</label>)}
-					<div className="actions"><Button className="primary" disabled={busy || selected.size === 0} onClick={addSelected}>{adding ? t.workspaces.adding : t.workspaces.addSelected(format.number(selected.size))}</Button></div>
-				</div>}
-			</Section>}
-		</Modal>
-	);
+	return <Modal title={t.workspaces.editTitle(workspace.name)} onClose={onClose}>
+		<form onSubmit={event => { void save(event); }}>
+			<p className="muted prewrap"><code>{workspace.id}</code> · <code>{workspace.repoPath}</code><br />{t.workspaces.immutableIdentity}</p>
+			<div className="two-col">
+				<Field label={t.workspaces.name}><input autoFocus required value={name} onChange={event => setName(event.target.value)} disabled={saving} /></Field>
+				<BranchPicker branches={inspection.data?.branches ?? []} value={defaultBase} onChange={setDefaultBase} disabled={saving || !inspection.data} />
+				<ModelPicker label={t.models.workerModel} value={workerModel} storedValue={workspace.workerModel} onChange={setWorkerModel} catalog={catalog.data} disabled={saving} defaultLabel={t.workspaces.workersDefault} defaultModel={settings.data?.workerModel ?? catalog.data?.defaultModel} />
+			</div>
+			<p className="hint">{t.workspaces.workersHint}</p>
+			{inspection.error && <ErrorState error={inspection.error} retry={inspection.reload} />}
+			{catalog.error && <ErrorState error={catalog.error} retry={catalog.reload} />}
+			{catalog.data?.error && <p className="error-text" role="alert">{catalog.data.error}</p>}
+			{formError && <div className="error-box" role="alert"><p>{formError}</p>{fieldErrors.length > 0 && <ul>{fieldErrors.map((error, index) => <li key={`${error.path}:${index}`}><code>{error.path || t.common.workspace}</code>: {error.message}</li>)}</ul>}</div>}
+			<div className="dialog-actions"><Button onClick={onClose} disabled={saving}>{t.common.cancel}</Button><Button type="submit" className="primary" disabled={saving}>{saving ? t.common.saving : t.workspaces.save}</Button></div>
+		</form>
+	</Modal>;
 }
 
 
@@ -252,7 +145,7 @@ function RecipeEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose
 		void api<RecipeDTO>(path).then((result) => {
 			if (cancelled) return;
 			setRecipe(result);
-			setText(result.status === "missing" ? RECIPE_EXAMPLE : result.text);
+			setText(result.status === "missing" ? getT().panels.workspaces.recipeExample : result.text);
 			setErrors(result.errors);
 		}).catch((error: unknown) => {
 			if (!cancelled) setLoadError(error instanceof Error ? error : new Error(getT().panels.workspaces.recipeLoadError));
@@ -285,6 +178,7 @@ function RecipeEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose
 			{loading ? <Loading /> : loadError ? <ErrorState error={loadError} retry={() => setRevision((current) => current + 1)} /> : recipe && <>
 				<div className="row wrap"><code className="prewrap grow muted">{recipe.path}</code><CopyButton text={recipe.path} /><Status value={recipe.status} /></div>
 				{recipe.status === "missing" && <p className="hint">{t.workspaces.noRecipeHint}</p>}
+				<RecipeSummary text={text} />
 				<Field label={t.workspaces.recipeYaml} hint={t.workspaces.recipeHint}>
 					<textarea className="code-editor" value={text} onChange={(event) => setText(event.target.value)} spellCheck={false} autoCapitalize="off" autoCorrect="off" rows={18} disabled={saving} />
 				</Field>

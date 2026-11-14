@@ -1,15 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import type { Language, RecipeDTO, ScanCandidate, WorkspaceDTO } from "../shared/api.ts";
+import type { Language, RecipeDTO, RepoInspection, RepoSuggestion, WorkspaceDTO } from "../shared/api.ts";
 import { IdError, parseWorkspaceId, slugify } from "../shared/ids.ts";
 import { writeFileAtomic, type HomePaths } from "./config.ts";
 import { parseRecipe, type EnvRecipe } from "./core/recipe.ts";
 import type { Db } from "./db.ts";
 import { fieldErrors, HubError, localizedField, localizeFieldErrors } from "./errors.ts";
-import { defaultBase, repoRoot } from "./git.ts";
+import { defaultBase, inspectGit, repoRoot } from "./git.ts";
 import { messages } from "./i18n.ts";
 import { validationMessages as m } from "./i18n-validation.ts";
+import { detectCommands, discoverRepositories } from "./repo-discovery.ts";
 
 export interface WorkspaceRow {
 	id: string;
@@ -33,6 +34,7 @@ const createSchema = z.strictObject({
 	id: z.string().optional(),
 	defaultBase: z.string().trim().min(1).optional(),
 	workerModel: z.string().trim().min(1).nullable().optional(),
+	recipe: z.string().max(200_000).optional(),
 });
 const patchSchema = z.strictObject({
 	name: z.string().trim().min(1).max(80).optional(),
@@ -44,10 +46,13 @@ const patchSchema = z.strictObject({
 export class Workspaces {
 	readonly #db: Db;
 	readonly #paths: HomePaths;
+	readonly #worktreeRoot: () => string | null;
+	#discovery: { expiresAt: number; worktreeRoot: string | null; pending: Promise<RepoSuggestion[]> } | undefined;
 
-	constructor(db: Db, paths: HomePaths) {
+	constructor(db: Db, paths: HomePaths, worktreeRoot: () => string | null) {
 		this.#db = db;
 		this.#paths = paths;
+		this.#worktreeRoot = worktreeRoot;
 	}
 
 	get(id: string): WorkspaceRow | undefined {
@@ -68,6 +73,13 @@ export class Workspaces {
 		const parsed = createSchema.safeParse(body);
 		if (!parsed.success) throw new HubError("unprocessable", m.invalidWorkspace(), fieldErrors(parsed.error.issues));
 		const input = parsed.data;
+		if (input.recipe !== undefined) {
+			const recipe = parseRecipe(input.recipe);
+			if (!recipe.ok) {
+				for (const error of recipe.errors) error.path = "recipe";
+				throw new HubError("unprocessable", m.invalidRecipe(), recipe.errors);
+			}
+		}
 		const resolved = path.resolve(input.repoPath);
 		if (!fs.existsSync(resolved)) throw new HubError("unprocessable", m.pathMissing(resolved), [localizedField("repoPath", m.doesNotExist())]);
 		let root: string;
@@ -90,9 +102,7 @@ export class Workspaces {
 			}
 			if (this.get(id)) throw new HubError("conflict", m.workspaceIdTaken(id));
 		} else {
-			const base = slugify(name);
-			id = base;
-			for (let n = 2; this.get(id); n++) id = `${base.slice(0, 36)}-${n}`;
+			id = this.#availableId(name);
 		}
 		const base = input.defaultBase ?? (await defaultBase(root));
 		this.#db.run(
@@ -104,6 +114,10 @@ export class Workspaces {
 			input.workerModel ?? null,
 			Date.now(),
 		);
+		if (input.recipe !== undefined) {
+			fs.mkdirSync(this.#paths.repos, { recursive: true });
+			writeFileAtomic(this.recipePath(id), input.recipe.endsWith("\n") ? input.recipe : `${input.recipe}\n`, 0o644, false);
+		}
 		const notes = this.notesPath(id);
 		if (!fs.existsSync(notes)) {
 			fs.mkdirSync(path.dirname(notes), { recursive: true });
@@ -191,35 +205,51 @@ export class Workspaces {
 		};
 	}
 
-	/** Absolute directories named in the home AGENTS.md, as workspace candidates. */
-	async scan(): Promise<ScanCandidate[]> {
-		let text: string;
-		try {
-			text = fs.readFileSync(this.#paths.agents, "utf8");
-		} catch {
-			return [];
+	#availableId(name: string): string {
+		const base = slugify(name);
+		let id = base;
+		for (let n = 2; this.get(id); n++) id = `${base.slice(0, 36)}-${n}`;
+		return id;
+	}
+
+	#repositories(): Promise<RepoSuggestion[]> {
+		const worktreeRoot = this.#worktreeRoot();
+		if (!this.#discovery || this.#discovery.expiresAt <= Date.now() || this.#discovery.worktreeRoot !== worktreeRoot) {
+			const pending = discoverRepositories(this.#paths, worktreeRoot, this.list(true).map(w => w.repo_path));
+			this.#discovery = { expiresAt: Date.now() + 30_000, worktreeRoot, pending };
+			void pending.catch(() => {
+				if (this.#discovery?.pending === pending) this.#discovery = undefined;
+			});
 		}
-		const seen = new Set<string>();
-		const out: ScanCandidate[] = [];
-		for (const m of text.matchAll(/(?:^|[\s`'"(\[<:：])(\/[^\s`'"()\[\]<>,;，。、]+)/g)) {
-			const candidate = m[1]!.replace(/[.:)/]+$/, "");
-			if (seen.has(candidate) || candidate.startsWith(this.#paths.data)) continue;
-			seen.add(candidate);
-			let stat: fs.Stats;
-			try {
-				stat = fs.statSync(candidate);
-			} catch {
-				continue;
-			}
-			if (!stat.isDirectory()) continue;
-			const real = fs.realpathSync(candidate);
-			const isGitRepo = await repoRoot(real).then(
-				root => fs.realpathSync(root) === real,
-				() => false,
-			);
-			const alreadyAdded = !!this.#db.get("SELECT 1 FROM workspace WHERE repo_path = ?", real);
-			out.push({ repoPath: real, name: path.basename(real), alreadyAdded, isGitRepo });
-		}
-		return out;
+		return this.#discovery.pending;
+	}
+
+	async suggestions(): Promise<RepoSuggestion[]> {
+		const registered = new Map(this.list(true).map(w => [w.repo_path, w.id]));
+		return (await this.#repositories()).map(repo => ({ ...repo, registeredAs: registered.get(repo.path) ?? null }))
+			.sort((a, b) => Number(a.registeredAs !== null) - Number(b.registeredAs !== null) || (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0) || a.name.localeCompare(b.name));
+	}
+
+	async inspect(dir: string): Promise<RepoInspection> {
+		const chosen = path.resolve(dir);
+		const git = await inspectGit(chosen);
+		const registered = git.root ? this.list(true).find(w => w.repo_path === git.root) : undefined;
+		const name = path.basename(git.root ?? chosen);
+		const id = registered?.id ?? this.#availableId(name);
+		const detected = detectCommands(git.root ?? chosen);
+		const existing = this.recipePath(id);
+		const hasRecipe = fs.existsSync(existing);
+		const repo = git.root ? (await this.#repositories()).find(r => r.path === git.root) : undefined;
+		return {
+			path: chosen,
+			...git,
+			name,
+			id,
+			registeredAs: registered?.id ?? null,
+			omp: { sessions: repo?.ompSessions ?? 0, lastUsedAt: repo?.lastUsedAt ?? null, lastTitle: repo?.lastTitle ?? null },
+			...detected,
+			recipeDraft: hasRecipe ? fs.readFileSync(existing, "utf8") : detected.recipeDraft,
+			hasRecipe,
+		};
 	}
 }

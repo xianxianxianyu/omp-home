@@ -48,10 +48,17 @@ export function saveConfig(config: HubConfig): void {
 	writeFileAtomic(file, `${JSON.stringify(config, null, 2)}\n`, 0o600);
 }
 
-export function writeFileAtomic(file: string, content: string, mode = 0o644): void {
+export function writeFileAtomic(file: string, content: string, mode = 0o644, overwrite = true): void {
 	const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
 	fs.writeFileSync(tmp, content, { mode });
-	fs.renameSync(tmp, file);
+	try {
+		if (overwrite) fs.renameSync(tmp, file);
+		else fs.linkSync(tmp, file);
+	} catch (err) {
+		if (overwrite || (err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+	} finally {
+		fs.rmSync(tmp, { force: true });
+	}
 }
 
 /** Every hub-owned location inside a home repo. `.omp-home/` is gitignored; `repos/` is versioned. */
