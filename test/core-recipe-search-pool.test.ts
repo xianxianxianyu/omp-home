@@ -100,7 +100,7 @@ test("launch spec: resume, optional model and pstack, worker git guard env", () 
 		worker: { env: { PORT: "41000", OMP_HOME_TOKEN: "spoofed" }, protectedBranches: ["main"], repoHooks: "/repo/.git/hooks" },
 	});
 	assert.deepEqual(spec.args, [
-		"--cwd", "/wt", "--session-dir", "/h/.omp-home/sessions/W-3", "--config", "/h/.omp-home/run/worker.yml",
+		"--mode", "rpc-ui", "--cwd", "/wt", "--session-dir", "/h/.omp-home/sessions/W-3", "--config", "/h/.omp-home/run/worker.yml",
 		"-e", "/app/omp-plugin/worker", "-e", "/h/.omp-home/run/pstack",
 		"--thinking", "high", "--approval-mode", "yolo", "--no-title", "--resume", "/h/s.jsonl",
 	]);

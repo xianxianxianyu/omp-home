@@ -47,10 +47,6 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 .pane-head .spacer { flex: 1; }
 .pane-body { flex: 1; min-height: 0; position: relative; }
 
-.terminal-host { position: absolute; inset: 6px 4px 4px 10px; }
-.terminal-host .xterm { height: 100%; }
-.terminal-host .xterm-viewport { background: transparent !important; }
-.term-wrap { position: absolute; inset: 0; background: #0f1115; }
 
 .tabs { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid var(--line); height: 38px; align-items: flex-end; overflow-x: auto; flex-shrink: 0; }
 .tab { display: flex; align-items: center; gap: 6px; padding: 7px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; background: none; color: var(--muted); cursor: pointer; white-space: nowrap; }
@@ -131,9 +127,7 @@ table.grid th { color: var(--dim); font-weight: 500; font-size: 11px; text-trans
 button, a, summary, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 button { touch-action: manipulation; }
 button:disabled { cursor: not-allowed; }
-/* xterm's IME textarea sits in a zero-width container; max-width: 100% would make it 0px wide,
-   and Chrome then puts the caret at 0 after each IME commit, so xterm resends stale composed text. */
-input, select, textarea:not(.xterm-helper-textarea) { min-width: 0; max-width: 100%; }
+input, select, textarea { min-width: 0; max-width: 100%; }
 input[type="checkbox"] { accent-color: var(--accent); }
 ::selection { background: #3b4252; color: #fff; }
 ::-webkit-scrollbar { width: 7px; height: 5px; }
@@ -160,12 +154,11 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .worker-tab { display: flex; align-items: center; flex-shrink: 0; border-radius: 7px 7px 0 0; }
 .worker-tab.active { background: var(--panel-2); }
 .worker-tab .tab { padding-right: 5px; border-right: none; }
-.terminal-tab-label { overflow: hidden; text-overflow: ellipsis; max-width: 230px; }
+.session-tab-label { overflow: hidden; text-overflow: ellipsis; max-width: 230px; }
 .close-tab, .icon-button { cursor: pointer; background: none; border: none; color: var(--muted); font-size: 19px; line-height: 1; padding: 5px; border-radius: 4px; }
 .close-tab:hover, .icon-button:hover { background: var(--line); color: var(--fg); }
 .close-tab { margin-right: 3px; }
 .hidden { display: none !important; }
-.terminal-connection { position: absolute; bottom: 8px; right: 10px; left: 10px; padding: 7px 10px; background: #2b2418; border: 1px solid #6b4c22; border-radius: 5px; color: var(--warn); font-size: 11px; }
 .start-main { display: grid; place-items: center; height: 100%; background: radial-gradient(ellipse at 50% 50%, #1a1d24, #0f1115 70%); }
 .start-main .btn { margin-top: 12px; }
 .scroll { padding: 22px; }
@@ -302,8 +295,16 @@ kbd { position: absolute; right: 7px; top: 6px; font: 10px var(--sans); color: v
 	* { scroll-behavior: auto !important; animation-duration: 2s !important; transition: none !important; }
 }
 .actions + section { margin-top: 22px; }
-.sessions-grid { min-width: 940px; }
-.sessions-grid td:nth-child(2) { min-width: 190px; max-width: 240px; }
-.sessions-grid td:nth-child(3) { min-width: 140px; max-width: 170px; }
-.sessions-grid td:nth-child(4), .sessions-grid td:nth-child(5) { white-space: nowrap; }
-.sessions-grid td:nth-child(6) { min-width: 140px; }
+/* The right pane is often ~half the window: fixed layout keeps Actions visible instead of scrolling it off-screen. */
+table.grid.sessions-grid { table-layout: fixed; }
+.sessions-grid th:nth-child(1) { width: 13%; }
+.sessions-grid th:nth-child(2) { width: 25%; }
+.sessions-grid th:nth-child(3) { width: 14%; }
+.sessions-grid th:nth-child(4) { width: 8%; }
+.sessions-grid th:nth-child(5) { width: 11%; }
+.sessions-grid th:nth-child(6) { width: 15%; }
+.sessions-grid th:nth-child(7) { width: 14%; }
+table.grid.sessions-grid th { white-space: normal; }
+.sessions-grid td { overflow-wrap: anywhere; }
+.sessions-grid .actions { flex-direction: column; align-items: stretch; min-width: 0; }
+.sessions-grid .actions .btn { width: 100%; min-width: 0; padding-inline: 4px; }

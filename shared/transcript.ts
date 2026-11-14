@@ -147,7 +147,7 @@ function mapItem(items: Item[], id: string, fn: (item: Item) => Item): Item[] {
 function bound(view: TranscriptView): TranscriptView {
 	if (view.items.length <= MAX_ITEMS) return view;
 	const dropped = view.items.length - MAX_ITEMS;
-	return { ...view, items: view.items.slice(dropped), earlierCursor: view.earlierCursor ?? view.items[dropped]!.id };
+	return { ...view, items: view.items.slice(dropped), earlierCursor: view.items[dropped]!.id };
 }
 
 function placeBlock(blocks: Block[], index: number, block: Block): Block[] {

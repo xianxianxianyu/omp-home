@@ -9,6 +9,8 @@ import { fieldErrors, HubError } from "./errors.ts";
 
 export const DEFAULT_PSTACK_ROOT = "/Volumes/NVMe2T/project/opensource/cursor-plugins/harness/pstack/claude-code";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+/** omp config every hub-spawned omp gets (also the compatibility self-check). */
+export const OVERLAY_BASE = { startup: { setupWizard: false }, update: { auto: false } };
 
 export type Settings = Omit<SettingsDTO, "homePath">;
 
@@ -29,6 +31,7 @@ export function defaultSettings(): Settings {
 		maxAutoWakes: 3,
 		portRange: [41000, 41999],
 		worktreeRoot: null,
+		ompPath: null,
 	};
 }
 
@@ -50,6 +53,10 @@ const fields = {
 		.tuple([z.number().int().min(1024).max(65535), z.number().int().min(1024).max(65535)])
 		.refine(([lo, hi]) => hi - lo >= 9, "the range needs at least 10 ports"),
 	worktreeRoot: z
+		.string()
+		.nullable()
+		.refine(v => v === null || path.isAbsolute(v), "must be an absolute path"),
+	ompPath: z
 		.string()
 		.nullable()
 		.refine(v => v === null || path.isAbsolute(v), "must be an absolute path"),
@@ -86,16 +93,16 @@ export class SettingsStore {
 		return next;
 	}
 
-	/** omp `--config` overlays per role; they affect the next spawn. */
+	/** omp `--config` overlays per role; they affect the next spawn. The hub pins omp versions, so omp never updates itself. */
 	writeOverlays(): void {
 		const s = this.get();
 		fs.mkdirSync(this.#paths.run, { recursive: true });
 		const main: Record<string, unknown> = {
-			startup: { setupWizard: false },
+			...OVERLAY_BASE,
 			compaction: { experimentalContextManagement: true },
 		};
 		if (s.dispatcherModel) main.task = { agentModelOverrides: { dispatcher: s.dispatcherModel } };
 		writeFileAtomic(this.#paths.overlay("main"), stringify(main));
-		writeFileAtomic(this.#paths.overlay("worker"), stringify({ startup: { setupWizard: false } }));
+		writeFileAtomic(this.#paths.overlay("worker"), stringify(OVERLAY_BASE));
 	}
 }

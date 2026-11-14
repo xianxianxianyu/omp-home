@@ -115,7 +115,7 @@ function TaskTextAction({ task, kind, onClose }: { task: TaskDetail; kind: "mess
 					? "Confirm that you want to cancel this task. Its branch and worktree are kept; clean them up separately."
 					: "Send a message to the worker. This counts as human input and can resume work on the task."}
 			</p>
-			<Field label={cancelling ? "Cancellation reason" : "Message"} hint={cancelling ? "A reason is required and will be recorded in the task timeline." : "You can also open the worker to talk in its live terminal."}>
+			<Field label={cancelling ? "Cancellation reason" : "Message"} hint={cancelling ? "A reason is required and will be recorded in the task timeline." : "You can also open the worker to talk in its session."}>
 				<textarea
 					aria-label={cancelling ? "Cancellation reason" : "Message to worker"}
 					value={text}

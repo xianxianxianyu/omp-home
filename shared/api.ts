@@ -246,6 +246,16 @@ export interface MainDTO {
 	pendingNotices: number;
 }
 
+/** The omp binary the hub spawns. */
+export interface OmpDTO {
+	version: string | null;
+	path: string | null;
+	/** The hub-managed copy under <configDir>/omp/<version>/omp (not the user's PATH binary). */
+	managed: boolean;
+	/** omp missing, or the PATH omp failed the compatibility self-check and an older managed copy stays in use. */
+	warning: string | null;
+}
+
 export interface StateDTO {
 	version: string;
 	setup: { done: boolean; homePath: string | null };
@@ -253,6 +263,7 @@ export interface StateDTO {
 	pool: { live: number; cap: number };
 	inboxOpen: number;
 	openTasks: number;
+	omp: OmpDTO;
 }
 
 export interface SettingsDTO {
@@ -268,6 +279,8 @@ export interface SettingsDTO {
 	maxAutoWakes: number;
 	portRange: [number, number];
 	worktreeRoot: string | null;
+	/** Explicit omp binary; null = managed copy, else PATH. */
+	ompPath: string | null;
 }
 
 export type SettingsPatch = Partial<Omit<SettingsDTO, "homePath">>;

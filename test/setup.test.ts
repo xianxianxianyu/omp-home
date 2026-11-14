@@ -7,6 +7,7 @@ import { generatePstackPackage, playbooks } from "../server/pstack.ts";
 import { applySetup, previewSetup } from "../server/setup.ts";
 
 const repo = path.resolve(import.meta.dirname, "..");
+const templates = path.join(repo, "templates");
 const manifest = JSON.parse(fs.readFileSync(path.join(repo, "templates/home/manifest.json"), "utf8")) as { path: string; action: string; heading?: string; source: string }[];
 const section = manifest.find(e => e.action === "section")!;
 const replaced = manifest.find(e => e.action === "replace")!;
@@ -18,13 +19,13 @@ test("setup replaces one markdown section, backs up what it replaces, and is ide
 	fs.mkdirSync(path.join(home, replaced.path), { recursive: true });
 	fs.writeFileSync(path.join(home, replaced.path, "SKILL.md"), "old skill\n");
 
-	const preview = previewSetup(home, repo);
+	const preview = previewSetup(home, templates);
 	assert.ok(preview.changes.some(c => c.path === section.path && c.action === "replace"));
 	assert.ok(preview.changes.some(c => c.path === replaced.path && c.action === "replace"));
 	assert.ok(preview.changes.some(c => c.action === "backup" && c.path.endsWith(replaced.path)));
 	assert.ok(preview.changes.some(c => c.path === ".gitignore" && c.action === "create"));
 
-	applySetup(home, repo, true);
+	applySetup(home, templates, true);
 	const agents = fs.readFileSync(path.join(home, section.path), "utf8");
 	assert.doesNotMatch(agents, /old workflow/);
 	assert.match(agents, /^# Home/);
@@ -36,8 +37,8 @@ test("setup replaces one markdown section, backs up what it replaces, and is ide
 	assert.equal(fs.readFileSync(path.join(home, ".omp-home/backup", backups[0]!, replaced.path, "SKILL.md"), "utf8"), "old skill\n");
 	assert.match(fs.readFileSync(path.join(home, ".omp-home/backup", backups[0]!, section.path), "utf8"), /old workflow/);
 
-	assert.deepEqual(previewSetup(home, repo).changes, []);
-	applySetup(home, repo, true);
+	assert.deepEqual(previewSetup(home, templates).changes, []);
+	applySetup(home, templates, true);
 	assert.equal(fs.readdirSync(path.join(home, ".omp-home/backup")).length, 1);
 	assert.equal(fs.readFileSync(path.join(home, section.path), "utf8"), agents);
 });
@@ -45,7 +46,7 @@ test("setup replaces one markdown section, backs up what it replaces, and is ide
 test("without migrateHome only missing files are created", () => {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "omphome-setup-"));
 	fs.writeFileSync(path.join(home, section.path), "# Mine\n");
-	applySetup(home, repo, false);
+	applySetup(home, templates, false);
 	assert.equal(fs.readFileSync(path.join(home, section.path), "utf8"), "# Mine\n");
 	assert.ok(fs.existsSync(path.join(home, replaced.path)));
 	assert.ok(!fs.existsSync(path.join(home, ".omp-home/backup")));

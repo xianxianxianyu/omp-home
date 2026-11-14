@@ -3,7 +3,7 @@ import { wsUrl } from "./api.ts";
 export interface SocketHandlers {
 	open: () => void;
 	message: (data: string) => void;
-	close: () => void;
+	close: (code?: number, reason?: string) => void;
 }
 export interface HubSocket {
 	readonly readyState: number;
@@ -20,6 +20,6 @@ export function connectSocket(path: string, handlers: SocketHandlers): HubSocket
 	socket.onmessage = event => {
 		if (typeof event.data === "string") handlers.message(event.data);
 	};
-	socket.onclose = handlers.close;
+	socket.onclose = event => handlers.close(event.code, event.reason);
 	return socket;
 }

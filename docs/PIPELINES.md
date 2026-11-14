@@ -89,21 +89,21 @@ flowchart TD
 - **数据边界**：worker 写的文字一律包在 `<worker-report>` 里，按数据处理，不作为指令执行。
 - **唤醒次数**：从「自上次你说话以来送出的 wake 批次」现算出来，不单独存计数器，因此不会算错。你在主聊天里说话，或在界面点「Let main continue」，次数就清零。
 
-## 4. 上报给你的流水线：没有表单，直接用 worker 自己的终端
+## 4. 上报给你的流水线：没有表单，直接在 worker 的会话视图里回复
 
 ```mermaid
 flowchart LR
   E1[主聊天 home_escalate] --> E2["开一条 escalation, 同一任务只开一条"]
   A1[worker 触发工具审批] --> E2
   E2 --> E3["确保 worker 进程在跑, 人为触发可超出上限 1 个"]
-  E3 --> E4["界面 focus 事件: 右侧打开 W-n 终端; 你正在打字时只弹提示"]
-  E4 --> E5["你在 W-n 的 omp 里直接回复"]
-  E5 --> E6[桥接 input 事件]
+  E3 --> E4["界面 focus 事件: 右侧打开 W-n 会话视图; 你正在输入时只弹提示"]
+  E4 --> E5["你在 W-n 的输入框回复, 或在审批卡片上点选"]
+  E5 --> E6["Hub 把回复作为 RPC prompt 转给 worker, 记一条 human_input"]
   E6 --> E7["escalation 关闭 (human_replied), 任务回到 working"]
   E7 --> E8[worker 继续, 结果再走一遍回流流水线]
 ```
 
-工具审批（approval）不经过主聊天的判断：主聊天无法替你在 worker 终端里按「批准」，所以 Hub 直接上报给你，只给主聊天发一条 info 通知。
+工具审批（approval）不经过主聊天的判断：审批卡片只有你能点，所以 Hub 直接上报给你，只给主聊天发一条 info 通知。
 
 ## 5. 任务状态机
 
@@ -114,7 +114,7 @@ stateDiagram-v2
   pending --> awaiting: provision_failed
   working --> done: 汇报 done 且本轮结束
   working --> awaiting: question / blocked / no_report / 审批 / 进程丢失
-  awaiting --> working: home_send / 你在终端里输入 / 审批已处理
+  awaiting --> working: home_send / 你在 worker 视图里回复 / 审批已处理
   done --> working: home_send 或你输入（重新打开）
   working --> cancelled: home_close cancelled
   awaiting --> cancelled: home_close cancelled
@@ -141,7 +141,7 @@ stateDiagram-v2
 ```
 
 - **上限**：默认最多 4 个活跃 worker；主聊天不计入。
-- **可以停掉的条件**：空闲、没有审批在等、没有后台任务、终端没人看、没有未处理的上报。
+- **可以停掉的条件**：空闲、没有审批在等、没有后台任务、没有人在看它的会话视图、没有未处理的上报。
 - **代价**：每个 omp 进程大约 450–500 MB 内存。
 
 ## 7. 记忆与恢复流水线

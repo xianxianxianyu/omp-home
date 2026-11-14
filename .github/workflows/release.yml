@@ -1,0 +1,45 @@
+name: Desktop release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    env:
+      OMP_HOME_RELEASE_REPOSITORY: ${{ github.repository }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.18.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.11.1
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Verify release version and runner
+        run: |
+          test "$(uname -m)" = arm64
+          node --input-type=module -e 'import p from "./package.json" with {type:"json"}; if (`v${p.version}` !== process.env.GITHUB_REF_NAME) throw Error("Tag must match package.json version")'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+      - run: pnpm build:app
+      - run: pnpm updater:json
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            desktop/src-tauri/target/release/bundle/macos/latest.json

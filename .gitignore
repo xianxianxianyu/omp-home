@@ -2,3 +2,6 @@ node_modules/
 web/dist/
 *.log
 .dev/
+dist/
+omp-plugin/dist/
+web/verification/

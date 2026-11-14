@@ -175,7 +175,7 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 		},
 
 		home_send(p, c) {
-			const r = hub.sendToTask({ taskId: taskId(p.task), text: p.text, mode: p.mode ?? "next", by: "main", decision: p.decision ?? null, dedupe: `call:${c.callId}` });
+			const r = hub.sendToTask({ taskId: taskId(p.task), text: p.text, mode: p.mode ?? "next", decision: p.decision ?? null, dedupe: `call:${c.callId}` });
 			return { text: r.text, details: { taskId: p.task, decision: r.decision } };
 		},
 

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { ChatRecordDTO, DecisionDTO, EscalationDTO, RecipeDTO, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
+import { createMockSessions } from "./mock-sessions.ts";
 
 export function installMock() {
 const now = Date.now();
@@ -11,7 +12,7 @@ const root = "/Volumes/NVMe2T/project";
 const subscribers = new Set<SocketHandlers>();
 const main: StateDTO["main"] = { sessionId: "M-1", state: "idle", wakesUsed: 2, wakesMax: 3, paused: false, pendingNotices: 1 };
 let setupDone = new URLSearchParams(location.search).get("setup") !== "1";
-let settings: SettingsDTO = { homePath: home, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees` };
+let settings: SettingsDTO = { homePath: home, ompPath: null, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees` };
 const workspaces: WorkspaceDTO[] = ["atlas", "console"].map((id, index) => ({ id, name: index ? "Console" : "Atlas", repoPath: `${root}/${id}`, defaultBase: "main", workerModel: null, notesPath: `${home}/repos/${id}.md`, recipePath: `${home}/repos/${id}.env.yaml`, recipeStatus: index ? "missing" : "ok", liveSessions: 1, totalSessions: 1, openTasks: index ? 1 : 3, archived: false }));
 const escalation: EscalationDTO = { id: "E-3", taskId: "T-12", taskTitle: "Choose the account migration strategy", sessionId: "W-12", reason: "The account migration removes a legacy column. I need your approval before changing the data contract.", openedBy: "main", openedAt: now - 180000, seenAt: null, resolvedAt: null, resolution: null };
 const decisions: DecisionDTO[] = [{ id: "D-7", taskId: "T-11", at: now - 420000, summary: "Keep the search index local to each worktree", why: "Isolation makes parallel tests deterministic and avoids shared writes.", revert: "Point SEARCH_DB at the shared development index and restart the service.", reverts: null, revertRequestedAt: null, revertedBy: null }, { id: "D-6", taskId: "T-9", at: now - 3600000, summary: "Use the existing retry policy for transient reads", why: "The established boundary already distinguishes transient errors.", revert: "Revert commit a1b2c3d on task/search-timeouts.", reverts: null, revertRequestedAt: null, revertedBy: null }];
@@ -36,10 +37,15 @@ const recipes = new Map<string, RecipeDTO>(workspaces.map(workspace => [workspac
 const chat: ChatRecordDTO[] = [{ id: 1, role: "user", at: now - 900000, text: "Let's improve search in Atlas and review the account migration in Console. Keep the work isolated." }, { id: 2, role: "assistant", at: now - 840000, text: "I'll route those to separate workers. I'll review their reports first and bring you in for the migration decision." }, { id: 3, role: "notice", at: now - 180000, text: "W-12 reported a schema migration that needs human approval." }, { id: 4, role: "assistant", at: now - 120000, text: "The incremental search work is progressing. The account migration changes a data contract; I've opened it in your inbox." }];
 function emit(event: UiEvent) { subscribers.forEach(subscriber => subscriber.message(JSON.stringify(event))); }
 function invalidate(topics: Topic[]) { queueMicrotask(() => emit({ t: "invalidate", topics })); }
-function state(): StateDTO { return { version: "mock", setup: { done: setupDone, homePath: setupDone ? settings.homePath : null }, main, pool: { live: sessions.filter(session => session.kind === "worker" && session.state !== "cold" && !session.retired).length, cap: settings.maxLiveWorkers }, inboxOpen: escalation.resolvedAt === null ? 1 : 0, openTasks: tasks.filter(task => task.status !== "done" && task.status !== "cancelled").length }; }
+function state(): StateDTO { return { version: "mock", omp: { version: "18.20.0", path: "/Applications/omp-home.app/Contents/Resources/omp", managed: true, warning: null }, setup: { done: setupDone, homePath: setupDone ? settings.homePath : null }, main, pool: { live: sessions.filter(session => session.kind === "worker" && session.state !== "cold" && !session.retired).length, cap: settings.maxLiveWorkers }, inboxOpen: escalation.resolvedAt === null ? 1 : 0, openTasks: tasks.filter(task => task.status !== "done" && task.status !== "cancelled").length }; }
 const bodySchema = z.record(z.string(), z.unknown());
 const text = (body: Record<string, unknown>, key: string, fallback = "") => typeof body[key] === "string" ? body[key] : fallback;
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } }); }
+const sessionMock = createMockSessions((command, sessionId) => {
+	if (command === "/focus") { escalation.resolvedAt = null; escalation.resolution = null; emit({ t: "focus", sessionId: "W-12", escalationId: escalation.id, reason: escalation.reason }); invalidate(["inbox", "state"]); }
+	else if (command === "/pause") { main.paused = true; main.wakesUsed = main.wakesMax; invalidate(["state", "inbox"]); }
+	else { chat.push({ id: chat.length + 1, role: "user", at: Date.now(), text: command }); if (sessionId === escalation.sessionId) { escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied"; invalidate(["inbox", "state"]); } }
+});
 
 	const realFetch = window.fetch.bind(window);
 	window.fetch = async (input, init) => {
@@ -71,6 +77,7 @@ function response(data: unknown, status = 200) { return new Response(JSON.string
 				}
 				return response(task);
 			}
+			if (route === "sessions" && id && action && ["prompt", "abort", "respond", "commands", "history", "subagents"].includes(action)) return response(sessionMock.request(id, action, body, parts, url.searchParams.get("before")));
 			if (route === "sessions") { if (!id) return response(sessions); const session = sessions.find(item => item.id === id); if (!session) return response({ error: "Session not found" }, 404); if (action === "attach") session.state = session.state === "cold" ? "idle" : session.state; else { session.state = "cold"; session.pid = null; if (action === "retire") session.retired = true; } if (session.kind === "main") main.state = session.state; invalidate(["sessions", "state", "workspaces"]); return response(session); }
 			if (route === "decisions") { if (!id) return response(decisions.filter(item => !url.searchParams.get("task") || item.taskId === url.searchParams.get("task"))); const decision = decisions.find(item => item.id === id); if (!decision) return response({ error: "Decision not found" }, 404); decision.revertRequestedAt = Date.now(); invalidate(["decisions", ...(decision.taskId ? [`task:${decision.taskId}` as Topic] : [])]); return response(decision); }
 			if (route === "workspaces") {
@@ -95,35 +102,13 @@ function response(data: unknown, status = 200) { return new Response(JSON.string
 		} catch (error) { return response({ error: error instanceof Error ? error.message : String(error) }, 400); }
 	};
 	installSocketFactory((path, handlers) => {
+		if (path !== "/api/events") {
+			const match = path.match(/^\/api\/sessions\/([^/]+)\/stream$/);
+			if (!match) throw new Error(`Unknown mock stream: ${path}`);
+			return sessionMock.connect(decodeURIComponent(match[1]), handlers);
+		}
 		let readyState = 0;
-		let line = "";
-		const timers = new Set<number>();
-		const isEvents = path === "/api/events";
-		const id = decodeURIComponent(path.split("/").at(-1) ?? "M-1");
-		const timer = window.setTimeout(() => {
-			readyState = 1; handlers.open();
-			if (isEvents) subscribers.add(handlers);
-			else handlers.message(`\x1b[2J\x1b[H\x1b[38;2;229;192;123m  omp\x1b[0m  \x1b[2m${id} · development demo\x1b[0m\r\n\r\n${id.startsWith("M-") ? "  Let's build something thoughtfully.\r\n\r\n  \x1b[38;2;152;195;121m✓\x1b[0m Routed incremental search to W-11\r\n  \x1b[38;2;152;195;121m✓\x1b[0m Reviewed the account migration report\r\n\r\n  W-12 needs your judgment on a data contract.\r\n  I've left the decision in your inbox.\r\n" : "  This worker is ready for your input.\r\n  Worktree and environment are isolated from main.\r\n"}\r\n  \x1b[2mDemo terminal · no real process is running.\r\n  /focus sends a worker escalation; /pause pauses main.\x1b[0m\r\n\r\n\x1b[38;2;229;192;123m❯\x1b[0m `);
-		}, 50);
-		timers.add(timer);
-		return {
-			get readyState() { return readyState; },
-			send(data) {
-				const input = z.discriminatedUnion("type", [z.object({ type: z.literal("input"), data: z.string() }), z.object({ type: z.literal("resize"), cols: z.number(), rows: z.number() })]).parse(JSON.parse(data));
-				if (input.type !== "input" || readyState !== 1) return;
-				for (const character of input.data) {
-					if (character === "\r" || character === "\n") {
-						const command = line.trim(); line = "";
-						handlers.message("\r\n");
-						if (command === "/focus") { escalation.resolvedAt = null; escalation.resolution = null; emit({ t: "focus", sessionId: "W-12", escalationId: escalation.id, reason: escalation.reason }); invalidate(["inbox", "state"]); }
-						else if (command === "/pause") { main.paused = true; main.wakesUsed = main.wakesMax; invalidate(["state", "inbox"]); }
-						else if (command) { chat.push({ id: chat.length + 1, role: "user", at: Date.now(), text: command }); handlers.message("\x1b[2mDemo input received. In the live app this goes directly to omp.\x1b[0m\r\n"); }
-						handlers.message("\r\n\x1b[38;2;229;192;123m❯\x1b[0m ");
-					} else if (character === "\x7f") { if (line) { line = line.slice(0, -1); handlers.message("\b \b"); } }
-					else if (character >= " ") { line += character; handlers.message(character); }
-				}
-			},
-			close() { readyState = 3; timers.forEach(clearTimeout); subscribers.delete(handlers); handlers.close(); },
-		};
+		const timer = window.setTimeout(() => { readyState = 1; subscribers.add(handlers); handlers.open(); }, 40);
+		return { get readyState() { return readyState; }, send() { throw new Error("Hub events are server-to-client only"); }, close() { readyState = 3; clearTimeout(timer); subscribers.delete(handlers); handlers.close(); } };
 	});
 }

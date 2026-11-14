@@ -126,10 +126,10 @@ export class Bridge {
 		return this.#conns.has(sessionId);
 	}
 
-	/** Send unacknowledged outbox rows in id order. The extension skips rows it already delivered. */
+	/** Send unacknowledged outbox rows in id order once the session is live (its history is seeded). The extension skips rows it already delivered. */
 	flush(sessionId: string): void {
 		const conn = this.#conns.get(sessionId);
-		if (!conn) return;
+		if (!conn || !this.#d.pool.isLive(sessionId)) return;
 		for (const row of this.#d.ledger.unacked(sessionId)) {
 			if (conn.sent.has(row.id)) continue;
 			if (!this.#send(conn, { t: "deliver", outboxId: row.id, kind: row.kind, text: row.text, deliver: row.deliver })) return;
@@ -139,7 +139,7 @@ export class Bridge {
 	}
 
 	closeAll(): void {
-		for (const conn of this.#conns.values()) conn.ws.close(1001, "hub stopping");
+		for (const conn of this.#conns.values()) conn.ws.terminate();
 		this.#conns.clear();
 		this.#wss.close();
 	}

@@ -34,7 +34,7 @@ export class UiChannel {
 
 	close(): void {
 		clearTimeout(this.#timer);
-		for (const ws of this.#clients) ws.close(1001, "hub stopping");
+		for (const ws of this.#clients) ws.terminate();
 		this.#clients.clear();
 	}
 }

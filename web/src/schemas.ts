@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { commands, historyPage } from "./transcript-schema.ts";
 
 const nullableText = z.string().nullable();
 const status = z.enum(["pending", "working", "awaiting", "done", "cancelled"]);
@@ -6,7 +7,7 @@ const proc = z.enum(["cold", "starting", "idle", "running", "approval", "stoppin
 export const fieldError = z.object({ path: z.string(), message: z.string() });
 const task = z.object({ id: z.string(), title: z.string(), workspace: z.string(), status, wait: z.object({ kind: z.enum(["question", "blocked", "no_report", "aborted", "error", "approval", "interrupted", "provision_failed"]), text: z.string() }).nullable(), sessionId: nullableText, branch: nullableText, playbook: nullableText, createdAt: z.number(), updatedAt: z.number() });
 const main = z.object({ sessionId: nullableText, state: proc, wakesUsed: z.number(), wakesMax: z.number(), paused: z.boolean(), pendingNotices: z.number() });
-const state = z.object({ version: z.string(), setup: z.object({ done: z.boolean(), homePath: nullableText }), main, pool: z.object({ live: z.number(), cap: z.number() }), inboxOpen: z.number(), openTasks: z.number() });
+const state = z.object({ version: z.string(), omp: z.object({ version: nullableText, path: nullableText, managed: z.boolean(), warning: nullableText }), setup: z.object({ done: z.boolean(), homePath: nullableText }), main, pool: z.object({ live: z.number(), cap: z.number() }), inboxOpen: z.number(), openTasks: z.number() });
 const session = z.object({ id: z.string(), kind: z.enum(["main", "worker"]), workspace: nullableText, worktreePath: nullableText, branch: nullableText, cwd: z.string(), model: z.string(), state: proc, pid: z.number().nullable(), rssMb: z.number().nullable(), lastActivity: z.number().nullable(), openTask: z.object({ id: z.string(), title: z.string(), status }).nullable(), retired: z.boolean(), createdAt: z.number() });
 const workspace = z.object({ id: z.string(), name: z.string(), repoPath: z.string(), defaultBase: z.string(), workerModel: nullableText, notesPath: z.string(), recipePath: z.string(), recipeStatus: z.enum(["missing", "ok", "invalid"]), liveSessions: z.number(), totalSessions: z.number(), openTasks: z.number(), archived: z.boolean() });
 const decision = z.object({ id: z.string(), taskId: nullableText, at: z.number(), summary: z.string(), why: z.string(), revert: z.string(), reverts: nullableText, revertRequestedAt: z.number().nullable(), revertedBy: nullableText });
@@ -15,7 +16,7 @@ const environment = z.object({ worktreeId: z.string(), worktreePath: z.string(),
 const service = z.object({ id: z.string(), workspace: z.string(), name: z.string(), kind: z.enum(["external", "run"]), state: z.enum(["down", "starting", "up", "failed"]), pid: z.number().nullable(), checkedAt: z.number().nullable(), error: nullableText, logTail: z.string() });
 const lease = z.object({ id: z.number(), kind: z.enum(["port", "db", "account"]), key: z.string(), label: z.string(), holderKind: z.enum(["worktree", "session", "service"]), holderId: z.string(), acquiredAt: z.number(), expiresAt: z.number().nullable() });
 const detail = task.extend({ brief: z.string(), envelope: nullableText, checkout: z.discriminatedUnion("kind", [z.object({ kind: z.literal("worktree"), base: z.string().optional(), branch: z.string().optional() }), z.object({ kind: z.literal("continue"), task: z.string(), session: z.enum(["reuse", "fresh"]) }), z.object({ kind: z.literal("readonly") })]), worktreePath: nullableText, related: z.array(z.string()), reports: z.array(z.object({ at: z.number(), status: z.enum(["done", "blocked", "question", "progress"]), summary: z.string(), details: nullableText })), events: z.array(z.object({ id: z.number(), at: z.number(), actor: z.enum(["main", "dispatcher", "worker", "human", "hub"]), kind: z.string(), summary: z.string(), data: z.record(z.string(), z.unknown()) })), decisions: z.array(decision), escalations: z.array(escalation), git: z.object({ dirty: z.boolean(), ahead: z.number(), head: z.string() }).nullable(), env: environment.nullable() });
-const settings = z.object({ homePath: z.string(), pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.string(), workerModel: nullableText, workerThinking: z.string(), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText });
+const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.string(), workerModel: nullableText, workerThinking: z.string(), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText });
 const recipe = z.object({ workspace: z.string(), path: z.string(), text: z.string(), status: z.enum(["missing", "ok", "invalid"]), errors: z.array(fieldError) });
 const topic = z.union([z.enum(["state", "tasks", "sessions", "inbox", "decisions", "workspaces", "resources", "settings"]), z.templateLiteral(["task:", z.string()])]);
 export const uiEvent = z.discriminatedUnion("t", [z.object({ t: z.literal("invalidate"), topics: z.array(topic) }), z.object({ t: z.literal("focus"), sessionId: z.string(), escalationId: nullableText, reason: z.string() }), z.object({ t: z.literal("toast"), level: z.enum(["info", "error"]), text: z.string() })]);
@@ -29,6 +30,9 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p === "/api/tasks") schema = z.array(task);
 	else if (p.startsWith("/api/tasks/")) schema = detail;
 	else if (p === "/api/sessions") schema = z.array(session);
+	else if (/^\/api\/sessions\/[^/]+\/commands$/.test(p)) schema = commands;
+	else if (/^\/api\/sessions\/[^/]+\/history$/.test(p)) schema = historyPage;
+	else if (/^\/api\/sessions\/[^/]+\/(prompt|abort|respond|subagents\/[^/]+\/(steer|cancel))$/.test(p)) schema = z.object({ ok: z.literal(true) });
 	else if (p.startsWith("/api/sessions/")) schema = session;
 	else if (p === "/api/inbox") schema = z.object({ escalations: z.array(escalation), main });
 	else if (p.startsWith("/api/escalations/")) schema = escalation;

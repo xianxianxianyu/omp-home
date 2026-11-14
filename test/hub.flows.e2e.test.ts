@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { after, test } from "node:test";
 import type { ResourcesDTO, SessionDTO, StateDTO, TaskDetail } from "../shared/api.ts";
-import { killHubs, sandbox, startHub, Term, until } from "./hub-harness.ts";
+import { killHubs, sandbox, startHub, Stream, until } from "./hub-harness.ts";
 
 /**
  * Hub flows beyond the happy path, with the fake omp: services, account leases and
@@ -44,10 +44,10 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	const capped = await hub.api<{ maxLiveWorkers: number }>("PUT", "/api/settings", { maxLiveWorkers: 1 });
 	assert.equal(capped.body.maxLiveWorkers, 1);
 	assert.equal((await hub.api("PUT", "/api/settings", { maxLiveWorkers: 0 })).status, 422);
-	const main = await new Term(hub, "M-1").open();
+	const main = await new Stream(hub, "M-1", box.home).open();
 
 	// T-1: read-only checkout; shared service started; home_env and home_lease from the worker.
-	main.type(send("Read only look", { kind: "readonly" }, "[fake:env]"));
+	main.agent(send("Read only look", { kind: "readonly" }, "[fake:env]"));
 	const t1 = await until("T-1 done", async () => {
 		const t = await task("T-1");
 		return t.status === "done" && t;
@@ -63,7 +63,7 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	const servicePid = res.services[0]!.pid!;
 
 	// T-2 needs a slot while W-1 is live at cap 1: queued until W-1 is evicted.
-	main.type(send("Hang in worktree", { kind: "worktree", branch: "feat/hang" }, "[fake:hang]"));
+	main.agent(send("Hang in worktree", { kind: "worktree", branch: "feat/hang" }, "[fake:hang]"));
 	await until("T-2 queued", async () => (await task("T-2")).events.some(e => e.kind === "queued_for_capacity"));
 	assert.equal((await task("T-2")).status, "pending");
 	assert.equal((await hub.api("POST", "/api/sessions/W-1/evict")).status, 200);
@@ -77,7 +77,7 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	assert.equal((await task("T-2")).status, "cancelled");
 
 	// T-3 continues T-2's worktree in the same session.
-	main.type(send("Continue it", { kind: "continue", task: "T-2", session: "reuse" }));
+	main.agent(send("Continue it", { kind: "continue", task: "T-2", session: "reuse" }));
 	const t3 = await until("T-3 done", async () => {
 		const t = await task("T-3");
 		return t.status === "done" && t;
@@ -100,7 +100,7 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 
 	// T-4: setup fails → provision_failed; fix the recipe and retry through home_send.
 	assert.equal((await hub.api("PUT", "/api/workspaces/deckhand/recipe", { text: recipe("echo broken >&2; exit 3") })).status, 200);
-	main.type(send("Needs setup", { kind: "worktree" }));
+	main.agent(send("Needs setup", { kind: "worktree" }));
 	const failed = await until("T-4 provision_failed", async () => {
 		const t = await task("T-4");
 		return t.wait?.kind === "provision_failed" && t;
@@ -109,7 +109,7 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	assert.equal(failed.env?.state, "failed");
 	assert.equal((await hub.api("PUT", "/api/workspaces/deckhand/recipe", { text: recipe("echo fixed > .setup-ok") })).status, 200);
 	let mark = main.out.length;
-	main.type(`/call home_send ${JSON.stringify({ task: "T-4", text: "Recipe fixed; go ahead." })}`);
+	main.agent(`/call home_send ${JSON.stringify({ task: "T-4", text: "Recipe fixed; go ahead." })}`);
 	await main.expect(/RESULT ok T-4 had failed setup; retrying it now/, mark);
 	const t4 = await until("T-4 done", async () => {
 		const t = await task("T-4");
@@ -120,12 +120,12 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 
 	// A decision revert reaches main as a prompt and resets the wake budget.
 	mark = main.out.length;
-	main.type(`/call home_decide ${JSON.stringify({ task: "T-4", decision: "Keep the old column", why: "reversible for now", revert: "drop it in a migration" })}`);
+	main.agent(`/call home_decide ${JSON.stringify({ task: "T-4", decision: "Keep the old column", why: "reversible for now", revert: "drop it in a migration" })}`);
 	await main.expect(/RESULT ok D-1 recorded for T-4/, mark);
 	mark = main.out.length;
 	const reverted = await hub.api<{ revertRequestedAt: number | null }>("POST", "/api/decisions/D-1/revert");
 	assert.ok(reverted.body.revertRequestedAt);
-	await main.expect(/PROMPT \[omp-home · the human asks to revert D-1\]/, mark);
+	await main.expect(/\[omp-home · the human asks to revert D-1\]/, mark);
 
 	// The shared service keeps running across tasks; the human can stop it.
 	const stopped = await hub.api<{ state: string }>("POST", `/api/services/${encodeURIComponent("deckhand/echo-svc")}/stop`);
@@ -149,8 +149,23 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	assert.equal(fresh.body.main.sessionId, "M-2");
 	await until("M-2 idle", async () => (await hub.api<StateDTO>("GET", "/api/state")).body.main.state === "idle");
 	assert.ok((await sessions()).find(s => s.id === "M-1")!.retired);
-	main.ws.close();
+	main.close();
 
 	hub.child.kill("SIGTERM");
 	assert.equal(await hub.exited, 0);
 });
+
+test("a hub stopped while omp is still starting exits promptly", { timeout: 60_000 }, async () => {
+	const box = sandbox();
+	// Real omp reads stdin only once it is ready; a first launch can take many seconds.
+	const hub = await startHub(box.configDir, { FAKE_OMP_START_DELAY_MS: "30000" });
+	assert.equal((await hub.api("POST", "/api/setup", { homePath: box.home, pstackRoot: null, migrateHome: true })).status, 200);
+	const main = await until("main spawned", async () => (await hub.api<SessionDTO[]>("GET", "/api/sessions")).body.find(s => s.id === "M-1" && s.pid));
+	assert.equal(main.state, "starting");
+	const stopAt = Date.now();
+	hub.child.kill("SIGTERM");
+	assert.equal(await hub.exited, 0);
+	assert.ok(Date.now() - stopAt < 4000, `shutdown took ${Date.now() - stopAt} ms`);
+	assert.throws(() => process.kill(main.pid!, 0), /ESRCH/);
+});
+

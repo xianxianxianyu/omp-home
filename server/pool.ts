@@ -10,18 +10,23 @@ import { admit, idleVictims, launchSpec, liveWorkers, procState, type PoolEntry,
 import type { Db } from "./db.ts";
 import { errorText, HubError } from "./errors.ts";
 import { hooksDir } from "./git.ts";
-import { PtyProcess, type PtyViewer } from "./pty.ts";
+import type { Resources } from "./resources.ts";
+import { RpcClient, RpcError, type RpcExit, type RpcFrame } from "./rpc.ts";
+import type { SessionSeed } from "./session-views.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { Workspaces } from "./workspaces.ts";
 
 const execFileP = promisify(execFile);
 const HELLO_TIMEOUT_MS = 60_000;
-const SHUTDOWN_GRACE_MS = 10_000;
+/** EOF → exit wait before SIGTERM; a hub stop (all sessions in parallel) must finish well inside the desktop shell's 10 s. */
+const SHUTDOWN_GRACE_MS = 3000;
 /** A worker must have been idle this long before it can be evicted to make room. */
 const MIN_IDLE_FOR_VICTIM_MS = 2 * 60_000;
 const MAIN_BACKOFF_MS = [1000, 5000, 30_000];
 const MAIN_FAILURE_WINDOW_MS = 5 * 60_000;
 const MAIN_FAILURE_LIMIT = 5;
+/** Messages per `get_messages_page`: small pages, because protocol v1 shortens strings until a frame fits 1 MiB. */
+const HISTORY_PAGE = 32;
 
 export interface SessionRow {
 	id: string;
@@ -50,6 +55,8 @@ export interface ExitInfo {
 	neverConnected: boolean;
 	exitCode: number;
 	incarnation: number;
+	/** Why: spawn error or the tail of omp's stderr. */
+	detail: string;
 }
 
 export interface PoolDeps {
@@ -57,35 +64,47 @@ export interface PoolDeps {
 	paths: HomePaths;
 	settings: SettingsStore;
 	workspaces: Workspaces;
-	repoDir: string;
-	ompBin: string;
+	resources: Resources;
+	/** The omp binary to spawn now (it can change when a managed copy is installed). */
+	ompBin(): string;
 	bridgeUrl: string;
 	envVars(worktreeId: string | null): Record<string, string>;
 	hasOpenEscalation(sessionId: string): boolean;
 	hadOpenRun(sessionId: string): boolean;
-	sendShutdown(sessionId: string): boolean;
+	/** UIs streaming this session; watched sessions are never evicted. */
+	viewers(sessionId: string): number;
+	/** A new process published its stored history; precedes every `frame` of that process. */
+	seeded(sessionId: string, seed: SessionSeed): void;
+	frame(sessionId: string, frame: RpcFrame): void;
+	/** Live: bridge connected and RPC set up (also after a bridge reconnect). */
+	ready(sessionId: string): void;
 	exited(session: SessionRow, info: ExitInfo): void;
 	changed(): void;
 	mainFailed(message: string): void;
+	log(message: string): void;
 }
 
 interface Live {
-	pty: PtyProcess | null;
+	rpc: RpcClient | null;
 	token: string;
 	incarnation: number;
 	proc: Proc;
 	running: boolean;
+	/** The bridge extension said hello. */
 	connected: boolean;
+	/** RPC set up and history seeded. */
+	initialized: boolean;
+	/** Frames that arrive while the history is being seeded; replayed right after the seed. */
+	backlog: RpcFrame[] | null;
+	client: PromiseWithResolvers<RpcClient>;
 	rssKb: number | null;
 	helloTimer: NodeJS.Timeout | undefined;
-	detach: Map<PtyViewer, () => void>;
 }
 
-/** Sole writer of `session`; owns every omp process (one PTY each) and the admission queue. */
+/** Sole writer of `session`; owns every omp process (`omp --mode rpc-ui` on stdio pipes) and the admission queue. */
 export class Pool {
 	readonly #d: PoolDeps;
 	readonly #live = new Map<string, Live>();
-	readonly #viewers = new Map<string, Set<PtyViewer>>();
 	#queue: string[] = [];
 	#mainFailures: number[] = [];
 	#restartTimer: NodeJS.Timeout | undefined;
@@ -149,7 +168,7 @@ export class Pool {
 			id: s.id,
 			kind: s.kind,
 			proc: this.#live.get(s.id)?.proc ?? { s: "cold" },
-			viewers: this.#viewers.get(s.id)?.size ?? 0,
+			viewers: this.#d.viewers(s.id),
 			openEscalation: this.#d.hasOpenEscalation(s.id),
 		}));
 	}
@@ -241,25 +260,30 @@ export class Pool {
 	}
 
 	#spawn(row: SessionRow): void {
+		const client = Promise.withResolvers<RpcClient>();
+		client.promise.catch(() => {});
 		const live: Live = {
-			pty: null,
+			rpc: null,
 			token: randomBytes(24).toString("hex"),
 			incarnation: row.incarnation + 1,
 			proc: { s: "starting", pid: 0, since: Date.now() },
 			running: false,
 			connected: false,
+			initialized: false,
+			backlog: [],
+			client,
 			rssKb: null,
 			helloTimer: undefined,
-			detach: new Map(),
 		};
 		this.#live.set(row.id, live);
 		this.#d.changed();
 		this.#launch(row, live).catch(err => {
 			if (this.#live.get(row.id) !== live) return;
 			this.#live.delete(row.id);
+			live.client.reject(new HubError("unavailable", `${row.id} could not start: ${errorText(err)}`));
+			this.#d.log(`${row.id}: could not start omp: ${errorText(err)}`);
 			this.#d.db.run("UPDATE session SET pid = NULL, last_exit = 'clean' WHERE id = ?", row.id);
-			this.#writeViewers(row.id, `\r\n[omp-home] could not start ${row.id}: ${errorText(err)}\r\n`);
-			this.#d.exited(this.must(row.id), { intentional: false, wasRunning: false, neverConnected: true, exitCode: -1, incarnation: live.incarnation });
+			this.#d.exited(this.must(row.id), { intentional: false, wasRunning: false, neverConnected: true, exitCode: -1, incarnation: live.incarnation, detail: errorText(err) });
 			this.#d.changed();
 			if (row.kind === "main") this.#mainCrashed(row.id);
 			this.#drainQueue();
@@ -288,7 +312,7 @@ export class Pool {
 			if (v !== undefined && !k.startsWith("OMP_HOME_") && !k.startsWith("GIT_CONFIG_")) baseEnv[k] = v;
 		}
 		const spec = launchSpec({
-			bin: this.#d.ompBin,
+			bin: this.#d.ompBin(),
 			session: {
 				id: row.id,
 				kind: row.kind,
@@ -299,46 +323,108 @@ export class Pool {
 				thinking,
 			},
 			paths: {
-				plugin: path.join(this.#d.repoDir, "omp-plugin", row.kind),
+				plugin: path.join(this.#d.resources.plugin, row.kind),
 				overlay: this.#d.paths.overlay(row.kind),
 				pstackPackage: settings.pstackRoot && fs.existsSync(path.join(this.#d.paths.pstackPackage, "package.json")) ? this.#d.paths.pstackPackage : null,
-				gitGuard: path.join(this.#d.repoDir, "git-guard"),
+				gitGuard: this.#d.resources.gitGuard,
 			},
 			bridge: { url: this.#d.bridgeUrl, token: live.token },
 			baseEnv,
 			worker,
 		});
-		const pty = new PtyProcess(spec);
-		live.pty = pty;
-		live.proc = { s: "starting", pid: pty.pid, since: Date.now() };
+		const rpc = new RpcClient(spec, frame => {
+			if (this.#live.get(row.id) !== live) return;
+			if (live.backlog) live.backlog.push(frame);
+			else this.#d.frame(row.id, frame);
+		});
+		live.rpc = rpc;
+		live.proc = { s: "starting", pid: rpc.pid, since: Date.now() };
 		this.#d.db.run(
 			"UPDATE session SET pid = ?, incarnation = ?, model = ?, thinking = ?, last_exit = NULL, last_activity = ? WHERE id = ?",
-			pty.pid,
+			rpc.pid,
 			live.incarnation,
 			model ?? "",
 			thinking,
 			Date.now(),
 			row.id,
 		);
-		for (const viewer of this.#viewers.get(row.id) ?? []) live.detach.set(viewer, pty.attach(viewer));
 		live.helloTimer = setTimeout(() => {
-			if (this.#live.get(row.id) !== live || live.connected) return;
-			this.#writeViewers(row.id, `\r\n[omp-home] ${row.id} did not connect to the hub within ${HELLO_TIMEOUT_MS / 1000}s; stopping it.\r\n`);
-			void pty.stop();
+			if (this.#live.get(row.id) !== live || (live.connected && live.initialized)) return;
+			this.#d.log(`${row.id}: omp did not ${live.initialized ? "connect to the hub" : "finish RPC setup"} within ${HELLO_TIMEOUT_MS / 1000}s; stopping it`);
+			void rpc.stop(SHUTDOWN_GRACE_MS);
 		}, HELLO_TIMEOUT_MS);
 		this.#d.changed();
-		void pty.exited.then(exit => this.#onExit(row.id, live, exit.exitCode));
+		void rpc.exited.then(exit => this.#onExit(row.id, live, exit));
+		void this.#initialize(row.id, live, rpc);
 	}
 
-	#onExit(id: string, live: Live, exitCode: number): void {
+	/** After `ready`: subscribe to subagent events, enable ask dialogs, seed history, then replay the backlog. */
+	async #initialize(id: string, live: Live, rpc: RpcClient): Promise<void> {
+		try {
+			await rpc.ready;
+			await rpc.request("set_subagent_subscription", { level: "events" });
+			await rpc.request("set_ask_dialog", { enabled: true });
+			const messages = await this.#history(id, rpc);
+			const commands = await rpc.request("get_available_commands");
+			const state = await rpc.request("get_state");
+			if (this.#live.get(id) !== live) return;
+			this.#d.seeded(id, { messages, commands, state });
+			const backlog = live.backlog ?? [];
+			live.backlog = null;
+			for (const frame of backlog) this.#d.frame(id, frame);
+			live.initialized = true;
+			live.client.resolve(rpc);
+			this.#settle(id, live);
+		} catch (err) {
+			if (this.#live.get(id) !== live || !rpc.alive) return;
+			this.#d.log(`${id}: omp RPC setup failed: ${errorText(err)}; stopping it`);
+			void rpc.stop(SHUTDOWN_GRACE_MS);
+		}
+	}
+
+	/** Every stored message, oldest first. A run that already started refuses paging; keep what we have. */
+	async #history(id: string, rpc: RpcClient): Promise<unknown[]> {
+		const messages: unknown[] = [];
+		let cursor: string | null = null;
+		do {
+			let page: unknown;
+			try {
+				page = await rpc.request("get_messages_page", cursor ? { cursor, limit: HISTORY_PAGE } : { limit: HISTORY_PAGE });
+			} catch (err) {
+				if (!(err instanceof RpcError) || err.code !== "session_busy") throw err;
+				this.#d.log(`${id}: history paging refused while a run is active; showing ${messages.length} messages`);
+				return messages;
+			}
+			const r = typeof page === "object" && page !== null ? page : {};
+			if ("messages" in r && Array.isArray(r.messages)) messages.push(...r.messages);
+			cursor = "nextCursor" in r && typeof r.nextCursor === "string" ? r.nextCursor : null;
+		} while (cursor);
+		return messages;
+	}
+
+	/** Live once both the bridge and RPC are up; every later bridge hello re-announces readiness. */
+	#settle(id: string, live: Live): void {
+		if (!live.connected || !live.initialized) return;
 		clearTimeout(live.helloTimer);
+		if (live.proc.s === "starting") {
+			const now = Date.now();
+			live.proc = { s: "live", pid: live.proc.pid, since: now, run: "idle", approval: false, asyncJobs: 0, lastActivity: now };
+			this.#d.changed();
+		}
+		if (live.proc.s === "live") this.#d.ready(id);
+	}
+
+	#onExit(id: string, live: Live, exit: RpcExit): void {
+		clearTimeout(live.helloTimer);
+		live.client.reject(new HubError("unavailable", `${id} exited before it was ready`));
 		if (this.#live.get(id) !== live) return;
 		this.#live.delete(id);
 		const intentional = live.proc.s === "stopping";
+		const exitCode = exit.code ?? -1;
 		this.#d.db.run("UPDATE session SET pid = NULL, last_exit = ?, last_activity = ? WHERE id = ?", live.running ? "lost" : "clean", Date.now(), id);
-		this.#writeViewers(id, `\r\n[omp-home] ${id} exited (code ${exitCode}).\r\n`);
+		if (!intentional) this.#d.log(`${id}: omp exited (${exit.signal ?? `code ${exitCode}`})${exit.detail ? `: ${exit.detail.slice(-1000)}` : ""}`);
 		const row = this.must(id);
-		this.#d.exited(row, { intentional, wasRunning: live.running, neverConnected: !live.connected, exitCode, incarnation: live.incarnation });
+		this.#d.exited(row, { intentional, wasRunning: live.running, neverConnected: !live.connected, exitCode, incarnation: live.incarnation, detail: exit.detail });
 		this.#d.changed();
 		if (row.kind === "main" && !intentional && !this.#shuttingDown && row.retired_at === null) this.#mainCrashed(id);
 		this.#drainQueue();
@@ -379,23 +465,42 @@ export class Pool {
 		return main;
 	}
 
-	/** Graceful stop: shutdown frame, then SIGTERM, then SIGKILL. Resolves when the process is gone. */
+	/** Graceful stop: close omp's stdin, then SIGTERM, then SIGKILL. Resolves when the process is gone. */
 	async stop(id: string, why: "evict" | "retire" | "restart" | "shutdown"): Promise<void> {
 		const live = this.#live.get(id);
 		if (!live) return;
 		if (live.proc.s === "stopping") {
-			await live.pty?.exited;
+			await live.rpc?.exited;
 			return;
 		}
-		if (!live.pty) {
+		if (!live.rpc) {
 			this.#live.delete(id);
+			live.client.reject(new HubError("unavailable", `${id} was stopped`));
 			this.#d.changed();
 			return;
 		}
-		live.proc = { s: "stopping", pid: live.pty.pid, why };
+		live.proc = { s: "stopping", pid: live.rpc.pid, why };
 		this.#d.changed();
-		if (this.#d.sendShutdown(id)) await Promise.race([live.pty.exited, sleep(SHUTDOWN_GRACE_MS)]);
-		await live.pty.stop();
+		await live.rpc.stop(SHUTDOWN_GRACE_MS);
+	}
+
+	/** The RPC client of a live (or starting) session, once it is set up. */
+	async client(id: string): Promise<RpcClient> {
+		const live = this.#live.get(id);
+		if (!live || live.proc.s === "stopping") throw new HubError("unavailable", `${id} is not running`);
+		const timeout = Promise.withResolvers<never>();
+		const timer = setTimeout(() => timeout.reject(new HubError("unavailable", `${id} did not finish starting within ${HELLO_TIMEOUT_MS / 1000}s`)), HELLO_TIMEOUT_MS);
+		try {
+			return await Promise.race([live.client.promise, timeout.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** Abort the running turn, if the session is up. */
+	async abort(id: string): Promise<void> {
+		const live = this.#live.get(id);
+		if (live?.initialized && live.rpc?.alive) await live.rpc.request("abort");
 	}
 
 	async evict(id: string): Promise<void> {
@@ -430,14 +535,10 @@ export class Pool {
 	onHello(id: string, hello: { ompSessionId: string; sessionFile: string | null }): void {
 		const live = this.#live.get(id);
 		if (!live) return;
-		clearTimeout(live.helloTimer);
 		live.connected = true;
-		if (live.proc.s === "starting") {
-			const now = Date.now();
-			live.proc = { s: "live", pid: live.proc.pid, since: now, run: "idle", approval: false, asyncJobs: 0, lastActivity: now };
-		}
 		this.#d.db.run("UPDATE session SET omp_session_id = ?, omp_session_file = coalesce(?, omp_session_file) WHERE id = ?", hello.ompSessionId, hello.sessionFile, id);
 		this.#d.changed();
+		this.#settle(id, live);
 	}
 
 	onDisconnect(id: string): void {
@@ -463,43 +564,15 @@ export class Pool {
 		}
 	}
 
+	/** Bridge connected and RPC set up: outbox rows may be delivered. */
+	isLive(id: string): boolean {
+		return this.#live.get(id)?.proc.s === "live";
+	}
+
 	/** Idle: live, connected, no run and no approval dialog. */
 	isIdle(id: string): boolean {
 		const live = this.#live.get(id);
 		return !!live && live.connected && live.proc.s === "live" && live.proc.run === "idle" && !live.proc.approval;
-	}
-
-	// ── terminals ────────────────────────────────────────────────────────────
-
-	/** Follow a session's terminal across restarts. Returns the detach function. */
-	watch(id: string, viewer: PtyViewer): () => void {
-		let set = this.#viewers.get(id);
-		if (!set) this.#viewers.set(id, (set = new Set()));
-		set.add(viewer);
-		const live = this.#live.get(id);
-		if (live?.pty) {
-			live.detach.set(viewer, live.pty.attach(viewer));
-			live.pty.repaint();
-		} else {
-			viewer.write(`\r\n[omp-home] ${id} is not running${this.queued(id) ? " (waiting for a worker slot)" : ""}.\r\n`);
-		}
-		return () => {
-			set.delete(viewer);
-			this.#live.get(id)?.detach.get(viewer)?.();
-			this.#live.get(id)?.detach.delete(viewer);
-		};
-	}
-
-	input(id: string, data: string): void {
-		this.#live.get(id)?.pty?.input(data);
-	}
-
-	resize(id: string, cols: number, rows: number): void {
-		this.#live.get(id)?.pty?.resize(cols, rows);
-	}
-
-	#writeViewers(id: string, text: string): void {
-		for (const viewer of this.#viewers.get(id) ?? []) viewer.write(text);
 	}
 
 	// ── periodic work ────────────────────────────────────────────────────────
@@ -509,7 +582,7 @@ export class Pool {
 		const idleMs = this.#d.settings.get().idleEvictMinutes * 60_000;
 		for (const id of idleVictims(this.#entries(), Date.now(), idleMs)) void this.stop(id, "evict");
 		this.#drainQueue();
-		const pids = [...this.#live.values()].map(l => l.pty?.pid).filter((p): p is number => !!p);
+		const pids = [...this.#live.values()].map(l => l.rpc?.pid).filter((p): p is number => !!p);
 		if (!pids.length) return;
 		const out = await execFileP("ps", ["-o", "pid=,rss=", "-p", pids.join(",")]).then(
 			r => r.stdout,
@@ -523,7 +596,7 @@ export class Pool {
 				.filter(p => p.length === 2)
 				.map(([pid, kb]) => [pid!, kb!]),
 		);
-		for (const live of this.#live.values()) if (live.pty) live.rssKb = rss.get(live.pty.pid) ?? null;
+		for (const live of this.#live.values()) if (live.rpc) live.rssKb = rss.get(live.rpc.pid) ?? null;
 		this.#d.changed();
 	}
 

@@ -76,7 +76,7 @@ export interface LaunchSpec {
 
 export function launchSpec(i: LaunchInput): LaunchSpec {
 	const s = i.session;
-	const args = ["--cwd", s.cwd, "--session-dir", s.sessionDir, "--config", i.paths.overlay, "-e", i.paths.plugin];
+	const args = ["--mode", "rpc-ui", "--cwd", s.cwd, "--session-dir", s.sessionDir, "--config", i.paths.overlay, "-e", i.paths.plugin];
 	if (i.paths.pstackPackage) args.push("-e", i.paths.pstackPackage);
 	if (s.model) args.push("--model", s.model);
 	args.push("--thinking", s.thinking, "--approval-mode", "yolo", "--no-title");
@@ -88,8 +88,6 @@ export function launchSpec(i: LaunchInput): LaunchSpec {
 		[BRIDGE_ENV.url]: i.bridge.url,
 		[BRIDGE_ENV.token]: i.bridge.token,
 		[BRIDGE_ENV.session]: s.id,
-		TERM: "xterm-256color",
-		COLORTERM: "truecolor",
 	};
 	if (i.worker) {
 		Object.assign(env, {

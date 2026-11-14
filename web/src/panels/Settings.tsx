@@ -4,11 +4,14 @@ import type { FieldError, SettingsDTO, SettingsPatch } from "../../../shared/api
 import { ApiError } from "../api.ts";
 import { useHub, useResource } from "../hub.tsx";
 import { Button, CopyButton, ErrorState, Field, Loading, Section, Status } from "../ui.tsx";
+import { notificationPermission } from "../native.ts";
+import type { NotificationState } from "../native.ts";
 
 type SettingsValues = { [Key in Exclude<keyof SettingsDTO, "homePath" | "portRange">]: string } & { portStart: string; portEnd: string };
 
 function formValues(settings: SettingsDTO): SettingsValues {
 	return {
+		ompPath: settings.ompPath ?? "",
 		pstackRoot: settings.pstackRoot ?? "",
 		mainModel: settings.mainModel ?? "",
 		mainThinking: settings.mainThinking,
@@ -26,9 +29,11 @@ function formValues(settings: SettingsDTO): SettingsValues {
 
 export function SettingsPanel() {
 	const { data, error, loading, reload } = useResource<SettingsDTO>("settings", "/api/settings");
+	const { state } = useHub();
 	return (
 		<div className="stack">
 			<div className="panel-heading"><div><h2>Settings</h2><p className="muted">Configure models, worker capacity, and local paths.</p></div></div>
+			{state && <Section title="omp runtime"><div className="card"><h3>omp {state.omp.version ?? "not detected"}</h3><p className="muted">{state.omp.managed ? "Managed runtime" : "User-provided runtime"}</p><code className="prewrap">{state.omp.path ?? "No executable found"}</code>{state.omp.warning && <p className="error-text" role="alert">{state.omp.warning}</p>}</div></Section>}
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data && <SettingsForm settings={data} />}
@@ -62,6 +67,7 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 		setError(null);
 		setErrors([]);
 		const patch: SettingsPatch = {
+			ompPath: values.ompPath.trim() || null,
 			pstackRoot: values.pstackRoot.trim() || null,
 			mainModel: values.mainModel.trim() || null,
 			mainThinking: values.mainThinking.trim(),
@@ -90,6 +96,7 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 		<form onSubmit={(event) => { void save(event); }} className="stack">
 			<Section title="Local paths">
 				<div className="card"><div className="muted">Home path</div><div className="row"><code className="prewrap grow">{settings.homePath}</code><CopyButton text={settings.homePath} /></div><p className="hint">The home path is fixed during setup and cannot be changed here.</p></div>
+				<Field label="omp binary" hint="Explicit omp executable. Leave empty to use managed omp or PATH."><input aria-label="omp binary" value={values.ompPath} onChange={event => change("ompPath", event.target.value)} placeholder="Managed / PATH" disabled={saving} /></Field>
 				<Field label="pstack root" hint="Path to your pstack skills. Leave blank to disable pstack integration.">
 					<input value={values.pstackRoot} onChange={(event) => change("pstackRoot", event.target.value)} placeholder="/path/to/pstack" disabled={saving} />
 				</Field>
@@ -133,18 +140,18 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 
 function NotificationSettings() {
 	const { toast } = useHub();
-	const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
+	const [permission, setPermission] = useState<NotificationState>("default");
 
 	useEffect(() => {
-		if (typeof Notification === "undefined") return;
-		const update = () => setPermission(Notification.permission);
+		const update = () => { void notificationPermission().then(setPermission); };
+		update();
 		window.addEventListener("focus", update);
 		return () => window.removeEventListener("focus", update);
 	}, []);
 
 	async function requestPermission() {
 		try {
-			const next = await Notification.requestPermission();
+			const next = await notificationPermission(true);
 			setPermission(next);
 			if (next === "granted") toast("Desktop notifications enabled");
 			else if (next === "denied") toast("Notifications are blocked. You can enable them in your browser’s site settings.");
@@ -157,7 +164,7 @@ function NotificationSettings() {
 		<Section title="Desktop notifications">
 			<div className="card">
 				<div className="row wrap"><h3 className="grow">When a worker needs you</h3><Status value={permission === "granted" ? "enabled" : permission === "default" ? "not requested" : permission} /></div>
-				<p className="muted">Show a browser notification when a worker needs your attention while this page is hidden.</p>
+				<p className="muted">Get a desktop notification when a worker needs you or main pauses. Browser notifications appear while this page is hidden.</p>
 				{permission === "unsupported" ? <p className="hint">This browser does not support desktop notifications.</p> : <>
 					<Button onClick={requestPermission} disabled={permission !== "default"}>{permission === "granted" ? "Notifications enabled" : permission === "denied" ? "Notifications blocked" : "Enable notifications"}</Button>
 					{permission === "denied" && <p className="hint">Allow notifications for this site in your browser settings, then return to this page.</p>}

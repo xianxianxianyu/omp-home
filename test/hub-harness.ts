@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import WebSocket from "ws";
+import { emptyTranscript, reduceTranscript, type Item, type TranscriptEvent, type TranscriptView } from "../shared/transcript.ts";
 
-/** Shared harness for hub end-to-end tests: a temp git repo, the hub as a child process, terminals. */
+/** Shared harness for hub end-to-end tests: a temp git repo, the hub as a child process, session streams. */
 
 export const repoDir = path.resolve(import.meta.dirname, "..");
 const hubs: ChildProcess[] = [];
@@ -44,11 +45,25 @@ export interface Hub {
 	api<T>(method: string, route: string, body?: unknown): Promise<{ status: number; body: T }>;
 }
 
-export async function startHub(configDir: string, env: Record<string, string> = {}): Promise<Hub> {
-	const child = spawn(process.execPath, [path.join(repoDir, "server/main.ts"), "--port", "0", "--no-open"], {
+function spawnHub(configDir: string, env: Record<string, string>): ChildProcess {
+	return spawn(process.execPath, [path.join(repoDir, "server/main.ts"), "--port", "0", "--no-open"], {
 		env: { ...process.env, ...env, OMP_HOME_CONFIG_DIR: configDir, OMP_HOME_OMP_BIN: path.join(repoDir, "test/fake-omp.ts") },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
+}
+
+/** Run a hub to completion (e.g. a second instance that must refuse to start). */
+export async function runHub(configDir: string): Promise<{ code: number | null; stdout: string }> {
+	const child = spawnHub(configDir, {});
+	hubs.push(child);
+	let stdout = "";
+	child.stdout!.on("data", d => (stdout += String(d)));
+	const [code] = (await once(child, "exit")) as [number | null];
+	return { code, stdout };
+}
+
+export async function startHub(configDir: string, env: Record<string, string> = {}): Promise<Hub> {
+	const child = spawnHub(configDir, env);
 	hubs.push(child);
 	let stderr = "";
 	child.stderr!.on("data", d => (stderr += String(d)));
@@ -57,7 +72,7 @@ export async function startHub(configDir: string, env: Record<string, string> = 
 	let stdout = "";
 	child.stdout!.on("data", d => {
 		stdout += String(d);
-		const m = /listening on http:\/\/127\.0\.0\.1:(\d+)\/\?token=(\S+)/.exec(stdout);
+		const m = /^omp-home ready http:\/\/127\.0\.0\.1:(\d+)\/\?token=(\S+)$/m.exec(stdout);
 		if (m) resolve({ port: Number(m[1]), token: decodeURIComponent(m[2]!) });
 	});
 	void exited.then(code => reject(new Error(`hub exited (${code}) before listening:\n${stderr}`)));
@@ -93,14 +108,48 @@ export async function until<T>(label: string, probe: () => Promise<T | null | un
 	throw new Error(`timed out waiting for ${label}${last ? `: ${String(last)}` : ""}`);
 }
 
-/** A viewer on /api/term/:session that can type into the session's TUI. */
-export class Term {
-	readonly ws: WebSocket;
-	out = "";
+function itemText(item: Item): string {
+	switch (item.kind) {
+		case "user":
+		case "notice":
+			return item.text;
+		case "assistant":
+			return item.streaming ? "" : item.blocks.flatMap(b => (b.kind === "text" ? [b.text] : [])).join("");
+		case "request":
+			return "title" in item.request ? item.request.title : "ask";
+	}
+}
 
-	constructor(hub: Hub, session: string) {
-		this.ws = new WebSocket(`ws://127.0.0.1:${hub.port}/api/term/${session}?token=${hub.token}`);
-		this.ws.on("message", d => (this.out += String(d)));
+/**
+ * A UI on WS /api/sessions/:id/stream: folds every event into `view` like the web UI, and logs
+ * finished items, status-line changes and answers into `out` for `expect`.
+ */
+export class Stream {
+	readonly ws: WebSocket;
+	readonly events: TranscriptEvent[] = [];
+	view: TranscriptView = emptyTranscript();
+	out = "";
+	closed: { code: number; reason: string } | null = null;
+	readonly #hub: Hub;
+	readonly #session: string;
+	readonly #sessionDir: string;
+
+	/** `home` locates the fake omp's agent script for `agent()`. */
+	constructor(hub: Hub, session: string, home: string) {
+		this.#hub = hub;
+		this.#session = session;
+		this.#sessionDir = path.join(home, ".omp-home", session.startsWith("M-") ? "chat" : "sessions", session);
+		this.ws = new WebSocket(`ws://127.0.0.1:${hub.port}/api/sessions/${session}/stream?token=${hub.token}`);
+		this.ws.on("message", d => {
+			const ev = JSON.parse(String(d)) as TranscriptEvent;
+			this.events.push(ev);
+			this.view = reduceTranscript(this.view, ev);
+			if (ev.t === "reset") this.out += `${[...ev.view.items.map(itemText), ...Object.values(ev.view.status.statusLine)].join("\n")}\n`;
+			else if (ev.t === "item" && itemText(ev.item)) this.out += `${itemText(ev.item)}\n`;
+			else if (ev.t === "status" && ev.patch.statusLine) this.out += `${Object.values(ev.patch.statusLine).join("\n")}\n`;
+			else if (ev.t === "request_closed") this.out += `answered ${ev.answer}\n`;
+		});
+		this.ws.on("close", (code, reason) => (this.closed = { code, reason: String(reason) }));
 	}
 
 	async open(): Promise<this> {
@@ -108,12 +157,23 @@ export class Term {
 		return this;
 	}
 
-	type(line: string): void {
-		this.ws.send(JSON.stringify({ type: "input", data: `${line}\r` }));
+	/** The human types into the session's composer. */
+	async prompt(text: string, mode?: "auto" | "steer" | "followUp"): Promise<void> {
+		const r = await this.#hub.api("POST", `/api/sessions/${this.#session}/prompt`, { text, ...(mode ? { mode } : {}) });
+		if (r.status !== 200) throw new Error(`prompt failed: ${r.status} ${JSON.stringify(r.body)}`);
+	}
+
+	/** The session's agent acts on its own (fake omp: `/dispatch …`, `/call <tool> …`); not human input. */
+	agent(line: string): void {
+		fs.appendFileSync(path.join(this.#sessionDir, "fake-agent.txt"), `${line}\n`);
 	}
 
 	/** Wait for output matching `re` after offset `from` of `out`. */
 	expect(re: RegExp, from = 0, timeoutMs = 20_000): Promise<string> {
-		return until(`terminal output ${re}`, async () => re.exec(this.out.slice(from))?.[0], timeoutMs);
+		return until(`stream output ${re}`, async () => re.exec(this.out.slice(from))?.[0], timeoutMs);
+	}
+
+	close(): void {
+		this.ws.close();
 	}
 }

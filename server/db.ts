@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
+import { resolveResources } from "./resources.ts";
 
 const SCHEMA_VERSION = "1";
-const SCHEMA_FILE = path.join(import.meta.dirname, "schema.sql");
+const SCHEMA_FILE = resolveResources().schema;
 
 export type IdKind = "T" | "W" | "M" | "WT" | "D" | "E";
 export type Param = SQLInputValue;

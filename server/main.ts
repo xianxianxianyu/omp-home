@@ -1,29 +1,63 @@
 import { execFile } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
-import { loadConfig } from "./config.ts";
+import pkg from "../package.json" with { type: "json" };
+import { configDir, loadConfig, saveConfig } from "./config.ts";
 import { HubServer } from "./http.ts";
+import { adoptLoginEnv, ALREADY_RUNNING_EXIT, HubLock } from "./instance.ts";
+import { resolveResources } from "./resources.ts";
 
-/** Entry: `node server/main.ts [--port N] [--no-open]`. */
+/**
+ * Entry: `node server/main.ts [--port N] [--no-open]` (bundled: `node hub.mjs`).
+ * Env: OMP_HOME_CONFIG_DIR, OMP_HOME_RESOURCES, OMP_HOME_LOGIN_ENV=1, OMP_HOME_OMP_BIN (tests).
+ * stdout carries exactly one machine-readable line: `omp-home ready <url>` once serving, or
+ * `omp-home already running <url>` with exit code 75 when another hub holds this config dir.
+ */
 const { values } = parseArgs({
 	options: { port: { type: "string" }, "no-open": { type: "boolean", default: false } },
 	strict: true,
 });
-
-const repoDir = path.resolve(import.meta.dirname, "..");
-const version = (JSON.parse(fs.readFileSync(path.join(repoDir, "package.json"), "utf8")) as { version?: string }).version ?? "0.0.0";
-const config = loadConfig();
-const port = values.port ? Number(values.port) : config.port;
-if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid --port ${values.port}`);
+const requestedPort = values.port === undefined ? null : Number(values.port);
+if (requestedPort !== null && (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535)) throw new Error(`invalid --port ${values.port}`);
 
 const log = (message: string) => process.stderr.write(`[omp-home ${new Date().toISOString()}] ${message}\n`);
-const server = new HubServer({ config, repoDir, ompBin: process.env.OMP_HOME_OMP_BIN ?? "omp", version, log });
-const bound = await server.listen(port);
+if (process.env.OMP_HOME_LOGIN_ENV === "1") adoptLoginEnv(log);
+
+const dir = configDir();
+const taken = HubLock.acquire(dir);
+if (!taken.held) {
+	let other = taken.other;
+	for (let i = 0; i < 100 && other.url === null; i++) {
+		await sleep(100);
+		other = HubLock.peek(dir) ?? other;
+	}
+	process.stdout.write(`omp-home already running ${other.url ?? `(pid ${other.pid}, still starting)`}\n`);
+	process.exit(ALREADY_RUNNING_EXIT);
+}
+const lock = taken.lock;
+process.on("exit", () => lock.release());
+
+const config = loadConfig();
+const server = new HubServer({ config, configDir: dir, resources: resolveResources(), version: pkg.version, log });
+let port: number;
+if (requestedPort !== null) {
+	port = await server.listen(requestedPort);
+} else {
+	try {
+		port = await server.listen(config.port);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
+		port = await server.listen(0);
+		log(`port ${config.port} is in use; using ${port} from now on`);
+		config.port = port;
+		saveConfig(config);
+	}
+}
+const url = `http://127.0.0.1:${port}/?token=${encodeURIComponent(config.token)}`;
+lock.publish(url);
 await server.boot();
 
-const url = `http://127.0.0.1:${bound}/?token=${encodeURIComponent(config.token)}`;
-process.stdout.write(`omp-home ${version} listening on ${url}\n${config.homePath ? `home: ${config.homePath}` : "first run: open the URL to choose the home repo"}\n`);
+process.stdout.write(`omp-home ${pkg.version} listening on ${url}\n${config.homePath ? `home: ${config.homePath}` : "first run: open the URL to choose the home repo"}\nomp-home ready ${url}\n`);
 if (!values["no-open"] && process.platform === "darwin") execFile("open", [url], () => {});
 
 let stopping = false;

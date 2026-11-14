@@ -10,7 +10,9 @@ import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskI
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError } from "./errors.ts";
 import { GitError } from "./git.ts";
+import type { Resources } from "./resources.ts";
 import { Hub } from "./hub.ts";
+import { OmpManager } from "./omp.ts";
 import { generatePstackPackage } from "./pstack.ts";
 import { defaultSettings } from "./settings.ts";
 import { applySetup, previewSetup } from "./setup.ts";
@@ -18,8 +20,8 @@ import { UiChannel } from "./ui.ts";
 
 export interface ServerOptions {
 	config: HubConfig;
-	repoDir: string;
-	ompBin: string;
+	configDir: string;
+	resources: Resources;
 	version: string;
 	log(message: string): void;
 }
@@ -57,10 +59,18 @@ const setupSchema = z.strictObject({
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(2000).optional() });
 const textSchema = z.object({ text: z.string().min(1).max(20_000) });
 const recipeSchema = z.object({ text: z.string().max(200_000) });
-const termInput = z.discriminatedUnion("type", [
-	z.object({ type: z.literal("input"), data: z.string() }),
-	z.object({ type: z.literal("resize"), cols: z.number().int().min(1).max(1000), rows: z.number().int().min(1).max(500) }),
-]);
+const promptSchema = z.strictObject({ text: z.string().min(1).max(20_000), mode: z.enum(["auto", "steer", "followUp"]).optional() });
+const respondSchema = z.strictObject({
+	requestId: z.string().min(1),
+	response: z.union([
+		z.strictObject({ value: z.string().max(200_000) }),
+		z.strictObject({ confirmed: z.boolean() }),
+		z.strictObject({ answers: z.array(z.strictObject({ id: z.string(), selectedOptions: z.array(z.string()), customInput: z.string().optional() })) }),
+		z.strictObject({ cancelled: z.literal(true) }),
+	]),
+});
+/** WS close code when a session cannot be started for a stream (no free worker slot); the reason says why. */
+const STREAM_UNAVAILABLE = 4503;
 
 function parse<T>(schema: z.ZodType<T>, body: unknown): T {
 	const r = schema.safeParse(body ?? {});
@@ -86,12 +96,14 @@ export class HubServer {
 	readonly #wss = new WebSocketServer({ noServer: true });
 	readonly #routes: Route[] = [];
 	readonly #dist: string;
+	readonly #omp: OmpManager;
 	#hub: Hub | null = null;
 	#port = 0;
 
 	constructor(opts: ServerOptions) {
 		this.#o = opts;
-		this.#dist = path.join(opts.repoDir, "web", "dist");
+		this.#dist = opts.resources.web;
+		this.#omp = new OmpManager({ configDir: opts.configDir, pluginDir: opts.resources.plugin, log: opts.log });
 		this.#server = http.createServer((req, res) => {
 			this.#handle(req, res).catch(err => {
 				this.#o.log(`${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
@@ -117,22 +129,39 @@ export class HubServer {
 		return this.#port;
 	}
 
-	/** Open the configured home (if any) and start its main chat. */
+	/** Resolve omp, open the configured home (if any) and start its main chat. */
 	async boot(): Promise<void> {
 		const home = this.#o.config.homePath;
-		if (!home || !fs.existsSync(home)) return;
-		const hub = new Hub({ home, repoDir: this.#o.repoDir, ompBin: this.#o.ompBin, port: this.#port, ui: this.#ui, log: this.#o.log });
+		if (!home || !fs.existsSync(home)) {
+			await this.#resolveOmp(null);
+			return;
+		}
+		const hub = this.#newHub(home);
 		this.#hub = hub;
+		await this.#resolveOmp(hub.settings.get().ompPath);
 		await hub.start();
 		this.#ui.invalidate("state", "settings");
 	}
 
+	#newHub(home: string): Hub {
+		return new Hub({ home, resources: this.#o.resources, omp: this.#omp, port: this.#port, ui: this.#ui, log: this.#o.log });
+	}
+
+	async #resolveOmp(explicit: string | null): Promise<void> {
+		const status = await this.#omp.resolve(explicit);
+		if (status.warning) this.#ui.send({ t: "toast", level: "error", text: status.warning });
+		this.#ui.invalidate("state");
+	}
+
+	/** Shutdown: drop UI sockets at once (a connected window must not hold the hub open), stop omp, close HTTP. */
 	async close(): Promise<void> {
-		this.#ui.close();
-		await this.#hub?.stop();
-		this.#hub = null;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#server.close(() => resolve());
+		this.#ui.close();
+		for (const ws of this.#wss.clients) ws.terminate();
+		this.#server.closeAllConnections();
+		await this.#hub?.stop();
+		this.#hub = null;
 		this.#server.closeAllConnections();
 		await promise;
 	}
@@ -225,30 +254,27 @@ export class HubServer {
 			this.#wss.handleUpgrade(req, socket, head, ws => this.#ui.add(ws));
 			return;
 		}
-		const term = /^\/api\/term\/([^/]+)$/.exec(url.pathname);
-		if (term && this.#hub) {
+		const stream = /^\/api\/sessions\/([^/]+)\/stream$/.exec(url.pathname);
+		if (stream && this.#hub) {
 			const hub = this.#hub;
 			let id: string;
 			try {
-				id = parseSessionId(decodeURIComponent(term[1]!));
+				id = parseSessionId(decodeURIComponent(stream[1]!));
 				hub.pool.must(id);
 			} catch {
 				return reject("404 Not Found");
 			}
 			this.#wss.handleUpgrade(req, socket, head, ws => {
-				const detach = hub.pool.watch(id, { write: data => ws.readyState === ws.OPEN && ws.send(data) });
-				ws.on("message", raw => {
-					let msg: unknown;
-					try {
-						msg = JSON.parse(String(raw));
-					} catch {
-						return;
-					}
-					const input = termInput.safeParse(msg);
-					if (!input.success) return;
-					if (input.data.type === "input") hub.pool.input(id, input.data.data);
-					else hub.pool.resize(id, input.data.cols, input.data.rows);
-				});
+				let detach: () => void;
+				try {
+					detach = hub.stream(id, ev => {
+						if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(ev));
+					});
+				} catch (err) {
+					if (!(err instanceof HubError)) throw err;
+					ws.close(STREAM_UNAVAILABLE, Buffer.from(err.message).subarray(0, 120).toString());
+					return;
+				}
 				ws.on("close", detach);
 				ws.on("error", () => ws.close());
 			});
@@ -267,6 +293,7 @@ export class HubServer {
 			pool: { live: 0, cap: s.maxLiveWorkers },
 			inboxOpen: 0,
 			openTasks: 0,
+			omp: this.#omp.status(),
 		};
 	}
 
@@ -283,19 +310,20 @@ export class HubServer {
 		r("GET", "/api/settings", () => this.#hub?.settings.dto() ?? { homePath: this.#o.config.homePath ?? DEFAULT_HOME, ...defaultSettings() });
 		r("PUT", "/api/settings", ({ body }) => {
 			const h = hub();
-			const before = h.settings.get().pstackRoot;
+			const before = h.settings.get();
 			const next = h.settings.update(body);
-			if (next.pstackRoot !== before) generatePstackPackage(next.pstackRoot, h.paths.pstackPackage);
+			if (next.pstackRoot !== before.pstackRoot) generatePstackPackage(next.pstackRoot, h.paths.pstackPackage);
+			if (next.ompPath !== before.ompPath) void this.#resolveOmp(next.ompPath).catch(err => this.#o.log(`omp: ${errorText(err)}`));
 			h.changed("settings", "state");
 			h.notifier.evaluate();
 			void h.pool.tick();
 			return h.settings.dto();
 		});
-		r("GET", "/api/setup/preview", ({ url }) => previewSetup(url.searchParams.get("home") || this.#o.config.homePath || DEFAULT_HOME, this.#o.repoDir));
+		r("GET", "/api/setup/preview", ({ url }) => previewSetup(url.searchParams.get("home") || this.#o.config.homePath || DEFAULT_HOME, this.#o.resources.templates));
 		r("POST", "/api/setup", async ({ body }) => {
 			const req = parse(setupSchema, body);
 			const home = path.resolve(req.homePath);
-			applySetup(home, this.#o.repoDir, req.migrateHome);
+			applySetup(home, this.#o.resources.templates, req.migrateHome);
 			if (this.#hub && this.#hub.home !== home) {
 				await this.#hub.stop();
 				this.#hub = null;
@@ -306,7 +334,7 @@ export class HubServer {
 				this.#hub.settings.update({ pstackRoot: req.pstackRoot });
 				generatePstackPackage(req.pstackRoot, this.#hub.paths.pstackPackage);
 			} else {
-				const h = new Hub({ home, repoDir: this.#o.repoDir, ompBin: this.#o.ompBin, port: this.#port, ui: this.#ui, log: this.#o.log });
+				const h = this.#newHub(home);
 				try {
 					h.settings.update({ pstackRoot: req.pstackRoot });
 				} catch (err) {
@@ -314,6 +342,7 @@ export class HubServer {
 					throw err;
 				}
 				this.#hub = h;
+				await this.#resolveOmp(h.settings.get().ompPath);
 				await h.start();
 			}
 			this.#ui.invalidate("state", "settings", "sessions");
@@ -345,9 +374,9 @@ export class HubServer {
 			await hub().cleanupTask(id);
 			return hub().taskDetail(id);
 		});
-		r("POST", "/api/tasks/:id/message", ({ params, body }) => {
+		r("POST", "/api/tasks/:id/message", async ({ params, body }) => {
 			const id = parseTaskId(params[0]);
-			hub().sendToTask({ taskId: id, text: parse(textSchema, body).text, mode: "next", by: "human", decision: null, dedupe: uiKey() });
+			await hub().messageTask(id, parse(textSchema, body).text, uiKey());
 			return hub().taskDetail(id);
 		});
 
@@ -393,6 +422,34 @@ export class HubServer {
 			if (open) throw new HubError("conflict", `${id} has open task ${open.id}; close it first`);
 			await h.pool.retire(id);
 			return h.sessionDTO(h.pool.must(id));
+		});
+		r("POST", "/api/sessions/:id/prompt", async ({ params, body }) => {
+			const p = parse(promptSchema, body);
+			await hub().prompt(parseSessionId(params[0]), p.text, p.mode ?? "auto");
+			return { ok: true };
+		});
+		r("POST", "/api/sessions/:id/abort", async ({ params }) => {
+			await hub().abort(parseSessionId(params[0]));
+			return { ok: true };
+		});
+		r("POST", "/api/sessions/:id/respond", async ({ params, body }) => {
+			const p = parse(respondSchema, body);
+			await hub().respond(parseSessionId(params[0]), p.requestId, p.response);
+			return { ok: true };
+		});
+		r("GET", "/api/sessions/:id/commands", ({ params }) => hub().commands(parseSessionId(params[0])));
+		r("GET", "/api/sessions/:id/history", ({ params, url }) => {
+			const before = url.searchParams.get("before");
+			if (!before) throw new HubError("invalid", "pass before=<id of the first item you hold>");
+			return hub().history(parseSessionId(params[0]), before);
+		});
+		r("POST", "/api/sessions/:id/subagents/:agent/steer", async ({ params, body }) => {
+			await hub().steerSubagent(parseSessionId(params[0]), params[1]!, parse(textSchema, body).text);
+			return { ok: true };
+		});
+		r("POST", "/api/sessions/:id/subagents/:agent/cancel", async ({ params }) => {
+			await hub().cancelSubagent(parseSessionId(params[0]), params[1]!);
+			return { ok: true };
 		});
 		r("POST", "/api/main/restart", async () => {
 			await hub().pool.restartMain();

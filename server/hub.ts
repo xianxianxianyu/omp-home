@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { DecisionDTO, EscalationDTO, InboxDTO, SessionDTO, StateDTO, TaskDetail, Topic } from "../shared/api.ts";
+import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, PromptRequest, SessionDTO, StateDTO, TaskDetail, Topic } from "../shared/api.ts";
 import type { BridgeToHub } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
+import type { TranscriptEvent, UiResponse } from "../shared/transcript.ts";
 import { Bridge, type CallFrame, type CallResult } from "./bridge.ts";
 import { homePaths, type HomePaths } from "./config.ts";
 import { Db } from "./db.ts";
@@ -11,20 +12,25 @@ import { Env } from "./env.ts";
 import { errorText, HubError } from "./errors.ts";
 import { removeWorktree, worktreeStatus, Worktrees } from "./git.ts";
 import { Indexer } from "./indexer.ts";
-import { isOpen, Ledger, waitOf, type ApplyResult, type DecisionRow, type EscalationRow } from "./ledger.ts";
+import { isOpen, Ledger, waitOf, type ApplyResult, type DecisionRow, type EscalationRow, type TaskRow } from "./ledger.ts";
 import { Notifier } from "./notify.ts";
+import type { OmpManager } from "./omp.ts";
 import { Pool, type ExitInfo, type SessionRow } from "./pool.ts";
 import { Provisioner } from "./provisioner.ts";
+import type { Resources } from "./resources.ts";
+import { RpcError, type RpcFrame } from "./rpc.ts";
+import { SessionViews } from "./session-views.ts";
 import { generatePstackPackage } from "./pstack.ts";
 import { SettingsStore } from "./settings.ts";
 import { createTools } from "./tools.ts";
+import { answerText, responseFits } from "./transcript.ts";
 import type { UiChannel } from "./ui.ts";
 import { Workspaces } from "./workspaces.ts";
 
 export interface HubOptions {
 	home: string;
-	repoDir: string;
-	ompBin: string;
+	resources: Resources;
+	omp: OmpManager;
 	port: number;
 	ui: UiChannel;
 	log(message: string): void;
@@ -50,6 +56,8 @@ export class Hub {
 	readonly bridge: Bridge;
 	readonly notifier: Notifier;
 	readonly provisioner: Provisioner;
+	readonly views: SessionViews;
+	readonly omp: OmpManager;
 	readonly #ui: UiChannel;
 	readonly #log: (message: string) => void;
 	readonly #callTool: (session: SessionRow, frame: CallFrame) => Promise<CallResult>;
@@ -61,6 +69,8 @@ export class Hub {
 		this.paths = homePaths(opts.home);
 		this.#ui = opts.ui;
 		this.#log = opts.log;
+		this.omp = opts.omp;
+		this.views = new SessionViews((id, level, text) => this.#ui.send({ t: "toast", level, text: `${id}: ${text}` }));
 		this.db = new Db(this.paths.db);
 		this.settings = new SettingsStore(this.db, this.paths);
 		this.ledger = new Ledger(this.db);
@@ -73,13 +83,20 @@ export class Hub {
 			paths: this.paths,
 			settings: this.settings,
 			workspaces: this.workspaces,
-			repoDir: opts.repoDir,
-			ompBin: opts.ompBin,
+			resources: opts.resources,
+			ompBin: () => this.omp.bin(),
 			bridgeUrl: `ws://127.0.0.1:${opts.port}/bridge`,
 			envVars: wt => this.env.varsOf(wt),
 			hasOpenEscalation: id => !!this.db.get("SELECT 1 FROM escalation WHERE session_id = ? AND resolved_at IS NULL", id),
 			hadOpenRun: id => this.ledger.latestForSession(id)?.run_open === 1,
-			sendShutdown: id => this.bridge.send(id, { t: "shutdown" }),
+			viewers: id => this.views.subscribers(id),
+			seeded: (id, seed) => this.views.seed(id, seed),
+			frame: (id, frame) => this.#onRpcFrame(id, frame),
+			ready: id => {
+				this.bridge.flush(id);
+				if (this.pool.currentMain()?.id === id) this.notifier.evaluate();
+			},
+			log: this.#log,
 			exited: (session, info) => this.#onExit(session, info),
 			changed: () => this.changed("sessions", "state"),
 			mainFailed: message => {
@@ -170,8 +187,6 @@ export class Hub {
 		switch (frame.t) {
 			case "hello":
 				this.pool.onHello(id, frame);
-				this.bridge.flush(id);
-				if (isMain) this.notifier.evaluate();
 				return;
 			case "run_start":
 				this.pool.onRun(id, "start");
@@ -196,13 +211,7 @@ export class Hub {
 				return;
 			}
 			case "input":
-				if (isMain) {
-					this.ledger.noteHumanInput();
-					this.changed("state", "inbox");
-					this.notifier.evaluate();
-				} else if (task) {
-					this.afterApply(task.id, this.ledger.apply(task.id, { kind: "human_input", text: frame.text }, "human"));
-				}
+				this.#humanInput(session, frame.text);
 				return;
 			case "capture":
 				if (isMain) {
@@ -233,7 +242,32 @@ export class Hub {
 		}
 	}
 
+	/** RPC frames feed the session's view; a finished run also refreshes model and context usage. */
+	#onRpcFrame(id: string, frame: RpcFrame): void {
+		this.views.frame(id, frame);
+		if (frame.type === "agent_end" || frame.type === "model_changed") {
+			void this.pool
+				.client(id)
+				.then(rpc => rpc.request("get_state"))
+				.then(state => this.views.state(id, state))
+				.catch(err => this.#log(`${id}: get_state failed: ${errorText(err)}`));
+		}
+	}
+
+	/** The human talked to a session: main resets its wake budget; a worker's task reopens and its escalation closes. */
+	#humanInput(session: SessionRow, text: string): void {
+		if (session.kind === "main") {
+			this.ledger.noteHumanInput();
+			this.changed("state", "inbox");
+			this.notifier.evaluate();
+			return;
+		}
+		const task = this.ledger.latestForSession(session.id);
+		if (task) this.afterApply(task.id, this.ledger.apply(task.id, { kind: "human_input", text }, "human"));
+	}
+
 	#onExit(session: SessionRow, info: ExitInfo): void {
+		this.views.ended(session.id);
 		this.env.releaseSession(session.id);
 		if (session.kind === "main") {
 			this.notifier.evaluate();
@@ -245,7 +279,7 @@ export class Hub {
 		if (info.neverConnected && task.status === "pending") {
 			const r = this.ledger.apply(
 				task.id,
-				{ kind: "provision_failed", step: "session", message: `omp exited before connecting to the hub (exit ${info.exitCode}); see the session terminal` },
+				{ kind: "provision_failed", step: "session", message: `omp exited before connecting to the hub (exit ${info.exitCode})${info.detail ? `: ${info.detail.slice(-1500)}` : ""}` },
 				"hub",
 				`spawnfail:${session.id}:${info.incarnation}`,
 			);
@@ -285,34 +319,18 @@ export class Hub {
 
 	// ── cross-owner actions (tools and HTTP share these) ────────────────────
 
-	/** home_send and the human's UI message: one outbox prompt to the task's worker, resuming it if cold. */
-	sendToTask(input: {
-		taskId: string;
-		text: string;
-		mode: "next" | "now";
-		by: "main" | "human";
-		decision: { why: string; revert: string } | null;
-		dedupe: string;
-	}): { text: string; decision: string | null } {
+	/** home_send: one outbox prompt to the task's worker, resuming it if cold. */
+	sendToTask(input: { taskId: string; text: string; mode: "next" | "now"; decision: { why: string; revert: string } | null; dedupe: string }): { text: string; decision: string | null } {
 		const task = this.ledger.mustTask(input.taskId);
-		if (input.by === "main" && task.status === "cancelled") {
+		if (task.status === "cancelled") {
 			throw new HubError("conflict", `${task.id} is cancelled; dispatch a new task with checkout {kind:"continue", task:"${task.id}"} to pick it up`);
 		}
 		const wait = waitOf(task);
-		if (input.by === "main" && (wait?.kind === "question" || wait?.kind === "blocked") && !input.decision) {
+		if ((wait?.kind === "question" || wait?.kind === "blocked") && !input.decision) {
 			throw new HubError("invalid", `${task.id} is waiting on a worker ${wait.kind}; answering decides on the human's behalf. Pass decision {why, revert}, or home_escalate.`);
 		}
-		if (!task.session_id) {
-			if (wait?.kind !== "provision_failed") throw new HubError("unavailable", `${task.id} is still being set up; its brief is delivered first. Send follow-ups after its first report.`);
-			const r = this.ledger.apply(task.id, { kind: "provision_retry", text: input.text }, input.by, input.dedupe);
-			this.afterApply(task.id, r);
-			this.provisioner.kick();
-			return { text: `${task.id} had failed setup; retrying it now. Your text is appended to its brief.`, decision: null };
-		}
-		const session = this.pool.must(task.session_id);
-		if (session.retired_at !== null) throw new HubError("conflict", `${task.id}'s session ${session.id} was retired (task cleaned up); dispatch a new task instead`);
-		const other = this.ledger.openForSession(session.id);
-		if (other && other.id !== task.id) throw new HubError("conflict", `${session.id} now works on ${other.id}; send to ${other.id} instead`);
+		const session = this.#taskSession(task, input.text, "main", input.dedupe);
+		if (!session) return { text: `${task.id} had failed setup; retrying it now. Your text is appended to its brief.`, decision: null };
 		const { logged, result } = this.db.tx(() => {
 			let decision: DecisionRow | null = null;
 			if (input.decision) {
@@ -327,29 +345,115 @@ export class Hub {
 					actor: "main",
 				});
 			}
-			const result = this.ledger.apply(
-				task.id,
-				{ kind: "message_sent", by: input.by, text: input.text, mode: input.mode, decision: decision?.id ?? null },
-				input.by === "main" ? "main" : "human",
-				input.dedupe,
-			);
-			const text = input.by === "main" ? `[omp-home · message from the home agent about ${task.id}]\n${input.text}` : input.text;
+			const result = this.ledger.apply(task.id, { kind: "message_sent", by: "main", text: input.text, mode: input.mode, decision: decision?.id ?? null }, "main", input.dedupe);
+			const text = `[omp-home · message from the home agent about ${task.id}]\n${input.text}`;
 			this.ledger.enqueue({ sessionId: session.id, taskId: task.id, kind: "prompt", deliver: input.mode, text, dedupeKey: input.dedupe });
 			return { logged: decision, result };
 		});
 		if (logged) this.indexer.decision(logged, task.workspace_id);
 		this.afterApply(task.id, result);
-		let live: string;
-		try {
-			live = this.pool.ensureLive(session.id, { human: input.by === "human" });
-		} catch (err) {
-			if (!(err instanceof HubError)) throw err;
-			live = "queued";
-		}
+		const live = this.pool.ensureLive(session.id, { human: false });
 		this.bridge.flush(session.id);
 		this.changed("decisions", "sessions");
 		const where = live === "live" ? (this.pool.isIdle(session.id) ? "idle; turn started" : "running; delivered after the current turn") : live === "starting" ? "starting" : "waiting for a worker slot";
 		return { text: `Queued to ${session.id} (${where})${logged ? ` · decision ${logged.id} logged` : ""}.`, decision: logged?.id ?? null };
+	}
+
+	/** The human's message to a task (Tasks panel): a prompt to its worker session. */
+	async messageTask(taskId: string, text: string, dedupe: string): Promise<void> {
+		const task = this.ledger.mustTask(taskId);
+		const session = this.#taskSession(task, text, "human", dedupe);
+		if (session) await this.prompt(session.id, text, "auto");
+	}
+
+	/**
+	 * The live session a message to `task` goes to, or null when the task failed setup and
+	 * the message instead retried provisioning (appended to its brief).
+	 */
+	#taskSession(task: TaskRow, text: string, by: "main" | "human", dedupe: string): SessionRow | null {
+		if (!task.session_id) {
+			if (waitOf(task)?.kind !== "provision_failed") throw new HubError("unavailable", `${task.id} is still being set up; its brief is delivered first. Send follow-ups after its first report.`);
+			this.afterApply(task.id, this.ledger.apply(task.id, { kind: "provision_retry", text }, by, dedupe));
+			this.provisioner.kick();
+			return null;
+		}
+		const session = this.pool.must(task.session_id);
+		if (session.retired_at !== null) throw new HubError("conflict", `${task.id}'s session ${session.id} was retired (task cleaned up); dispatch a new task instead`);
+		const other = this.ledger.openForSession(session.id);
+		if (other && other.id !== task.id) throw new HubError("conflict", `${session.id} now works on ${other.id}; send to ${other.id} instead`);
+		return session;
+	}
+
+	// ── sessions: what the UI does to one omp session ────────────────────────
+
+	/** A UI prompt: starts a cold session (human admission), then counts as human input once omp accepts it. */
+	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>): Promise<void> {
+		const session = this.#activeSession(id);
+		this.pool.ensureLive(id, { human: true });
+		// streamingBehavior only applies while a run streams; when idle the prompt starts a turn.
+		await this.#command(id, "prompt", { message: text, streamingBehavior: mode === "steer" ? "steer" : "followUp" });
+		this.#humanInput(session, text);
+	}
+
+	async abort(id: string): Promise<void> {
+		this.pool.must(id);
+		await this.pool.abort(id).catch(err => {
+			throw err instanceof RpcError ? new HubError("conflict", `omp refused abort: ${err.message}`) : err;
+		});
+	}
+
+	async respond(id: string, requestId: string, response: UiResponse): Promise<void> {
+		const request = this.views.openRequest(id, requestId);
+		if (!responseFits(request, response)) throw new HubError("invalid", `that answer does not fit a ${request.method} request`);
+		const rpc = await this.pool.client(id);
+		rpc.send({ type: "extension_ui_response", id: requestId, ...response });
+		this.views.apply(id, { t: "request_closed", id: requestId, answer: answerText(request, response) });
+	}
+
+	commands(id: string): CommandDTO[] {
+		this.pool.must(id);
+		return this.views.commands(id);
+	}
+
+	history(id: string, before: string): Extract<TranscriptEvent, { t: "prepend" }> {
+		this.pool.must(id);
+		return this.views.history(id, before);
+	}
+
+	async steerSubagent(id: string, agentId: string, text: string): Promise<void> {
+		await this.#command(id, "steer_subagent", { subagentId: agentId, message: text });
+	}
+
+	async cancelSubagent(id: string, agentId: string): Promise<void> {
+		const cancelled = await this.#command(id, "cancel_subagent", { subagentId: agentId });
+		if (cancelled !== true && !(typeof cancelled === "object" && cancelled !== null && "cancelled" in cancelled && cancelled.cancelled === true)) {
+			throw new HubError("conflict", `subagent ${agentId} is not running`);
+		}
+	}
+
+	/** WS stream: start the session if cold (human admission), then `reset` and increments. Throws HubError when no slot is free. */
+	stream(id: string, send: (ev: TranscriptEvent) => void): () => void {
+		const session = this.pool.must(id);
+		if (session.retired_at === null) this.pool.ensureLive(id, { human: true });
+		return this.views.subscribe(id, send);
+	}
+
+	#activeSession(id: string): SessionRow {
+		const session = this.pool.must(id);
+		if (session.retired_at !== null) throw new HubError("conflict", `${id} is retired`);
+		return session;
+	}
+
+	/** One RPC command to a running session; omp's refusals become 409s with omp's message. */
+	async #command(id: string, type: string, params: Record<string, unknown>): Promise<unknown> {
+		this.#activeSession(id);
+		const rpc = await this.pool.client(id);
+		try {
+			return await rpc.request(type, params);
+		} catch (err) {
+			if (err instanceof RpcError) throw new HubError("conflict", `omp: ${err.message}`);
+			throw err;
+		}
 	}
 
 	cancelTask(taskId: string, by: "main" | "human", reason: string, dedupe: string): DecisionRow | null {
@@ -372,7 +476,7 @@ export class Hub {
 			this.ledger.dropPrompts(task.id);
 			return { logged: decision, r: this.ledger.apply(task.id, { kind: "cancelled", by, reason }, by, dedupe) };
 		});
-		if (task.session_id) this.bridge.send(task.session_id, { t: "abort" });
+		if (task.session_id) void this.pool.abort(task.session_id).catch(err => this.#log(`${task.session_id}: abort failed: ${errorText(err)}`));
 		if (logged) this.indexer.decision(logged, task.workspace_id);
 		this.afterApply(task.id, r);
 		this.changed("decisions");
@@ -551,6 +655,7 @@ export class Hub {
 			pool: { live: this.pool.liveWorkerCount(), cap: this.settings.get().maxLiveWorkers },
 			inboxOpen: this.ledger.escalations({ open: true }).length,
 			openTasks: this.ledger.listTasks({ status: "open" }).length,
+			omp: this.omp.status(),
 		};
 	}
 }

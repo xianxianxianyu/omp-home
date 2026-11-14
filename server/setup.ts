@@ -19,12 +19,12 @@ type Change = SetupPreview["changes"][number];
 
 const GITIGNORE_LINE = ".omp-home/";
 
-function templatesDir(repoDir: string): string {
-	return path.join(repoDir, "templates", "home");
+function templatesDir(templatesRoot: string): string {
+	return path.join(templatesRoot, "home");
 }
 
-function readManifest(repoDir: string): Entry[] {
-	const file = path.join(templatesDir(repoDir), "manifest.json");
+function readManifest(templatesRoot: string): Entry[] {
+	const file = path.join(templatesDir(templatesRoot), "manifest.json");
 	if (!fs.existsSync(file)) return [];
 	const parsed = z.array(entrySchema).safeParse(JSON.parse(fs.readFileSync(file, "utf8")));
 	if (!parsed.success) throw new Error(`${file} is invalid: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
@@ -94,10 +94,10 @@ interface Plan {
 	effect: "create" | "replace" | "none";
 }
 
-function plan(home: string, repoDir: string): Plan[] {
-	return readManifest(repoDir).map(entry => {
+function plan(home: string, templatesRoot: string): Plan[] {
+	return readManifest(templatesRoot).map(entry => {
 		const target = path.join(home, entry.path);
-		const source = path.join(templatesDir(repoDir), entry.source);
+		const source = path.join(templatesDir(templatesRoot), entry.source);
 		const exists = fs.existsSync(target);
 		if (!exists) return { entry, effect: "create" };
 		if (entry.action === "create") return { entry, effect: "none" };
@@ -112,7 +112,7 @@ export function pstackCandidates(home: string): string[] {
 	return [...new Set(guesses)].filter(isPstackRoot);
 }
 
-export function previewSetup(homeInput: string, repoDir: string): SetupPreview {
+export function previewSetup(homeInput: string, templatesRoot: string): SetupPreview {
 	if (!path.isAbsolute(homeInput)) throw new HubError("invalid", "home path must be absolute");
 	const home = path.resolve(homeInput);
 	const exists = fs.existsSync(home);
@@ -128,7 +128,7 @@ export function previewSetup(homeInput: string, repoDir: string): SetupPreview {
 	if (gitignoreNeedsLine(home)) {
 		changes.push({ path: ".gitignore", action: fs.existsSync(path.join(home, ".gitignore")) ? "replace" : "create", reason: `add ${GITIGNORE_LINE}: hub database, transcripts and logs stay out of git` });
 	}
-	for (const { entry, effect } of plan(home, repoDir)) {
+	for (const { entry, effect } of plan(home, templatesRoot)) {
 		if (effect === "none") continue;
 		const reason = entry.action === "section" ? `section "${entry.heading}": ${entry.reason}` : entry.reason;
 		changes.push({ path: entry.path, action: effect, reason });
@@ -142,7 +142,7 @@ export function previewSetup(homeInput: string, repoDir: string): SetupPreview {
  * entries are skipped. Replacing (only when `migrate` is set) moves the old file or
  * directory to `.omp-home/backup/<timestamp>/` first.
  */
-export function applySetup(home: string, repoDir: string, migrate: boolean): void {
+export function applySetup(home: string, templatesRoot: string, migrate: boolean): void {
 	const paths = homePaths(home);
 	for (const dir of [home, paths.data, paths.chat, paths.sessions, paths.envLogs, paths.serviceLogs, paths.run, paths.repos]) fs.mkdirSync(dir, { recursive: true });
 	if (gitignoreNeedsLine(home)) {
@@ -151,10 +151,10 @@ export function applySetup(home: string, repoDir: string, migrate: boolean): voi
 		fs.writeFileSync(file, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${GITIGNORE_LINE}\n`);
 	}
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-	for (const { entry, effect } of plan(home, repoDir)) {
+	for (const { entry, effect } of plan(home, templatesRoot)) {
 		if (effect === "none" || (effect === "replace" && !migrate)) continue;
 		const target = path.join(home, entry.path);
-		const source = path.join(templatesDir(repoDir), entry.source);
+		const source = path.join(templatesDir(templatesRoot), entry.source);
 		if (effect === "replace") {
 			const backup = path.join(paths.backup, stamp, entry.path);
 			fs.mkdirSync(path.dirname(backup), { recursive: true });

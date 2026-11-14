@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn as spawnPty } from "@lydell/node-pty";
 import { WebSocketServer } from "ws";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { TOOL_SPECS } from "../shared/tools.ts";
 
@@ -38,7 +38,7 @@ function waitFor(predicate, timeout = 180_000) {
 	const found = events.find(predicate);
 	if (found) return Promise.resolve(found);
 	const { promise, resolve, reject } = Promise.withResolvers();
-	const waiter = { predicate, resolve, timer: setTimeout(() => { waiters.delete(waiter); reject(new Error("Timed out waiting for live event; inspect frames.jsonl and PTY logs")); }, timeout) };
+	const waiter = { predicate, resolve, timer: setTimeout(() => { waiters.delete(waiter); reject(new Error("Timed out waiting for live event; inspect frames.jsonl and RPC logs")); }, timeout) };
 	waiters.add(waiter);
 	return promise;
 }
@@ -51,11 +51,6 @@ function deliver(session, text, kind = "prompt", mode = "next") {
 	const frame = { t: "deliver", outboxId: ++outbox, kind, text, deliver: mode };
 	send(session, frame);
 	return frame;
-}
-async function typed(pty, text) {
-	for (const character of text) { pty.write(character); await delay(12); }
-	await delay(150);
-	pty.write("\r");
 }
 
 server.on("connection", (socket, request) => {
@@ -130,17 +125,33 @@ fs.writeFileSync(path.join(work, "repos/fixture.env.yaml"), "version: 1\ntest:\n
 fs.writeFileSync(path.join(work, "repo/README.md"), "# Fixture\nNo files need changing. Validate the task bridge, then report the observed result.\n");
 fs.writeFileSync(path.join(work, "overlay.yml"), `startup:\n  setupWizard: false\ntask:\n  agentModelOverrides:\n    dispatcher: ${model}\n    sonic: ${model}\n`);
 
-function launch(role, session, extraArgs = []) {
-	const log = fs.createWriteStream(path.join(work, `${session}.pty.log`));
-	const pty = spawnPty(omp, ["--cwd", work, "--session-dir", path.join(work, `${session}-sessions`), "--config", path.join(work, "overlay.yml"), "-e", path.join(root, "omp-plugin", role), "-e", observer, "--model", model, "--thinking", "low", "--approval-mode", "yolo", "--no-title", ...extraArgs], { name: "xterm-256color", cols: 140, rows: 45, cwd: work, env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor", OMP_HOME_ROLE: role, OMP_HOME_SESSION: session, OMP_HOME_URL: `${url}/bridge`, OMP_HOME_TOKEN: "live-test-token", OMP_HOME_TEST_OBSERVER: `${url}/observe`, OMP_HOME_PROTECTED: "main,master" } });
-	pty.onData(data => {
-		log.write(data);
-		if (data.includes("\x1b[6n")) pty.write("\x1b[1;1R");
-		if (data.includes("\x1b[c")) pty.write("\x1b[?1;2c");
+async function launch(role, session, extraArgs = []) {
+	const child = spawn(omp, ["--mode", "rpc-ui", "--cwd", work, "--session-dir", path.join(work, `${session}-sessions`), "--config", path.join(work, "overlay.yml"), "-e", path.join(root, "omp-plugin", role), "-e", observer, "--model", model, "--thinking", "low", "--approval-mode", "yolo", "--no-title", ...extraArgs], { cwd: work, env: { ...process.env, OMP_HOME_ROLE: role, OMP_HOME_SESSION: session, OMP_HOME_URL: `${url}/bridge`, OMP_HOME_TOKEN: "live-test-token", OMP_HOME_TEST_OBSERVER: `${url}/observe`, OMP_HOME_PROTECTED: "main,master" }, stdio: ["pipe", "pipe", "pipe"] });
+	processes.push(child);
+	child.stdout.pipe(fs.createWriteStream(path.join(work, `${session}.rpc.jsonl`)));
+	child.stderr.pipe(fs.createWriteStream(path.join(work, `${session}.stderr.log`)));
+	const sendRpc = frame => child.stdin.write(`${JSON.stringify(frame)}\n`);
+	createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", line => {
+		const frame = JSON.parse(line);
+		observe({ session, source: "rpc", ...frame });
+		if (frame.type !== "extension_ui_request") return;
+		if (frame.method === "select") sendRpc({ type: "extension_ui_response", id: frame.id, value: frame.options.find(option => /^approve\b/i.test(option)) ?? frame.options[0] });
+		if (frame.method === "confirm") sendRpc({ type: "extension_ui_response", id: frame.id, confirmed: true });
 	});
-	pty.onExit(event => { observe({ session, source: "pty", t: "exit", ...event }); log.end(); });
-	processes.push(pty);
-	return pty;
+	child.on("error", error => observe({ session, source: "process", t: "error", message: String(error) }));
+	child.on("close", (exitCode, signal) => observe({ session, source: "process", t: "exit", exitCode, signal }));
+	const ready = await waitFor(event => event.session === session && ((event.source === "rpc" && event.type === "ready") || event.source === "process"), 60_000);
+	assert.equal(ready.type, "ready", JSON.stringify(ready));
+	let sequence = 0;
+	return {
+		async request(type, params = {}) {
+			const id = `${session}-${++sequence}`;
+			sendRpc({ id, type, ...params });
+			const response = await waitFor(event => event.session === session && event.source === "rpc" && event.type === "response" && event.id === id, 30_000);
+			assert.equal(response.success, true, JSON.stringify(response));
+			return response.data;
+		},
+	};
 }
 
 async function runPrint(cwd, args, prompt) {
@@ -204,7 +215,7 @@ try {
 		for (const name of ["repo-worktree", "task-brief", "test-env"]) assert.ok(output.includes(`${copy}/.agents/skills/${name}/SKILL.md`), `Missing observed project skill path for ${name}`);
 	});
 
-	const main = launch("main", "M-1");
+	const main = await launch("main", "M-1");
 	await check("hello; role audiences; nested schema rejects invalid enum; lifecycle APIs", async () => {
 		const hello = await waitFor(event => event.session === "M-1" && event.t === "hello", 60_000);
 		assert.equal(hello.v, 1); assert.equal(hello.cwd, work); assert.ok(hello.ompSessionId);
@@ -242,22 +253,16 @@ try {
 		await delay(700);
 		assert.equal(events.filter(event => event.session === "M-1" && event.t === "run_start").length, starts);
 	});
-	await check("interactive characters plus Enter emits human-only input frame", async () => {
-		await typed(main, "Reply exactly BRIDGE-TYPED-OK. No tools.");
-		const input = await waitFor(event => event.session === "M-1" && event.t === "input", 30_000);
-		assert.match(input.text, /BRIDGE-TYPED-OK/);
-		const raw = await waitFor(event => event.session === "M-1" && event.t === "raw_input");
-		assert.equal(raw.event.source, "interactive"); assert.equal(raw.event.text, input.text);
-		assert.equal(events.filter(event => event.session === "M-1" && event.t === "input").length, 1);
-		await waitFor(event => event.session === "M-1" && event.t === "run_end" && event.text.includes("BRIDGE-TYPED-OK"));
-		console.log("INPUT PAYLOAD", JSON.stringify(raw.event));
+	await check("RPC prompt completes without a bridge input frame", async () => {
+		await main.request("prompt", { message: "Reply exactly BRIDGE-RPC-OK. No tools." });
+		await waitFor(event => event.session === "M-1" && event.t === "run_end" && event.text.includes("BRIDGE-RPC-OK"));
+		assert.equal(events.filter(event => event.session === "M-1" && event.source === "bridge" && event.t === "input").length, 0);
 	});
-	await check("approval requested/resolved payloads forwarded from real UI", async () => {
+	await check("approval requested/resolved payloads forwarded from RPC UI", async () => {
 		deliver("M-1", "For this harmless acceptance check, call bridge_probe_approval with value BRIDGE-APPROVAL-OK exactly once, then reply BRIDGE-APPROVAL-OK. It only returns that string; the human will approve.");
 		const rawRequest = await waitFor(event => event.session === "M-1" && event.t === "raw_approval_requested");
 		const request = await waitFor(event => event.session === "M-1" && event.t === "approval" && event.phase === "requested");
 		assert.equal(request.tool, "bridge_probe_approval");
-		await delay(800); main.write("\r");
 		const rawResolved = await waitFor(event => event.session === "M-1" && event.t === "raw_approval_resolved", 30_000);
 		const resolved = await waitFor(event => event.session === "M-1" && event.t === "approval" && event.phase === "resolved");
 		assert.equal(resolved.approved, true);
@@ -281,7 +286,7 @@ try {
 		await waitFor(event => events.indexOf(event) >= before && event.session === "M-1" && event.t === "delivered" && event.outboxId === firstPrompt.outboxId);
 	});
 
-	const worker = launch("worker", "W-1");
+	await launch("worker", "W-1");
 	await check("worker audience hides ask and main tools", async () => {
 		await waitFor(event => event.session === "W-1" && event.t === "hello", 60_000);
 		const tools = await waitFor(event => event.session === "W-1" && event.t === "tools" && event.agent.kind === "main");
@@ -301,9 +306,11 @@ try {
 		const tools = await waitFor(event => event.session === "W-1" && event.t === "tools" && event.agent.id === call.agent.id);
 		assert.ok(!tools.active.includes("ask")); assert.ok(!tools.active.includes("home_report")); assert.ok(tools.active.includes("home_env"));
 		await waitFor(event => event.session === "W-1" && event.t === "call" && event.tool === "home_report" && event.params.summary.includes("BRIDGE-SUB-OK"));
+		await waitFor(event => event.session === "W-1" && event.t === "run_end" && event.text.includes("BRIDGE-SUB-OK"));
 	});
 	await check("shutdown exits live omp cleanly", async () => {
-		send("M-1", { t: "shutdown" }); send("W-1", { t: "shutdown" });
+		// RPC mode terminates gracefully on stdin EOF.
+		for (const child of processes) child.stdin.end();
 		for (const session of ["M-1", "W-1"]) {
 			const exit = await waitFor(event => event.session === session && event.t === "exit", 30_000);
 			assert.equal(exit.exitCode, 0);

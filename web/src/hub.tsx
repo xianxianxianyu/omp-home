@@ -5,6 +5,7 @@ import { api } from "./api.ts";
 import { uiEvent } from "./schemas.ts";
 import { connectSocket } from "./transport.ts";
 import type { HubSocket } from "./transport.ts";
+import { notify } from "./native.ts";
 
 export const PANELS = ["Inbox", "Tasks", "Sessions", "Workspaces", "Decisions", "Resources", "Settings"] as const;
 export type Panel = typeof PANELS[number];
@@ -67,7 +68,7 @@ interface Hub {
 	toasts: Toast[];
 	dismissToast: (id: number) => void;
 	mutate: <T>(path: string, body?: unknown, method?: string) => Promise<T>;
-	noteInput: () => void;
+	noteComposerInput: () => void;
 }
 const CacheContext = createContext<Cache | null>(null);
 const HubContext = createContext<Hub | null>(null);
@@ -96,7 +97,13 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 	const [tabs, setTabs] = useState<SessionDTO[]>([]);
 	const [taskId, setTaskId] = useState<string | null>(null);
 	const [toasts, setToasts] = useState<Toast[]>([]);
-	const lastInput = useRef(0);
+	const lastComposerInput = useRef(0);
+	const wasPaused = useRef(false);
+	useEffect(() => {
+		const paused = state.data?.main.paused ?? false;
+		if (paused && !wasPaused.current) void notify("Main is paused", "The automatic wake budget is used. Continue main when you’re ready.", "main-paused");
+		wasPaused.current = paused;
+	}, [state.data?.main.paused]);
 	const nextToast = useRef(0);
 	const toastTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
 	const dismissToast = useCallback((id: number) => setToasts(current => current.filter(toast => toast.id !== id)), []);
@@ -108,6 +115,8 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 			toastTimers.current.add(timer);
 		}
 	}, [dismissToast]);
+	const ompWarning = state.data?.omp.warning;
+	useEffect(() => { if (ompWarning) addToast(ompWarning, "error"); }, [ompWarning, addToast]);
 	useEffect(() => () => toastTimers.current.forEach(clearTimeout), []);
 	const toast = useCallback((text: string, level?: "info" | "error") => addToast(text, level), [addToast]);
 	const mutate = useCallback(async <T,>(path: string, body?: unknown, method = "POST"): Promise<T> => {
@@ -135,12 +144,9 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 				await openSession(event.sessionId);
 				if (event.escalationId) await mutate(`/api/escalations/${encodeURIComponent(event.escalationId)}/seen`);
 			};
-			if (Date.now() - lastInput.current < 8000) addToast(`${event.sessionId} needs you: ${event.reason}`, "info", { label: "Open", run: open });
+			if (Date.now() - lastComposerInput.current < 8000) addToast(`${event.sessionId} needs you: ${event.reason}`, "info", { label: "Open", run: open });
 			else void open().catch(() => {});
-			if (document.hidden && "Notification" in window && Notification.permission === "granted") {
-				const notification = new Notification(`${event.sessionId} needs you`, { body: event.reason, tag: event.escalationId ?? event.sessionId });
-				notification.onclick = () => { window.focus(); void open().catch(() => {}); notification.close(); };
-			}
+			void notify(`${event.sessionId} needs you`, event.reason, event.escalationId ?? event.sessionId, () => { void open().catch(() => {}); });
 		}
 	}, [cache, toast, openSession, mutate, addToast]);
 	useEffect(() => {
@@ -164,6 +170,6 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 		connect();
 		return () => { disposed = true; clearTimeout(timer); socket?.close(); };
 	}, [cache, handleEvent, toast]);
-	const value = useMemo<Hub>(() => ({ state: state.data, stateError: state.error, reload: state.reload, connected, active, setActive, tabs, closeTab, openSession, taskId, openTask: setTaskId, closeTask: () => setTaskId(null), toast, toasts, dismissToast, mutate, noteInput: () => { lastInput.current = Date.now(); } }), [state.data, state.error, state.reload, connected, active, tabs, closeTab, openSession, taskId, toast, toasts, dismissToast, mutate]);
+	const value = useMemo<Hub>(() => ({ state: state.data, stateError: state.error, reload: state.reload, connected, active, setActive, tabs, closeTab, openSession, taskId, openTask: setTaskId, closeTask: () => setTaskId(null), toast, toasts, dismissToast, mutate, noteComposerInput: () => { lastComposerInput.current = Date.now(); } }), [state.data, state.error, state.reload, connected, active, tabs, closeTab, openSession, taskId, toast, toasts, dismissToast, mutate]);
 	return <HubContext.Provider value={value}>{children}</HubContext.Provider>;
 }
