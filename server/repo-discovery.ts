@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -125,59 +126,145 @@ export async function discoverRepositories(paths: HomePaths, worktreeRoot: strin
 	return [...result.values()];
 }
 
-export function detectCommands(root: string): Pick<RepoInspection, "stack" | "commands" | "recipeDraft"> {
+function objectOf(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function readJsonObject(file: string, comments = false): Record<string, unknown> {
+	let text = readText(file);
+	if (comments) {
+		text = text.replace(/"(?:\\.|[^"\\])*"|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, token => token.startsWith('"') ? token : " ");
+		text = text.replace(/"(?:\\.|[^"\\])*"|,(?=\s*[}\]])/g, token => token === "," ? "" : token);
+	}
+	try {
+		return objectOf(JSON.parse(text));
+	} catch {
+		return {};
+	}
+}
+
+const COPY_FILES = 128;
+const COPY_BYTES = 2 * 1024 * 1024;
+const COPY_SKIP_DIRECTORIES = ["node_modules", "vendor", "target", "dist", "build", "coverage", ".git", ".next", ".nuxt", ".output", ".venv", "venv", "__pycache__", "Pods", ".gradle", ".yarn", ".pnpm-store"];
+const COPY_ENV = [".env.test", ".env.test.local", ".env.local"];
+
+function configPatterns(value: unknown, directories: boolean): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((entry: unknown) => {
+		if (typeof entry !== "string" || !entry.trim() || path.posix.isAbsolute(entry)) return [];
+		const normalized = path.posix.normalize(entry).replace(/\/$/, "");
+		if (normalized === ".." || normalized.startsWith("../")) return [];
+		const pattern = normalized === "." ? "**/*" : normalized;
+		return [directories && !/[*?[]/.test(pattern) && !path.posix.extname(pattern) ? `${pattern}/**/*` : pattern];
+	});
+}
+
+function detectCopy(root: string): RepoInspection["copy"] {
+	const configs = ["tsconfig.json", "jsconfig.json"].map(file => {
+		const config = readJsonObject(path.join(root, file), true);
+		return { include: configPatterns(config.include, true), files: configPatterns(config.files, false), exclude: configPatterns(config.exclude, true) };
+	});
+	const patterns = [...new Set(configs.flatMap(config => [...config.files, ...config.include]))];
+	const env = COPY_ENV.filter(file => fs.existsSync(path.join(root, file)));
+	if (!patterns.length && !env.length) return [];
+	let ignored: string[];
+	try {
+		// Positive pathspecs scope discovery to declared inputs; exclusions prune large ignored trees before enumeration.
+		ignored = execFileSync("git", [
+			"ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--",
+			...patterns.map(pattern => `:(top,glob)${pattern}`),
+			...env.map(file => `:(top,literal)${file}`),
+			...COPY_SKIP_DIRECTORIES.map(dir => `:(top,glob,exclude)**/${dir}/**`),
+		], { cwd: root, encoding: "utf8", timeout: 3000, maxBuffer: 256 * 1024, stdio: ["ignore", "pipe", "ignore"] }).split("\0").filter(Boolean);
+	} catch {
+		return [];
+	}
+	ignored.sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+	const copy: RepoInspection["copy"] = [];
+	let bytes = 0;
+	for (const file of ignored) {
+		if (copy.length === COPY_FILES) break;
+		if (file.split("/").some(part => COPY_SKIP_DIRECTORIES.includes(part))) continue;
+		const why = COPY_ENV.includes(file) ? "env" : configs.some(config =>
+			config.files.some(pattern => path.matchesGlob(file, pattern))
+			|| (config.include.some(pattern => path.matchesGlob(file, pattern)) && !config.exclude.some(pattern => path.matchesGlob(file, pattern))),
+		) ? "tsconfig" : null;
+		if (!why) continue;
+		try {
+			const absolute = path.join(root, file);
+			const stat = fs.lstatSync(absolute);
+			if (!stat.isFile() || !inside(realPath(absolute), realPath(root)) || bytes + stat.size > COPY_BYTES) continue;
+			bytes += stat.size;
+			copy.push({ path: file, why });
+		} catch {
+			// Files can disappear while a generator is updating its output.
+		}
+	}
+	return copy;
+}
+
+export function detectCommands(root: string): Pick<RepoInspection, "stack" | "commands" | "tests" | "copy" | "recipeDraft"> {
 	const stack: string[] = [];
 	const install: string[] = [];
-	const test: string[] = [];
+	const unit: string[] = [];
+	const tests: RepoInspection["tests"] = {};
 	let dev: string | null = null;
 	const has = (file: string) => fs.existsSync(path.join(root, file));
 	if (has("package.json")) {
-		let manifest: { scripts?: Record<string, unknown>; packageManager?: string } = {};
-		try {
-			const value: unknown = JSON.parse(readText(path.join(root, "package.json")));
-			if (value && typeof value === "object") {
-				if ("scripts" in value && value.scripts && typeof value.scripts === "object" && !Array.isArray(value.scripts)) manifest.scripts = value.scripts as Record<string, unknown>;
-				if ("packageManager" in value && typeof value.packageManager === "string") manifest.packageManager = value.packageManager;
-			}
-		} catch {
-			// Invalid manifests cannot provide script names, but their lockfile still identifies the toolchain.
-		}
-		const declared = manifest.packageManager?.split("@")[0];
+		const manifest = readJsonObject(path.join(root, "package.json"));
+		const scripts = objectOf(manifest.scripts);
+		const hasScript = (name: string) => typeof scripts[name] === "string" && scripts[name].trim().length > 0;
+		const declared = typeof manifest.packageManager === "string" ? manifest.packageManager.split("@")[0] : null;
 		const manager = has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : has("bun.lock") || has("bun.lockb") ? "bun" : has("package-lock.json") || has("npm-shrinkwrap.json") ? "npm" : declared && ["pnpm", "yarn", "npm", "bun"].includes(declared) ? declared : "npm";
 		stack.push(manager, "node");
-		install.push(`${manager} install`);
-		if (typeof manifest.scripts?.test === "string" && manifest.scripts.test.trim()) test.push(`${manager} ${manager === "npm" ? "test" : "run test"}`);
-		if (typeof manifest.scripts?.dev === "string" && manifest.scripts.dev.trim()) dev = `${manager} run dev`;
+		install.push(manager === "npm"
+			? has("package-lock.json") || has("npm-shrinkwrap.json") ? "npm ci --prefer-offline --no-audit --no-fund" : "npm install --prefer-offline --no-audit --no-fund"
+			: manager === "pnpm" ? "pnpm install --frozen-lockfile --prefer-offline"
+			: manager === "yarn" ? `yarn install ${has(".yarnrc.yml") ? "--immutable" : "--frozen-lockfile"}`
+			: "bun install --frozen-lockfile");
+		const typecheck = ["typecheck", "type-check", "tsc"].find(hasScript);
+		if (typecheck) tests.typecheck = `${manager} run ${typecheck}`;
+		else if (has("tsconfig.json") && [manifest.dependencies, manifest.devDependencies].some(dependencies => typeof objectOf(dependencies).typescript === "string")) tests.typecheck = "npx tsc --noEmit";
+		if (hasScript("lint")) tests.lint = `CI=1 ${manager} run lint`;
+		if (hasScript("test")) unit.push(`${manager} ${manager === "npm" ? "test" : "run test"}${/\bjest\b/.test(String(scripts.test)) ? " -- --ci" : ""}`);
+		const coverage = ["test:ci", "test:coverage", "coverage"].find(hasScript);
+		if (coverage) tests.coverage = `${manager} run ${coverage}`;
+		if (hasScript("dev")) dev = `${manager} run dev`;
 	}
 	if (has("Cargo.toml")) {
 		stack.push("cargo");
-		install.push("cargo fetch");
-		test.push("cargo test");
+		install.push(`cargo fetch${has("Cargo.lock") ? " --locked" : ""}`);
+		unit.push("cargo test");
 	}
 	if (has("go.mod")) {
 		stack.push("go");
 		install.push("go mod download");
-		test.push("go test ./...");
+		unit.push("go test ./...");
 	}
 	if (has("pyproject.toml")) {
 		const pyproject = readText(path.join(root, "pyproject.toml"));
 		const manager = has("uv.lock") || /\[tool\.uv(?:\.|\])/.test(pyproject) ? "uv" : has("poetry.lock") || /\[tool\.poetry(?:\.|\])/.test(pyproject) ? "poetry" : null;
 		stack.push(...(manager ? [manager, "python"] : ["python"]));
-		install.push(manager === "uv" ? "uv sync" : manager === "poetry" ? "poetry install" : "python -m pip install -e .");
-		if (/\bpytest\b/.test(pyproject) || has("pytest.ini") || has("conftest.py")) test.push(manager ? `${manager} run pytest` : "python -m pytest");
+		install.push(manager === "uv" ? "uv sync --frozen" : manager === "poetry" ? "poetry install --no-interaction" : "python -m pip install -e .");
+		if (/\bpytest\b/.test(pyproject) || has("pytest.ini") || has("conftest.py")) unit.push(manager ? `${manager} run pytest` : "python -m pytest");
 	}
 	const makefile = ["GNUmakefile", "makefile", "Makefile"].find(has);
 	if (makefile && /^(?:test|test[ \t]+[^:\n]+)[ \t]*:/m.test(readText(path.join(root, makefile)))) {
 		stack.push("make");
-		if (!test.length) test.push("make test");
+		if (!unit.length) unit.push("make test");
 	}
-	const commands = { install: install.join(" && ") || null, test: test.join(" && ") || null, dev };
+	if (unit.length) tests.unit = unit.join(" && ");
+	const full = [tests.typecheck, tests.lint, tests.unit].filter(Boolean).join(" && ");
+	if (full) tests.full = full;
+	const commands = { install: install.join(" && ") || null, dev };
+	const copy = detectCopy(root);
+	const draftCopy = copy.filter(file => file.why === "tsconfig").map(file => file.path);
 	let recipeDraft: string | null = null;
-	if (commands.install || commands.test || commands.dev) {
-		const draft = stringify({ version: 1, ...(dev ? { ports: ["web"], env: { PORT: "{port.web}" } } : {}), ...(commands.install ? { setup: [commands.install] } : {}), ...(commands.test ? { test: { full: commands.test } } : {}) });
+	if (commands.install || Object.keys(tests).length || dev || draftCopy.length) {
+		const draft = stringify({ version: 1, ...(dev ? { ports: ["web"], env: { PORT: "{port.web}" } } : {}), ...(draftCopy.length ? { copy: draftCopy } : {}), ...(commands.install ? { setup: [commands.install] } : {}), ...(Object.keys(tests).length ? { test: tests } : {}) });
 		const parsed = parseRecipe(draft);
 		if (!parsed.ok) throw new Error(`Detected recipe is invalid: ${JSON.stringify(parsed.errors)}`);
 		recipeDraft = draft;
 	}
-	return { stack, commands, recipeDraft };
+	return { stack, commands, tests, copy, recipeDraft };
 }

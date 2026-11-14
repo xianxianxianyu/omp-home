@@ -1,11 +1,12 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { parseDocument } from "yaml";
 import type { FieldError, RepoInspection, RepoSuggestion, SettingsDTO, WorkspaceCreate, WorkspaceDTO } from "../../../shared/api.ts";
 import { api, ApiError } from "../api.ts";
 import { useHub, useResource } from "../hub.tsx";
 import { useI18n, useT } from "../i18n/index.tsx";
 import { ModelPicker, useModelCatalog } from "../ModelPicker.tsx";
-import { RecipeSummary } from "../RecipeSummary.tsx";
+import { RecipeSummary, readRecipeSummary } from "../RecipeSummary.tsx";
 import { Button, Empty, ErrorState, Field, Loading, Section, useNow } from "../ui.tsx";
 
 export function AddRepository({ onClose, onAdded, onOpen }: { onClose: () => void; onAdded: (workspace: WorkspaceDTO) => void; onOpen: (id: string) => void }) {
@@ -107,6 +108,13 @@ function RepositoryReview({ repo, onBack, onAdded }: { repo: RepoInspection; onB
 	const root = repo.root!;
 	const worktreeParent = settings.data?.worktreeRoot ?? root.slice(0, root.lastIndexOf("/"));
 	const worktreePath = `${worktreeParent.replace(/\/$/, "")}/${root.split("/").at(-1)}.worktrees`;
+	function toggleCopy(path: string, checked: boolean) {
+		const summary = readRecipeSummary(recipe);
+		if (!summary) return;
+		const document = parseDocument(recipe);
+		document.set("copy", checked ? [...summary.copy, path] : summary.copy.filter(file => file !== path));
+		setRecipe(document.toString());
+	}
 	async function save(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
 		if (saving) return;
@@ -115,6 +123,10 @@ function RepositoryReview({ repo, onBack, onAdded }: { repo: RepoInspection; onB
 			const body: WorkspaceCreate = { repoPath: root, id: repo.id, name: name.trim(), ...(base ? { defaultBase: base } : {}), workerModel, ...(createRecipe && canCreateRecipe ? { recipe } : {}) };
 			const workspace = await mutate<WorkspaceDTO>("/api/workspaces", body);
 			toast(t => t.panels.workspaces.added);
+			if (workspace.recipeStatus === "ok") {
+				try { await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/recipe/check`, { method: "POST" }); }
+				catch (error) { toast(t => t.panels.workspaces.checkStartError(error instanceof Error ? error.message : String(error)), "error"); }
+			}
 			onAdded(workspace);
 		} catch (error) { setError(error instanceof Error ? error.message : t.workspaces.saveError); if (error instanceof ApiError) setFieldErrors(error.errors); }
 		finally { setSaving(false); }
@@ -140,7 +152,8 @@ function RepositoryReview({ repo, onBack, onAdded }: { repo: RepoInspection; onB
 			<label className="row"><input type="checkbox" checked={createRecipe} disabled={saving || !canCreateRecipe} onChange={event => setCreateRecipe(event.target.checked)} /><strong>{t.workspaces.createRecipe}</strong></label>
 			{!canCreateRecipe && <p className="hint">{repo.hasRecipe ? t.workspaces.recipeExists : t.workspaces.noRecipeDraft}</p>}
 			{repo.commands.dev && <p className="hint">{t.workspaces.devCommand}: <code>{repo.commands.dev}</code></p>}
-			{repo.recipeDraft !== null && <><RecipeSummary text={recipe} /><details className="repo-yaml"><summary>{t.workspaces.showYaml}</summary><Field label={t.workspaces.recipeYaml} hint={t.workspaces.recipeHint}><textarea className="code-editor" rows={10} value={recipe} onChange={event => setRecipe(event.target.value)} disabled={saving || !createRecipe} spellCheck={false} autoCapitalize="off" autoCorrect="off" /></Field></details></>}
+			{repo.recipeDraft !== null && <><RecipeSummary text={recipe} detectedCopy={repo.copy} onCopyChange={canCreateRecipe ? toggleCopy : undefined} disabled={saving || !createRecipe} /><details className="repo-yaml"><summary>{t.workspaces.showYaml}</summary><Field label={t.workspaces.recipeYaml} hint={t.workspaces.recipeHint}><textarea className="code-editor" rows={10} value={recipe} onChange={event => setRecipe(event.target.value)} disabled={saving || !createRecipe} spellCheck={false} autoCapitalize="off" autoCorrect="off" /></Field></details></>}
+			{(createRecipe || repo.hasRecipe) && <p className="hint">{t.workspaces.autoCheckHint}</p>}
 		</div>
 		{error && <div className="error-box" role="alert"><p>{error}</p>{fieldErrors.length > 0 && <ul>{fieldErrors.map((field, index) => <li key={index}><code>{field.path}</code>: {field.message}</li>)}</ul>}</div>}
 		<div className="dialog-actions repo-review-actions"><Button onClick={onBack} disabled={saving}>{t.workspaces.chooseAnother}</Button><Button type="submit" className="primary" disabled={saving || !name.trim() || (createRecipe && !recipe.trim())}>{saving ? t.workspaces.adding : t.workspaces.add}</Button></div>

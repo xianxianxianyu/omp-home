@@ -10,6 +10,7 @@ import { ModelPicker, useModelCatalog } from "../ModelPicker.tsx";
 
 import { AddRepository, BranchPicker } from "./AddRepository.tsx";
 import { RecipeSummary } from "../RecipeSummary.tsx";
+import { RecipeCheck } from "../RecipeCheck.tsx";
 
 export function WorkspacesPanel() {
 	const t = useT().panels;
@@ -54,10 +55,11 @@ export function WorkspacesPanel() {
 						<Button className="small" onClick={() => setEditor(workspace)}>{t.common.edit}</Button>
 						{!workspace.archived && <Button className="small danger" onClick={() => setArchive(workspace)}>{t.workspaces.archive}</Button>}
 					</div>
+					<RecipeCheck workspace={workspace} />
 				</article>
 			))}
 			{editor && <WorkspaceEditor workspace={editor} onClose={() => setEditor(null)} />}
-			{recipe && <RecipeEditor workspace={recipe} onClose={() => setRecipe(null)} />}
+			{recipe && <RecipeEditor workspace={data?.find(workspace => workspace.id === recipe.id) ?? recipe} onClose={() => setRecipe(null)} />}
 			{archive && (
 				<Confirm
 					title={t.workspaces.archiveTitle(archive.name)}
@@ -136,6 +138,7 @@ function RecipeEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose
 	const [errors, setErrors] = useState<FieldError[]>([]);
 	const [revision, setRevision] = useState(0);
 	const [saving, setSaving] = useState(false);
+	const [offerCheck, setOfferCheck] = useState(false);
 	const path = `/api/workspaces/${encodeURIComponent(workspace.id)}/recipe`;
 
 	useEffect(() => {
@@ -164,6 +167,7 @@ function RecipeEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose
 			setRecipe(result);
 			setText(result.text);
 			setErrors(result.errors);
+			setOfferCheck(text !== recipe?.text);
 			toast(t => t.panels.workspaces.recipeSaved);
 		} catch (error) {
 			setSaveError(error instanceof Error ? error.message : t.workspaces.recipeSaveError);
@@ -184,6 +188,7 @@ function RecipeEditor({ workspace, onClose }: { workspace: WorkspaceDTO; onClose
 				</Field>
 				{(saveError || errors.length > 0) && <div className="error-box" role="alert">{saveError && <p>{saveError}</p>}{errors.length > 0 && <ul>{errors.map((error, index) => <li key={`${error.path}:${index}`}><code>{error.path || t.common.recipe}</code>: {error.message}</li>)}</ul>}</div>}
 				<div className="dialog-actions"><Button onClick={onClose} disabled={saving}>{t.common.close}</Button><Button className="primary" onClick={save} disabled={saving || (recipe.status !== "missing" && text === recipe.text)}>{saving ? t.common.saving : t.workspaces.saveRecipe}</Button></div>
+				<RecipeCheck workspace={workspace} disabled={saving || text !== recipe.text} offer={offerCheck && text === recipe.text} onStarted={() => setOfferCheck(false)} />
 				<Section title={t.workspaces.recipeHelp}>
 					<p className="muted"><code>version: 1</code> — {t.workspaces.recipeVersionHint}</p>
 					<dl className="kv">

@@ -25,4 +25,4 @@ description: "编写 omp-home 的 repos/<workspace>.env.yaml。Hub 统一准备�
 
 Hub 创建/继续 worktree 时准备环境，端口和数据库隔离，服务按 check 复用。worker 用 `home_env({})` 读实际地址和命令；环境坏了才 `home_env({repair:true})`。账号用 `home_lease({pool:"名字"})`，本轮结束自动释放，TTL 兜底。不要向报告或日志输出密码。
 
-缺配方先查 README、AGENTS、锁文件、scripts、CI，写真实可执行命令。涉及共享服务、数据删除、用户偏好先请主聊天决定或 escalate。不要再调用旧 prepare.sh。验证证据写实际命令、退出状态和结果末尾，不能只说“测试通过”。
+改完配方在 UI 的「设置 → 仓库」点「试运行」：Hub 在基准分支的临时工作树里按配方复制、安装、跑检查，再全部清理；结果进 `home_status`，不必等第一个任务才知道配方能不能用。缺配方先查 README、AGENTS、锁文件、scripts、CI，写真实可执行命令。涉及共享服务、数据删除、用户偏好先请主聊天决定或 escalate。不要再调用旧 prepare.sh。验证证据写实际命令、退出状态和结果末尾，不能只说“测试通过”。

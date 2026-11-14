@@ -56,7 +56,7 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 			const lines = [
 				"Workspaces:",
 				...(workspaces.length
-					? workspaces.map(w => `- ${w.id}: ${w.repoPath} · base ${w.defaultBase} · sessions ${w.liveSessions} live / ${w.totalSessions} · ${w.openTasks} open task(s) · recipe ${w.recipeStatus}`)
+					? workspaces.map(w => `- ${w.id}: ${w.repoPath} · base ${w.defaultBase} · sessions ${w.liveSessions} live / ${w.totalSessions} · ${w.openTasks} open task(s) · recipe ${w.recipeStatus} · ${hub.recipeChecks.describe(w.id)}`)
 					: ["- none registered (the human adds them in the Workspaces view)"]),
 				`Pool: ${hub.pool.liveWorkerCount()}/${hub.settings.get().maxLiveWorkers} live workers`,
 				"Open tasks:",

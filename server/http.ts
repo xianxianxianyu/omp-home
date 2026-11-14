@@ -63,6 +63,7 @@ const setupSchema = z.strictObject({
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(2000).optional() });
 const textSchema = z.object({ text: z.string().min(1).max(20_000) });
 const recipeSchema = z.object({ text: z.string().max(200_000) });
+const recipeCheckSchema = z.strictObject({ test: z.string().min(1).optional() });
 const inspectSchema = z.object({ path: z.string().min(1).refine(p => path.isAbsolute(p), localizedCheck(validationMessages.absolutePath())) });
 const pickFolderSchema = z.strictObject({
 	title: z.string().max(200).optional(),
@@ -542,6 +543,9 @@ export class HubServer {
 			h.changed("workspaces", "resources");
 			return dto;
 		});
+		r("GET", "/api/workspaces/:id/recipe/check", ({ params, language }) => hub().recipeChecks.get(parseWorkspaceId(params[0]), language));
+		r("POST", "/api/workspaces/:id/recipe/check", ({ params, body, language }) => hub().recipeChecks.start(parseWorkspaceId(params[0]), parse(recipeCheckSchema, body).test, language));
+		r("POST", "/api/workspaces/:id/recipe/check/cancel", ({ params, language }) => hub().recipeChecks.cancel(parseWorkspaceId(params[0]), language));
 
 		r("GET", "/api/resources", ({ language }) => hub().env.resources(language));
 		r("POST", "/api/services/:id/:action", ({ params, language }) => {

@@ -5,7 +5,7 @@ import { errorText, HubError } from "./errors.ts";
 import { messages } from "./i18n.ts";
 import { resolveResources } from "./resources.ts";
 
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 const SCHEMA_FILE = resolveResources().schema;
 
 export type IdKind = "T" | "W" | "M" | "WT" | "D" | "E";
@@ -33,11 +33,31 @@ export class Db {
 		if (!hasMeta) {
 			this.tx(() => {
 				this.raw.exec(fs.readFileSync(SCHEMA_FILE, "utf8"));
+				this.setMeta("schema_version", "1");
+			});
+		}
+		let version = this.meta("schema_version");
+		if (version === "1") {
+			this.tx(() => {
+				this.raw.exec(`CREATE TABLE recipe_check (
+					workspace_id TEXT PRIMARY KEY REFERENCES workspace(id),
+					id TEXT NOT NULL UNIQUE,
+					recipe_hash TEXT NOT NULL,
+					recipe TEXT NOT NULL,
+					base TEXT NOT NULL,
+					sha TEXT NOT NULL,
+					path TEXT NOT NULL,
+					state TEXT NOT NULL CHECK (state IN ('running','passed','failed','cancelled')),
+					started_at INTEGER NOT NULL,
+					ended_at INTEGER,
+					steps TEXT NOT NULL,
+					processes TEXT NOT NULL DEFAULT '{}',
+					cleaned INTEGER NOT NULL DEFAULT 0 CHECK (cleaned IN (0,1))
+				) STRICT`);
 				this.setMeta("schema_version", SCHEMA_VERSION);
 			});
-			return;
+			version = SCHEMA_VERSION;
 		}
-		const version = this.meta("schema_version");
 		if (version !== SCHEMA_VERSION) throw new HubError("conflict", messages.databaseVersion(version, SCHEMA_VERSION));
 	}
 

@@ -1,10 +1,10 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import type { EnvDTO, Language, LeaseDTO, ResourcesDTO, ServiceDTO } from "../shared/api.ts";
+import type { EnvDTO, Language, LeaseDTO, RecipeCheckStep, ResourcesDTO, ServiceDTO } from "../shared/api.ts";
 import type { HomePaths } from "./config.ts";
 import { expand, slugOf, type EnvRecipe, type ServiceSpec, type Vars } from "./core/recipe.ts";
 import type { Db } from "./db.ts";
@@ -54,16 +54,56 @@ export interface LeaseRow {
 /** An environment step failed; the message is meant for the agent or human. */
 export class EnvError extends Error {
 	readonly localizedText: Message | undefined;
+	readonly exitCode: number | undefined;
 
-	constructor(message: string | Message) {
+	constructor(message: string | Message, exitCode?: number) {
 		super(render(message));
 		this.localizedText = typeof message === "string" ? undefined : message;
+		this.exitCode = exitCode;
 	}
 }
 
 const SETUP_TIMEOUT_MS = 30 * 60_000;
 const COMMAND_TIMEOUT_MS = 5 * 60_000;
 const OUTPUT_TAIL = 4000;
+
+export type EnvTarget = Pick<WorktreeRow, "id" | "path" | "branch">;
+export type ExecutionStep = RecipeCheckStep & { outputText?: Message };
+export interface EnvExecution {
+	signal?: AbortSignal;
+	log?: string;
+	process?: (pid: number, startedAt: string | null) => void;
+	setupTimeoutMs?: number;
+	step?: (step: ExecutionStep) => void;
+}
+
+/** Worker preparation and recipe checks share these exact operations; only checks observe each step. */
+export async function environmentStep<T>(execution: EnvExecution, kind: RecipeCheckStep["kind"], name: string, command: string | null, run: (output: (tail: string | Message) => void) => Promise<T>): Promise<T> {
+	execution.signal?.throwIfAborted();
+	const step: ExecutionStep = { kind, name, command, state: "running", exitCode: null, ms: null, outputTail: "" };
+	const started = Date.now();
+	const output = (tail: string | Message) => {
+		step.outputTail = render(tail).slice(-OUTPUT_TAIL);
+		step.outputText = typeof tail === "string" ? undefined : { en: tail.en.slice(-OUTPUT_TAIL), zh: tail.zh.slice(-OUTPUT_TAIL) };
+		execution.step?.(step);
+	};
+	execution.step?.(step);
+	try {
+		const result = await run(output);
+		execution.signal?.throwIfAborted();
+		step.state = "passed";
+		step.exitCode = command ? 0 : null;
+		return result;
+	} catch (err) {
+		step.state = "failed";
+		step.exitCode = err instanceof EnvError ? err.exitCode ?? null : null;
+		if (!step.outputTail) output(err instanceof EnvError || err instanceof HubError ? err.localizedText ?? err.message : errorText(err));
+		throw err;
+	} finally {
+		step.ms = Date.now() - started;
+		execution.step?.(step);
+	}
+}
 
 /**
  * Sole writer of worktree_env, service and lease. Brings a worktree's test environment
@@ -153,24 +193,7 @@ export class Env {
 		const log = this.logPath(worktreeId);
 		fs.mkdirSync(path.dirname(log), { recursive: true });
 		try {
-			await this.ensureServices(ws, recipe);
-			const vars = await this.#worktreeVars(ws, wt, recipe, true);
-			if (recipe.database) await this.#ensureDatabase(ws, wt, recipe, vars, log);
-			for (const rel of recipe.copy) {
-				const from = path.resolve(ws.repo_path, rel);
-				const to = path.resolve(wt.path, rel);
-				if (!fs.existsSync(to) && fs.existsSync(from)) {
-					fs.mkdirSync(path.dirname(to), { recursive: true });
-					fs.cpSync(from, to, { recursive: true });
-				}
-			}
-			const exported = Object.fromEntries(Object.entries(recipe.env).map(([k, v]) => [k, expand(v, vars, "plain")]));
-			if (force || prev?.state !== "ready" || prev.recipe_hash !== hash) {
-				for (const cmd of recipe.setup) {
-					const r = await runShell(expand(cmd, vars, "shell"), { cwd: wt.path, env: { ...process.env, ...exported }, timeoutMs: SETUP_TIMEOUT_MS, log });
-					if (r.code !== 0) throw new EnvError(envMessages.setupFailed(r.code, cmd, r.outputText ?? r.output));
-				}
-			}
+			const exported = await this.prepare(ws, wt, recipe, { log }, force || prev?.state !== "ready" || prev.recipe_hash !== hash);
 			this.#setEnv(worktreeId, "ready", hash, exported, null);
 		} catch (err) {
 			const detail = err instanceof EnvError || err instanceof HubError ? err.localizedText ?? err.message : errorText(err);
@@ -181,8 +204,38 @@ export class Env {
 		return this.envRow(worktreeId)!;
 	}
 
+	async prepare(ws: WorkspaceRow, target: EnvTarget, recipe: EnvRecipe, execution: EnvExecution = {}, setup = true): Promise<Record<string, string>> {
+		const log = execution.log ?? this.logPath(target.id);
+		fs.mkdirSync(path.dirname(log), { recursive: true });
+		await this.ensureServices(ws, recipe, execution);
+		const vars = await environmentStep(execution, "services", "(ports)", null, () => this.#worktreeVars(ws, target, recipe, true));
+		if (recipe.database) await environmentStep(execution, "database", "prepare", null, output => this.#ensureDatabase(ws, target, recipe, vars, log, execution, output));
+		for (const rel of recipe.copy) {
+			await environmentStep(execution, "copy", rel, null, async () => {
+				const from = path.resolve(ws.repo_path, rel);
+				const to = path.resolve(target.path, rel);
+				if (!fs.existsSync(to) && fs.existsSync(from)) {
+					fs.mkdirSync(path.dirname(to), { recursive: true });
+					fs.cpSync(from, to, { recursive: true });
+				}
+			});
+		}
+		const exported = Object.fromEntries(Object.entries(recipe.env).map(([k, v]) => [k, expand(v, vars, "plain")]));
+		if (setup) {
+			for (const [index, cmd] of recipe.setup.entries()) {
+				const command = expand(cmd, vars, "shell");
+				await environmentStep(execution, "setup", String(index + 1), command, async output => {
+					const r = await runShell(command, { cwd: target.path, env: { ...process.env, ...exported }, timeoutMs: execution.setupTimeoutMs ?? SETUP_TIMEOUT_MS, log, signal: execution.signal, onOutput: output, onProcess: execution.process });
+					output(r.outputText ?? r.output);
+					if (r.code !== 0) throw new EnvError(envMessages.setupFailed(r.code, cmd, r.outputText ?? r.output), r.code);
+				});
+			}
+		}
+		return exported;
+	}
+
 	/** Template variables for a worktree. Port leases are acquired when `acquire` is set. */
-	async #worktreeVars(ws: WorkspaceRow, wt: WorktreeRow, recipe: EnvRecipe, acquire: boolean): Promise<Vars> {
+	async #worktreeVars(ws: WorkspaceRow, wt: EnvTarget, recipe: EnvRecipe, acquire: boolean): Promise<Vars> {
 		const port: Record<string, number> = { ...this.#servicePorts(ws.id) };
 		for (const name of recipe.ports) {
 			const held = this.#activeLease("worktree", wt.id, "port", name);
@@ -198,7 +251,7 @@ export class Env {
 		return vars;
 	}
 
-	async #ensureDatabase(ws: WorkspaceRow, wt: WorktreeRow, recipe: EnvRecipe, vars: Vars, log: string): Promise<void> {
+	async #ensureDatabase(ws: WorkspaceRow, wt: EnvTarget, recipe: EnvRecipe, vars: Vars, log: string, execution: EnvExecution, output: (tail: string | Message) => void): Promise<void> {
 		const d = recipe.database!;
 		const name = vars.db!.name;
 		this.#db.tx(() => {
@@ -209,16 +262,21 @@ export class Env {
 			this.#insertLease("db", name, "database", "worktree", wt.id, null);
 		});
 		const env = { ...process.env };
-		const exists = await runShell(expand(d.exists, vars, "shell"), { cwd: ws.repo_path, env, timeoutMs: COMMAND_TIMEOUT_MS, log });
+		const options = { cwd: ws.repo_path, env, timeoutMs: execution.setupTimeoutMs ?? SETUP_TIMEOUT_MS, log, signal: execution.signal, onOutput: output, onProcess: execution.process };
+		const exists = await runShell(expand(d.exists, vars, "shell"), { ...options, timeoutMs: COMMAND_TIMEOUT_MS });
+		execution.signal?.throwIfAborted();
 		if (exists.code === 0) return;
-		const clone = await runShell(expand(d.clone, vars, "shell"), { cwd: ws.repo_path, env, timeoutMs: SETUP_TIMEOUT_MS, log });
-		if (clone.code !== 0) throw new EnvError(envMessages.databaseCloneFailed(clone.code, clone.outputText ?? clone.output));
+		const clone = await runShell(expand(d.clone, vars, "shell"), options);
+		output(clone.outputText ?? clone.output);
+		if (clone.code !== 0) throw new EnvError(envMessages.databaseCloneFailed(clone.code, clone.outputText ?? clone.output), clone.code);
 	}
 
 	/** Shared services of a workspace: `check` first, start only what is down. */
-	ensureServices(ws: WorkspaceRow, recipe: EnvRecipe): Promise<void> {
+	ensureServices(ws: WorkspaceRow, recipe: EnvRecipe, execution: EnvExecution = {}): Promise<void> {
 		return this.#once(`services:${ws.id}`, async () => {
-			for (const [name, spec] of Object.entries(recipe.services)) await this.#ensureService(ws, name, spec);
+			for (const [name, spec] of Object.entries(recipe.services)) {
+				await environmentStep(execution, "services", name, spec.check, output => this.#ensureService(ws, name, spec, execution, output));
+			}
 		});
 	}
 
@@ -250,41 +308,47 @@ export class Env {
 		return { repo: ws.repo_path, port };
 	}
 
-	async #ensureService(ws: WorkspaceRow, name: string, spec: ServiceSpec): Promise<ServiceRow> {
-		const log = this.#serviceLog(ws.id, name);
+	async #ensureService(ws: WorkspaceRow, name: string, spec: ServiceSpec, execution: EnvExecution = {}, output?: (tail: string | Message) => void): Promise<ServiceRow> {
+		const log = execution.log ?? this.#serviceLog(ws.id, name);
 		fs.mkdirSync(path.dirname(log), { recursive: true });
 		const vars = await this.#serviceVars(ws, spec);
-		const check = () => runShell(expand(spec.check, vars, "shell"), { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: 30_000, log });
+		const options = { cwd: ws.repo_path, env: { ...process.env }, log, signal: execution.signal, onOutput: output, onProcess: execution.process };
+		const check = () => runShell(expand(spec.check, vars, "shell"), { ...options, timeoutMs: 30_000 });
 		const current = this.#service(`${ws.id}/${name}`);
+		execution.signal?.throwIfAborted();
 		if ((await check()).code === 0) {
 			this.#setService(ws, name, spec.kind, "up", current?.pid ?? null, null);
 			return this.#service(`${ws.id}/${name}`)!;
 		}
+		execution.signal?.throwIfAborted();
 		this.#setService(ws, name, spec.kind, "starting", current?.pid ?? null, null);
 		let pid: number | null = null;
 		if (spec.kind === "external") {
-			const r = await runShell(expand(spec.start, vars, "shell"), { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: spec.timeoutSec * 1000, log });
+			const r = await runShell(expand(spec.start, vars, "shell"), { ...options, env: { ...process.env }, timeoutMs: spec.timeoutSec * 1000 });
 			if (r.code !== 0) {
 				this.#setService(ws, name, spec.kind, "failed", null, envMessages.startFailed(r.code, r.outputText ?? r.output));
-				throw new EnvError(envMessages.serviceStartFailed(name, r.code, log));
+				throw new EnvError(envMessages.serviceStartFailed(name, r.code, log), r.code);
 			}
 		} else {
-			const fd = fs.openSync(log, "a");
+			const serviceLog = this.#serviceLog(ws.id, name);
+			fs.mkdirSync(path.dirname(serviceLog), { recursive: true });
+			const fd = fs.openSync(serviceLog, "a");
 			const child = spawn("/bin/sh", ["-c", expand(spec.run, vars, "shell")], { cwd: ws.repo_path, env: { ...process.env }, detached: true, stdio: ["ignore", fd, fd] });
 			fs.closeSync(fd);
 			child.on("error", () => {});
 			child.unref();
 			pid = child.pid ?? null;
+			this.#setService(ws, name, spec.kind, "starting", pid, null);
 		}
 		const deadline = Date.now() + spec.timeoutSec * 1000;
 		while (Date.now() < deadline) {
-			await sleep(500);
+			await sleep(500, undefined, { signal: execution.signal });
 			if ((await check()).code === 0) {
 				this.#setService(ws, name, spec.kind, "up", pid, null);
 				return this.#service(`${ws.id}/${name}`)!;
 			}
 		}
-		const tail = readTail(log, 1500);
+		const tail = readTail(spec.kind === "run" ? this.#serviceLog(ws.id, name) : log, 1500);
 		this.#setService(ws, name, spec.kind, "failed", pid, envMessages.checkTimeout(spec.timeoutSec));
 		throw new EnvError(envMessages.serviceCheckTimeout(name, spec.timeoutSec, log, tail));
 	}
@@ -331,22 +395,50 @@ export class Env {
 		if (!wt) return;
 		const ws = this.#workspaces.must(wt.workspace_id);
 		const loaded = this.#workspaces.loadRecipe(ws.id);
-		const log = this.logPath(worktreeId);
+		if (loaded.status === "ok") await this.teardownTarget(ws, wt, loaded.recipe);
+		else this.releaseTarget(worktreeId);
+		if (this.envRow(worktreeId)) this.#setEnv(worktreeId, "torn_down", this.envRow(worktreeId)!.recipe_hash, {}, null);
+	}
+
+	async teardownTarget(ws: WorkspaceRow, target: EnvTarget, recipe: EnvRecipe, execution: EnvExecution = {}): Promise<void> {
+		const log = execution.log ?? this.logPath(target.id);
 		fs.mkdirSync(path.dirname(log), { recursive: true });
-		if (loaded.status === "ok" && fs.existsSync(wt.path)) {
-			const vars = await this.#worktreeVars(ws, wt, loaded.recipe, false);
-			const env = { ...process.env, ...this.varsOf(worktreeId) };
-			for (const cmd of loaded.recipe.teardown) {
-				const r = await runShell(expand(cmd, vars, "shell"), { cwd: wt.path, env, timeoutMs: COMMAND_TIMEOUT_MS, log });
-				if (r.code !== 0) throw new HubError("conflict", envMessages.teardownFailed(r.code, cmd, log));
-			}
-			if (loaded.recipe.database && this.#activeLease("worktree", wt.id, "db", "database")) {
-				const r = await runShell(expand(loaded.recipe.database.drop, vars, "shell"), { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: COMMAND_TIMEOUT_MS, log });
-				if (r.code !== 0) throw new HubError("conflict", envMessages.databaseDropFailed(r.code, log));
+		const vars = await this.#worktreeVars(ws, target, recipe, false);
+		const errors: unknown[] = [];
+		if (fs.existsSync(target.path)) {
+			const exported = Object.fromEntries(Object.entries(recipe.env).map(([k, v]) => [k, expand(v, vars, "plain")]));
+			for (const [index, cmd] of recipe.teardown.entries()) {
+				const command = expand(cmd, vars, "shell");
+				try {
+					await environmentStep(execution, "teardown", String(index + 1), command, async output => {
+						const r = await runShell(command, { cwd: target.path, env: { ...process.env, ...exported }, timeoutMs: COMMAND_TIMEOUT_MS, log, onOutput: output, onProcess: execution.process });
+						output(r.outputText ?? r.output);
+						if (r.code !== 0) throw new EnvError(envMessages.teardownFailed(r.code, cmd, log), r.code);
+					});
+				} catch (err) {
+					errors.push(err);
+				}
 			}
 		}
-		this.#db.run("UPDATE lease SET released_at = ? WHERE holder_kind = 'worktree' AND holder_id = ? AND released_at IS NULL", Date.now(), worktreeId);
-		if (this.envRow(worktreeId)) this.#setEnv(worktreeId, "torn_down", this.envRow(worktreeId)!.recipe_hash, {}, null);
+		if (recipe.database && this.#activeLease("worktree", target.id, "db", "database")) {
+			const command = expand(recipe.database.drop, vars, "shell");
+			try {
+				await environmentStep(execution, "teardown", "database", command, async output => {
+					const r = await runShell(command, { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: COMMAND_TIMEOUT_MS, log, onOutput: output, onProcess: execution.process });
+					output(r.outputText ?? r.output);
+					if (r.code !== 0) throw new EnvError(envMessages.databaseDropFailed(r.code, log), r.code);
+				});
+			} catch (err) {
+				errors.push(err);
+			}
+		}
+		if (errors.length) throw errors[0];
+		this.releaseTarget(target.id);
+	}
+
+	releaseTarget(id: string): void {
+		this.#db.run("UPDATE lease SET released_at = ? WHERE holder_kind = 'worktree' AND holder_id = ? AND released_at IS NULL", Date.now(), id);
+		this.#changed();
 	}
 
 	// ── leases ───────────────────────────────────────────────────────────────
@@ -507,8 +599,8 @@ export class Env {
 	}
 
 	/** Recipe test commands with variables filled in where this checkout has values. */
-	testCommands(ws: WorkspaceRow, wt: WorktreeRow | null): Record<string, string> {
-		const loaded = this.#workspaces.loadRecipe(ws.id);
+	testCommands(ws: WorkspaceRow, wt: EnvTarget | null, snapshot?: EnvRecipe): Record<string, string> {
+		const loaded = snapshot ? { status: "ok" as const, recipe: snapshot } : this.#workspaces.loadRecipe(ws.id);
 		if (loaded.status !== "ok") return {};
 		const recipe = loaded.recipe;
 		const port: Record<string, number> = { ...this.#servicePorts(ws.id) };
@@ -626,51 +718,89 @@ export function readTail(file: string, bytes: number): string {
 	}
 }
 
-function killGroup(pid: number): void {
+function killGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
 	try {
-		process.kill(-pid, "SIGTERM");
+		process.kill(-pid, signal);
 	} catch {
 		try {
-			process.kill(pid, "SIGTERM");
+			process.kill(pid, signal);
 		} catch {
 			// already gone
 		}
 	}
 }
 
+export function processStartedAt(pid: number): string | null {
+	try {
+		return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] }).trim() || null;
+	} catch (err) {
+		if (err && typeof err === "object" && "status" in err && err.status === 1) return null;
+		throw err;
+	}
+}
+
 /** Run one shell command; output is appended to `log` and its tail returned. */
-export function runShell(cmd: string, o: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; log: string }): Promise<{ code: number; output: string; outputText?: Message }> {
+export function runShell(cmd: string, o: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; log: string; signal?: AbortSignal; onOutput?: (tail: string | Message) => void; onProcess?: EnvExecution["process"] }): Promise<{ code: number; output: string; outputText?: Message }> {
+	o.signal?.throwIfAborted();
 	const { promise, resolve } = Promise.withResolvers<{ code: number; output: string; outputText?: Message }>();
 	const log = fs.createWriteStream(o.log, { flags: "a" });
 	log.write(`\n[${new Date().toISOString()}] $ ${cmd}\n`);
 	let tail = "";
 	let translatedTail: string | undefined;
+	let forcedCode: number | undefined;
+	let escalation: NodeJS.Timeout | undefined;
 	const child = spawn("/bin/sh", ["-c", cmd], { cwd: o.cwd, env: o.env, stdio: ["ignore", "pipe", "pipe"], detached: true });
 	const onData = (chunk: Buffer) => {
 		log.write(chunk);
 		const text = chunk.toString("utf8");
 		tail = (tail + text).slice(-OUTPUT_TAIL);
 		if (translatedTail !== undefined) translatedTail = (translatedTail + text).slice(-OUTPUT_TAIL);
+		o.onOutput?.(tail);
 	};
 	child.stdout.on("data", onData);
 	child.stderr.on("data", onData);
-	const timer = setTimeout(() => {
-		const message = envMessages.shellTimeout(Math.round(o.timeoutMs / 1000));
-		translatedTail = `${tail}\n${message.zh}`;
-		tail += `\n${message.en}`;
-		if (child.pid) killGroup(child.pid);
-	}, o.timeoutMs);
+	const terminate = (code: number, message: Message) => {
+		if (forcedCode !== undefined) return;
+		forcedCode = code;
+		translatedTail = `${tail}\n${message.zh}`.slice(-OUTPUT_TAIL);
+		tail = `${tail}\n${message.en}`.slice(-OUTPUT_TAIL);
+		log.write(`\n${message.en}\n`);
+		o.onOutput?.({ en: tail, zh: translatedTail });
+		if (child.pid) {
+			killGroup(child.pid);
+			escalation = setTimeout(() => killGroup(child.pid!, "SIGKILL"), 1000);
+		}
+	};
+	const abort = () => terminate(130, envMessages.shellCancelled());
+	o.signal?.addEventListener("abort", abort, { once: true });
+	const timer = setTimeout(() => terminate(124, envMessages.shellTimeout(Math.round(o.timeoutMs / 1000))), o.timeoutMs);
 	let done = false;
 	const finish = (code: number) => {
 		if (done) return;
 		done = true;
 		clearTimeout(timer);
+		clearTimeout(escalation);
+		o.signal?.removeEventListener("abort", abort);
+		if (forcedCode !== undefined && child.pid) killGroup(child.pid, "SIGKILL");
+		if (child.pid) o.onProcess?.(child.pid, null);
+		code = forcedCode ?? code;
 		log.end(`[exit ${code}]\n`);
 		const output = tail.trim();
 		resolve({ code, output, ...(translatedTail === undefined ? {} : { outputText: { en: output, zh: translatedTail.trim() } }) });
 	};
-	child.on("error", () => finish(127));
+	child.on("error", err => {
+		onData(Buffer.from(errorText(err)));
+		finish(127);
+	});
 	child.on("close", (code, signal) => finish(code ?? (signal ? 128 : 1)));
+	if (o.onProcess && child.pid) {
+		try {
+			const startedAt = processStartedAt(child.pid);
+			if (startedAt) o.onProcess(child.pid, startedAt);
+		} catch (err) {
+			terminate(127, envMessages.startFailed(127, errorText(err)));
+		}
+	}
 	return promise;
 }
 

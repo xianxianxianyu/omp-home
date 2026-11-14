@@ -10,7 +10,8 @@ const task = z.object({ id: z.string(), title: z.string(), workspace: z.string()
 const main = z.object({ sessionId: nullableText, state: proc, wakesUsed: z.number(), wakesMax: z.number(), paused: z.boolean(), pendingNotices: z.number() });
 const state = z.object({ version: z.string(), omp: z.object({ version: nullableText, path: nullableText, managed: z.boolean(), warning: nullableText }), setup: z.object({ done: z.boolean(), homePath: nullableText }), main, pool: z.object({ live: z.number(), cap: z.number() }), inboxOpen: z.number(), openTasks: z.number() });
 const session = z.object({ id: z.string(), kind: z.enum(["main", "worker"]), workspace: nullableText, worktreePath: nullableText, branch: nullableText, cwd: z.string(), model: z.string(), state: proc, pid: z.number().nullable(), rssMb: z.number().nullable(), lastActivity: z.number().nullable(), openTask: z.object({ id: z.string(), title: z.string(), status }).nullable(), retired: z.boolean(), createdAt: z.number() });
-const workspace = z.object({ id: z.string(), name: z.string(), repoPath: z.string(), defaultBase: z.string(), workerModel: nullableText, notesPath: z.string(), recipePath: z.string(), recipeStatus: z.enum(["missing", "ok", "invalid"]), liveSessions: z.number(), totalSessions: z.number(), openTasks: z.number(), archived: z.boolean() });
+const recipeCheckState = z.enum(["running", "passed", "failed", "cancelled"]);
+const workspace = z.object({ id: z.string(), name: z.string(), repoPath: z.string(), defaultBase: z.string(), workerModel: nullableText, notesPath: z.string(), recipePath: z.string(), recipeStatus: z.enum(["missing", "ok", "invalid"]), recipeCheck: z.object({ state: recipeCheckState, current: z.boolean(), endedAt: z.number().nullable() }).nullable(), liveSessions: z.number(), totalSessions: z.number(), openTasks: z.number(), archived: z.boolean() });
 const decision = z.object({ id: z.string(), taskId: nullableText, at: z.number(), summary: z.string(), why: z.string(), revert: z.string(), reverts: nullableText, revertRequestedAt: z.number().nullable(), revertedBy: nullableText });
 const escalation = z.object({ id: z.string(), taskId: z.string(), taskTitle: z.string(), sessionId: z.string(), reason: z.string(), openedBy: z.enum(["main", "hub"]), openedAt: z.number(), seenAt: z.number().nullable(), resolvedAt: z.number().nullable(), resolution: z.enum(["human_replied", "task_moved", "dismissed"]).nullable() });
 const environment = z.object({ worktreeId: z.string(), worktreePath: z.string(), workspace: z.string(), state: z.enum(["preparing", "ready", "failed", "torn_down"]), error: nullableText, vars: z.record(z.string(), z.string()), updatedAt: z.number() });
@@ -21,6 +22,11 @@ export const appearance = z.object({ theme: z.enum(THEMES), accent: z.enum(ACCEN
 const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.enum(THINKING_LEVELS), workerModel: nullableText, workerThinking: z.enum(THINKING_LEVELS), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText, appearance, language: z.enum(LANGUAGE_SETTINGS) });
 const modelCatalog = z.object({ models: z.array(z.object({ selector: z.string(), provider: z.string(), id: z.string(), name: z.string(), contextWindow: z.number().nullable(), maxTokens: z.number().nullable(), reasoning: z.boolean(), thinking: z.array(z.enum(THINKING_LEVELS)), input: z.array(z.string()), cost: z.object({ input: z.number(), output: z.number() }).nullable() })), defaultModel: nullableText, fetchedAt: z.number(), error: nullableText });
 const recipe = z.object({ workspace: z.string(), path: z.string(), text: z.string(), status: z.enum(["missing", "ok", "invalid"]), errors: z.array(fieldError) });
+const recipeCheck = z.object({
+	workspace: z.string(), recipeHash: z.string(), current: z.boolean(), base: z.string(), sha: z.string(),
+	state: recipeCheckState, startedAt: z.number(), endedAt: z.number().nullable(),
+	steps: z.array(z.object({ kind: z.enum(["checkout", "copy", "setup", "services", "database", "test", "teardown"]), name: z.string(), command: nullableText, state: z.enum(["pending", "running", "passed", "failed", "skipped"]), exitCode: z.number().nullable(), ms: z.number().nullable(), outputTail: z.string() })),
+});
 const repoSuggestion = z.object({ path: z.string(), name: z.string(), source: z.enum(["home", "omp"]), ompSessions: z.number(), lastUsedAt: z.number().nullable(), lastTitle: nullableText, registeredAs: nullableText });
 const repoInspection = z.object({
 	path: z.string(), root: nullableText, name: z.string(), id: z.string(), registeredAs: nullableText,
@@ -29,7 +35,8 @@ const repoInspection = z.object({
 	worktrees: z.array(z.object({ path: z.string(), branch: nullableText, head: z.string() })),
 	remoteUrl: nullableText, dirty: z.boolean(),
 	omp: z.object({ sessions: z.number(), lastUsedAt: z.number().nullable(), lastTitle: nullableText }),
-	stack: z.array(z.string()), commands: z.object({ install: nullableText, test: nullableText, dev: nullableText }),
+	stack: z.array(z.string()), commands: z.object({ install: nullableText, dev: nullableText }),
+	tests: z.record(z.string(), z.string()), copy: z.array(z.object({ path: z.string(), why: z.enum(["tsconfig", "env"]) })),
 	recipeDraft: nullableText, hasRecipe: z.boolean(),
 });
 const topic = z.union([z.enum(["state", "tasks", "sessions", "inbox", "decisions", "workspaces", "resources", "settings"]), z.templateLiteral(["task:", z.string()])]);
@@ -56,6 +63,7 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p === "/api/pick-folder") schema = z.object({ path: nullableText });
 	else if (p === "/api/workspaces/suggestions") schema = z.array(repoSuggestion);
 	else if (p === "/api/workspaces/inspect") schema = repoInspection;
+	else if (/\/recipe\/check(?:\/cancel)?$/.test(p)) schema = recipeCheck.nullable();
 	else if (p.endsWith("/recipe")) schema = recipe;
 	else if (p === "/api/workspaces") schema = Array.isArray(data) ? z.array(workspace) : workspace;
 	else if (p.startsWith("/api/workspaces/")) schema = workspace;

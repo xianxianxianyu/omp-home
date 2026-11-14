@@ -1,10 +1,11 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
+import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeCheckDTO, RecipeCheckStep, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { createMockSessions } from "./mock-sessions.ts";
 import { getT } from "./i18n/runtime.ts";
+import { readRecipeSummary } from "./RecipeSummary.tsx";
 
 export function installMock() {
 const now = Date.now();
@@ -24,8 +25,9 @@ const catalog: ModelCatalogDTO = {
 		{ selector: "openai-codex/gpt-5.3-codex", provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 400000, maxTokens: 128000, reasoning: true, thinking: ["low", "medium", "high", "xhigh"], input: ["text", "image"], cost: { input: 1.75, output: 14 } },
 	],
 };
-const workspaces: WorkspaceDTO[] = ["atlas", "console"].map((id, index) => ({ id, name: index ? "Console" : "Atlas", repoPath: `${root}/${id}`, defaultBase: "main", workerModel: null, notesPath: `${home}/repos/${id}.md`, recipePath: `${home}/repos/${id}.env.yaml`, recipeStatus: index ? "missing" : "ok", liveSessions: 1, totalSessions: 1, openTasks: index ? 1 : 3, archived: false }));
-const recipeDraft = 'version: 1\nports: [web]\nenv:\n  PORT: "{port.web}"\nsetup:\n  - pnpm install --frozen-lockfile\ntest:\n  full: pnpm test\n';
+const workspaces: WorkspaceDTO[] = ["atlas", "console"].map((id, index) => ({ id, name: index ? "Console" : "Atlas", repoPath: `${root}/${id}`, defaultBase: "main", workerModel: null, notesPath: `${home}/repos/${id}.md`, recipePath: `${home}/repos/${id}.env.yaml`, recipeStatus: index ? "missing" : "ok", recipeCheck: null, liveSessions: 1, totalSessions: 1, openTasks: index ? 1 : 3, archived: false }));
+const detectedTests = { typecheck: "pnpm run typecheck", lint: "CI=1 pnpm run lint", unit: "pnpm test -- --ci", coverage: "pnpm run test:ci", full: "pnpm run typecheck && CI=1 pnpm run lint && pnpm test -- --ci" };
+const recipeDraft = 'version: 1\ncopy: [expo-env.d.ts, .expo/types/router.d.ts]\nports: [web]\nenv:\n  PORT: "{port.web}"\nsetup:\n  - pnpm install --frozen-lockfile\ntest:\n' + Object.entries(detectedTests).map(([name, command]) => `  ${name}: ${command}\n`).join("");
 function inspectRepo(path: string): RepoInspection {
 	const name = path.split("/").filter(Boolean).at(-1) ?? "repository";
 	const workspace = workspaces.find(item => item.repoPath === path);
@@ -42,7 +44,9 @@ function inspectRepo(path: string): RepoInspection {
 		remoteUrl: isGit ? `git@github.com:demo/${name}.git` : null, dirty: isGit,
 		omp: { sessions: isGit ? 8 : 0, lastUsedAt: isGit ? now - 3 * 86400000 : null, lastTitle: isGit ? "Refine the search experience" : null },
 		stack: isGit ? ["pnpm", "node", "TypeScript"] : [],
-		commands: { install: isGit ? "pnpm install --frozen-lockfile" : null, test: isGit ? "pnpm test" : null, dev: isGit ? "pnpm dev" : null },
+		commands: { install: isGit ? "pnpm install --frozen-lockfile" : null, dev: isGit ? "pnpm dev" : null },
+		tests: isGit ? detectedTests : {},
+		copy: isGit ? [{ path: "expo-env.d.ts", why: "tsconfig" }, { path: ".expo/types/router.d.ts", why: "tsconfig" }, { path: ".env.local", why: "env" }] : [],
 		recipeDraft: isGit ? recipes.get(workspace?.id ?? "")?.text || recipeDraft : null,
 		hasRecipe: workspace?.recipeStatus === "ok",
 	};
@@ -89,7 +93,47 @@ const sessions: SessionDTO[] = [{ id: "M-1", kind: "main", workspace: null, work
 	return { id, kind: "worker", workspace: task.workspace, worktreePath: task.worktreePath, branch: task.branch, cwd: task.worktreePath!, model: settings.workerModel!, state: index ? "approval" : "running", pid: 42311 + index, rssMb: index ? 146.8 : 211.2, lastActivity: now - (index + 1) * 45000, openTask: { id: task.id, title: task.title, status: task.status }, retired: false, createdAt: now - 3600000 };
 })];
 const resources: ResourcesDTO = { services: [{ id: "S-1", workspace: "atlas", name: "postgres", kind: "external", state: "up", pid: null, checkedAt: now - 30000, error: null, logTail: "[health] 127.0.0.1:5432 accepting connections\n[health] database ready" }, { id: "S-2", workspace: "console", name: "preview", kind: "run", state: "down", pid: null, checkedAt: now - 60000, error: null, logTail: "Preview service stopped cleanly." }], leases: [{ id: 1, kind: "port", key: "4101", label: "Atlas development server", holderKind: "worktree", holderId: "WT-2", acquiredAt: now - 3600000, expiresAt: now + 3600000 }, { id: 2, kind: "db", key: "atlas_t11", label: "Isolated test database", holderKind: "worktree", holderId: "WT-2", acquiredAt: now - 3600000, expiresAt: null }], environments: tasks.flatMap(task => task.env ? [task.env] : []) };
-const recipes = new Map<string, RecipeDTO>(workspaces.map(workspace => [workspace.id, { workspace: workspace.id, path: workspace.recipePath, text: workspace.recipeStatus === "ok" ? 'version: 1\nenv:\n  NODE_ENV: test\n  PROJECT_DIR: "{worktree}"\nsetup:\n  - "npm ci"\nteardown:\n  - "echo Environment released"\n' : "", status: workspace.recipeStatus, errors: [] }]));
+const recipes = new Map<string, RecipeDTO>(workspaces.map(workspace => [workspace.id, { workspace: workspace.id, path: workspace.recipePath, text: workspace.recipeStatus === "ok" ? recipeDraft : "", status: workspace.recipeStatus, errors: [] }]));
+const recipeChecks = new Map<string, RecipeCheckDTO>();
+const checkSources = new Map<string, string>();
+function publishCheck(workspace: WorkspaceDTO, check: RecipeCheckDTO) {
+	check.current = checkSources.get(workspace.id) === recipes.get(workspace.id)?.text;
+	workspace.recipeCheck = { state: check.state, current: check.current, endedAt: check.endedAt };
+	invalidate(["workspaces"]);
+}
+function startCheck(workspace: WorkspaceDTO, test: string) {
+	const recipe = recipes.get(workspace.id);
+	const summary = readRecipeSummary(recipe?.text ?? "");
+	if (!recipe || recipe.status !== "ok" || !summary) return response({ error: getT().panels.workspaces.recipeLoadError }, 422);
+	if (recipeChecks.get(workspace.id)?.state === "running") return response({ error: getT().panels.workspaces.checkStates.running }, 409);
+	if (test && !(test in summary.test)) return response({ error: getT().panels.workspaces.checkActionError }, 422);
+	const step = (kind: RecipeCheckStep["kind"], name: string, command: string | null = null): RecipeCheckStep => ({ kind, name, command, state: "pending", exitCode: null, ms: null, outputTail: "" });
+	const tests = test ? [[test, summary.test[test]]] : summary.test.full ? [["full", summary.test.full]] : Object.entries(summary.test);
+	const check: RecipeCheckDTO = {
+		workspace: workspace.id, recipeHash: `mock-${Date.now()}`, current: true, base: workspace.defaultBase, sha: "a1b2c3d4e5f67890",
+		state: "running", startedAt: Date.now(), endedAt: null,
+		steps: [step("checkout", workspace.defaultBase), ...summary.copy.map(file => step("copy", file)), ...summary.setup.map((command, index) => step("setup", String(index + 1), command)), ...tests.map(([name, command]) => step("test", name, command)), step("teardown", "worktree")],
+	};
+	check.steps[0].state = "running";
+	recipeChecks.set(workspace.id, check); checkSources.set(workspace.id, recipe.text); publishCheck(workspace, check);
+	let index = 0;
+	const advance = () => {
+		if (check.state !== "running") return;
+		const current = check.steps[index];
+		const failed = workspace.id === "atlas" && current.kind === "test" && (current.name === "lint" || current.name === "full");
+		current.state = failed ? "failed" : "passed"; current.ms = 650; current.exitCode = current.command ? failed ? 1 : 0 : null;
+		current.outputTail = failed ? "src/search.ts:42:7  error  'query' is assigned a value but never used  @typescript-eslint/no-unused-vars\n✖ 1 problem (1 error, 0 warnings)\nCommand failed with exit code 1." : current.kind === "test" ? "All checks passed.\nTests: 24 passed, 24 total." : current.kind === "setup" ? "Dependencies installed from the lockfile." : current.kind === "teardown" ? "Temporary worktree removed. No leases remain." : "";
+		if (failed) {
+			for (const remaining of check.steps.slice(index + 1, -1)) remaining.state = "skipped";
+			index = check.steps.length - 1;
+		} else index++;
+		if (index === check.steps.length) { check.state = check.steps.some(item => item.state === "failed") ? "failed" : "passed"; check.endedAt = Date.now(); }
+		else { check.steps[index].state = "running"; window.setTimeout(advance, 650); }
+		publishCheck(workspace, check);
+	};
+	window.setTimeout(advance, 650);
+	return response(check, 202);
+}
 const chat: ChatRecordDTO[] = [{ id: 1, role: "user", at: now - 900000, text: "Let's improve search in Atlas and review the account migration in Console. Keep the work isolated." }, { id: 2, role: "assistant", at: now - 840000, text: "I'll route those to separate workers. I'll review their reports first and bring you in for the migration decision." }, { id: 3, role: "notice", at: now - 180000, text: "W-12 reported a schema migration that needs human approval." }, { id: 4, role: "assistant", at: now - 120000, text: "The incremental search work is progressing. The account migration changes a data contract; I've opened it in your inbox." }];
 function emit(event: UiEvent) { subscribers.forEach(subscriber => subscriber.message(JSON.stringify(event))); }
 function invalidate(topics: Topic[]) { queueMicrotask(() => emit({ t: "invalidate", topics })); }
@@ -202,14 +246,39 @@ window.setInterval(() => {
 						try { const parsed: unknown = parseYaml(yaml); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(); }
 						catch { return response({ error: getT().panels.workspaces.recipeSaveError }, 422); }
 					}
-					const workspace: WorkspaceDTO = { id: workspaceId, name: text(body, "name", workspaceId), repoPath, defaultBase: text(body, "defaultBase", "main"), workerModel: body.workerModel === null ? null : text(body, "workerModel") || null, notesPath: `${home}/repos/${workspaceId}.md`, recipePath: `${home}/repos/${workspaceId}.env.yaml`, recipeStatus: yaml ? "ok" : "missing", liveSessions: 0, totalSessions: 0, openTasks: 0, archived: false };
+					const workspace: WorkspaceDTO = { id: workspaceId, name: text(body, "name", workspaceId), repoPath, defaultBase: text(body, "defaultBase", "main"), workerModel: body.workerModel === null ? null : text(body, "workerModel") || null, notesPath: `${home}/repos/${workspaceId}.md`, recipePath: `${home}/repos/${workspaceId}.env.yaml`, recipeStatus: yaml ? "ok" : "missing", recipeCheck: null, liveSessions: 0, totalSessions: 0, openTasks: 0, archived: false };
 					if (yaml) recipes.set(workspaceId, { workspace: workspaceId, path: workspace.recipePath, text: yaml, status: "ok", errors: [] });
 					workspaces.push(workspace); invalidate(["workspaces"]); return response(workspace);
 				}
 				const workspace = workspaces.find(item => item.id === id); if (!workspace) return response({ error: "Workspace not found" }, 404);
 				if (action === "recipe") {
+					if (parts[4] === "check") {
+						const check = recipeChecks.get(id);
+						if (parts[5] === "cancel" && method === "POST") {
+							if (!check) return response({ error: getT().panels.workspaces.checkActionError }, 404);
+							if (check.state === "running") {
+								check.state = "cancelled"; check.endedAt = Date.now();
+								for (const step of check.steps) {
+									if (step.state === "running" || step.state === "pending") step.state = "skipped";
+									if (step.kind === "teardown") { step.state = "passed"; step.ms = 100; step.outputTail = "Temporary worktree removed after cancellation."; }
+								}
+								publishCheck(workspace, check);
+							}
+							return response(check);
+						}
+						if (method === "POST") return startCheck(workspace, text(body, "test"));
+						return response(check ?? null);
+					}
 					const recipe = recipes.get(id) ?? { workspace: id, path: workspace.recipePath, text: "", status: "missing", errors: [] };
-					if (method === "PUT") { const yaml = text(body, "text"); try { const parsed: unknown = parseYaml(yaml); if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) throw new Error("Recipe must be a YAML mapping."); } catch (error) { return response({ error: "Invalid environment recipe", errors: [{ path: "recipe", message: error instanceof Error ? error.message : String(error) }] }, 422); } recipe.text = yaml; recipe.status = "ok"; workspace.recipeStatus = "ok"; recipes.set(id, recipe); invalidate(["workspaces"]); } return response(recipe);
+					if (method === "PUT") {
+						const yaml = text(body, "text");
+						try { const parsed: unknown = parseYaml(yaml); if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) throw new Error(getT().panels.workspaces.recipeSaveError); }
+						catch (error) { return response({ error: getT().panels.workspaces.recipeSaveError, errors: [{ path: "recipe", message: error instanceof Error ? error.message : String(error) }] }, 422); }
+						recipe.text = yaml; recipe.status = "ok"; workspace.recipeStatus = "ok"; recipes.set(id, recipe);
+						const check = recipeChecks.get(id); if (check) publishCheck(workspace, check);
+						invalidate(["workspaces"]);
+					}
+					return response(recipe);
 				}
 				if (action === "archive") workspace.archived = true;
 				if (method === "PATCH") { workspace.name = text(body, "name", workspace.name); workspace.defaultBase = text(body, "defaultBase", workspace.defaultBase); if ("workerModel" in body) workspace.workerModel = body.workerModel === null ? null : text(body, "workerModel"); }

@@ -20,6 +20,7 @@ import type { OmpManager } from "./omp.ts";
 import { Pool, type ExitInfo, type SessionRow } from "./pool.ts";
 import { ProgressWatch } from "./progress-watch.ts";
 import { Provisioner } from "./provisioner.ts";
+import { RecipeChecks } from "./recipe-check.ts";
 import type { Resources } from "./resources.ts";
 import { RpcError, type RpcFrame } from "./rpc.ts";
 import { SessionViews } from "./session-views.ts";
@@ -55,6 +56,7 @@ export class Hub {
 	readonly workspaces: Workspaces;
 	readonly worktrees: Worktrees;
 	readonly env: Env;
+	readonly recipeChecks: RecipeChecks;
 	readonly pool: Pool;
 	readonly bridge: Bridge;
 	readonly notifier: Notifier;
@@ -79,9 +81,10 @@ export class Hub {
 		this.settings = new SettingsStore(this.db, this.paths);
 		this.ledger = new Ledger(this.db);
 		this.indexer = new Indexer(this.db);
-		this.workspaces = new Workspaces(this.db, this.paths, () => this.settings.get().worktreeRoot);
+		this.workspaces = new Workspaces(this.db, this.paths, () => this.settings.get().worktreeRoot, id => this.recipeChecks.summary(id));
 		this.worktrees = new Worktrees(this.db);
 		this.env = new Env(this.db, this.paths, this.settings, this.workspaces, this.worktrees, () => this.changed("resources"));
+		this.recipeChecks = new RecipeChecks(this.db, this.paths, this.settings, this.workspaces, this.env, () => this.changed("workspaces", "resources"));
 		this.pool = new Pool({
 			db: this.db,
 			paths: this.paths,
@@ -152,6 +155,7 @@ export class Hub {
 		this.worktrees.reconcile();
 		this.db.run("UPDATE lease SET released_at = ? WHERE holder_kind = 'session' AND released_at IS NULL", Date.now());
 		this.env.releaseExpired();
+		await this.recipeChecks.reconcile();
 		const main = this.pool.currentMain() ?? this.pool.create({ kind: "main", workspaceId: null, worktreeId: null, cwd: this.home });
 		this.pool.ensureLive(main.id, { human: false });
 		for (const { session_id } of this.db.all<{ session_id: string }>(
@@ -174,7 +178,7 @@ export class Hub {
 		this.notifier.stop();
 		this.#progress.stop();
 		await Promise.race([this.provisioner.idle(), sleep(5000)]);
-		await this.pool.stopAll();
+		await Promise.all([this.recipeChecks.stop(), this.pool.stopAll()]);
 		this.bridge.closeAll();
 		this.db.close();
 	}

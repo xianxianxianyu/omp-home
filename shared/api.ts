@@ -45,6 +45,9 @@
  *   POST /api/workspaces/:id/archive        → WorkspaceDTO
  *   GET  /api/workspaces/:id/recipe         → RecipeDTO
  *   PUT  /api/workspaces/:id/recipe {text}  → RecipeDTO          (422 with errors when invalid)
+ *   GET  /api/workspaces/:id/recipe/check   → RecipeCheckDTO | null   (latest trial run of the recipe)
+ *   POST /api/workspaces/:id/recipe/check {test?} → RecipeCheckDTO   (start a trial run; 409 while one runs; test = one test entry name)
+ *   POST /api/workspaces/:id/recipe/check/cancel → RecipeCheckDTO
  *   GET  /api/workspaces/suggestions        → RepoSuggestion[]   (repos named in the home AGENTS.md + git repos you used omp in, newest first)
  *   GET  /api/workspaces/inspect ?path      → RepoInspection     (any folder; resolves to the git root; never writes)
  *   POST /api/pick-folder     {title?, defaultPath?} → { path: string | null }  (macOS folder chooser run by the hub; null = cancelled.
@@ -154,6 +157,8 @@ export interface WorkspaceDTO {
 	notesPath: string;
 	recipePath: string;
 	recipeStatus: "missing" | "ok" | "invalid";
+	/** Latest recipe trial run, summarised for lists; null = never run. */
+	recipeCheck: { state: RecipeCheckDTO["state"]; current: boolean; endedAt: number | null } | null;
 	liveSessions: number;
 	totalSessions: number;
 	openTasks: number;
@@ -207,12 +212,45 @@ export interface RepoInspection {
 	omp: { sessions: number; lastUsedAt: number | null; lastTitle: string | null };
 	/** Detected toolchain, e.g. ["pnpm", "node"], ["cargo"], ["uv", "python"]. */
 	stack: string[];
-	/** Detected commands, used for the recipe draft. */
-	commands: { install: string | null; test: string | null; dev: string | null };
+	/** Detected commands, used for the recipe draft. install is lockfile-strict (npm ci, pnpm --frozen-lockfile, …). */
+	commands: { install: string | null; dev: string | null };
+	/** Detected checks keyed like recipe `test` entries (typecheck, lint, unit, coverage, full); full chains the fast checks in order. */
+	tests: Record<string, string>;
+	/** Git-ignored files present in the main checkout that a fresh worktree needs (recipe `copy`), e.g. generated type declarations the tsconfig includes. */
+	copy: { path: string; why: "tsconfig" | "env" }[];
 	/** A valid environment recipe YAML derived from the above (null when nothing was detected); the repo's existing recipe wins if one exists. */
 	recipeDraft: string | null;
 	/** True when <home>/repos/<id>.env.yaml already exists for the suggested id. */
 	hasRecipe: boolean;
+}
+
+/**
+ * A trial run of a workspace's recipe in a throwaway worktree at the default base: the same checkout, copy, setup, services
+ * and test commands a worker gets, then torn down. A failure here is the base's baseline, not a task's fault.
+ */
+export interface RecipeCheckDTO {
+	workspace: string;
+	recipeHash: string;
+	/** False once the recipe file changed after this run. */
+	current: boolean;
+	base: string;
+	sha: string;
+	state: "running" | "passed" | "failed" | "cancelled";
+	startedAt: number;
+	endedAt: number | null;
+	steps: RecipeCheckStep[];
+}
+
+export interface RecipeCheckStep {
+	kind: "checkout" | "copy" | "setup" | "services" | "database" | "test" | "teardown";
+	/** Test entry name for kind "test"; otherwise a short label (file, service or command index). */
+	name: string;
+	command: string | null;
+	state: "pending" | "running" | "passed" | "failed" | "skipped";
+	exitCode: number | null;
+	ms: number | null;
+	/** Last ~4 KB of output. */
+	outputTail: string;
 }
 
 export interface RecipeDTO {

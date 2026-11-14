@@ -47,12 +47,15 @@ export class Workspaces {
 	readonly #db: Db;
 	readonly #paths: HomePaths;
 	readonly #worktreeRoot: () => string | null;
+	readonly #recipeCheck: (workspaceId: string) => WorkspaceDTO["recipeCheck"];
 	#discovery: { expiresAt: number; worktreeRoot: string | null; pending: Promise<RepoSuggestion[]> } | undefined;
 
-	constructor(db: Db, paths: HomePaths, worktreeRoot: () => string | null) {
+	/** `recipeCheck` summarises the workspace's latest recipe trial run for its DTO. */
+	constructor(db: Db, paths: HomePaths, worktreeRoot: () => string | null, recipeCheck: (workspaceId: string) => WorkspaceDTO["recipeCheck"] = () => null) {
 		this.#db = db;
 		this.#paths = paths;
 		this.#worktreeRoot = worktreeRoot;
+		this.#recipeCheck = recipeCheck;
 	}
 
 	get(id: string): WorkspaceRow | undefined {
@@ -198,6 +201,7 @@ export class Workspaces {
 			notesPath: this.notesPath(w.id),
 			recipePath: this.recipePath(w.id),
 			recipeStatus: this.loadRecipe(w.id).status,
+			recipeCheck: this.#recipeCheck(w.id),
 			liveSessions: sessions.live,
 			totalSessions: sessions.total,
 			openTasks: open,
