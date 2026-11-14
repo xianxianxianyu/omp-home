@@ -41,9 +41,8 @@ export const zh: CatalogShape<typeof en> = {
 			restartDescription: "主对话进程将停止，再从已保存的对话恢复。正在进行的轮次会中断，执行者会话不受影响。",
 			startNewChat: "开始新对话",
 			restartMain: "重启主对话",
-			more: "更多",
-			settingsMenu: "设置…",
-			newChatMenu: "新对话…",
+			newChat: "新对话",
+			newChatHint: "结束当前主对话会话，开启一段新对话",
 		},
 		now: {
 			title: "此刻",
@@ -74,6 +73,7 @@ export const zh: CatalogShape<typeof en> = {
 			taskActions: (title: string) => `「${title}」的操作`,
 			finished: "已完成",
 			clear: "清空",
+			allHistory: "全部已完成的任务和决定",
 			dismissFinished: (title: string) => `忽略已完成的「${title}」`,
 			stopTitle: (sessionId: string) => `停止 ${sessionId}？`,
 			stopDescription: "执行者将停止，任务和已保存的对话会保留。之后可打开任务继续。",
@@ -349,7 +349,7 @@ export const zh: CatalogShape<typeof en> = {
 			title: "模型", description: "从 omp 的模型列表中选择。", spawnNote: "模型和思考强度的修改从下一次启动会话起生效，不影响正在运行的会话。", catalogMeta: (_count: number, formatted: string) => `${formatted} 个模型 · 更新于`, saved: "模型已保存。", mainChat: "主对话", workersDefault: "执行者（默认）", dispatcher: "调度器", mainModel: "主对话模型", mainThinking: "主对话思考强度", workerModel: "执行者模型", workerThinking: "执行者思考强度", dispatcherModel: "调度器模型", save: "保存模型",
 		},
 		settings: {
-			title: "通用", description: "配置执行者容量与本地路径。", saved: "设置已保存。", saveError: "无法保存设置。", localPaths: "本地路径", ompBinary: "omp 可执行文件", ompHint: "指定 omp 可执行文件。留空则使用托管的 omp 或 PATH 中的版本。", managedPath: "托管版本 / PATH", pstackRoot: "pstack 根目录", pstackHint: "pstack 技能所在的路径。留空则不启用 pstack 集成。", worktreeRoot: "工作树根目录", worktreeHint: "留空则使用默认工作树位置。", defaultLocation: "默认位置", capacity: "执行者容量与唤醒额度", maxWorkers: "在线执行者上限", maxWorkersHint: (min: string, max: string) => `执行者池中最多保留的在线进程数（${min}–${max}）。`, idleEviction: "空闲回收时间（分钟）", idleEvictionHint: (min: string, max: string) => `执行者空闲多久后回收进程（${min}–${max} 分钟）。`, maxWakes: "自动唤醒上限", maxWakesHint: (min: string, max: string) => `两次人工输入之间，中枢最多自动唤醒主对话的次数（${min}–${max}）。超出后，后续通知等待你批准。`, ports: "端口分配", portsHint: (minimum: string, start: string, end: string) => `工作树预留端口的范围（含首尾）：至少 ${minimum} 个端口，介于 ${start} 与 ${end} 之间。`, firstPort: "起始端口", lastPort: "结束端口", save: "保存设置",
+			title: "通用", description: "主对话、执行者容量与本地路径。", mainChat: "主对话", mainSession: (id: string) => `会话 ${id}`, noMainSession: "尚未启动", wakes: (used: number, max: number) => `自动唤醒已用 ${used} / ${max} 次`, restartHint: "停止主对话进程，再从已保存的对话恢复。主对话卡住或换了模型之后可以用。", saved: "设置已保存。", saveError: "无法保存设置。", localPaths: "本地路径", ompBinary: "omp 可执行文件", ompHint: "指定 omp 可执行文件。留空则使用托管的 omp 或 PATH 中的版本。", managedPath: "托管版本 / PATH", pstackRoot: "pstack 根目录", pstackHint: "pstack 技能所在的路径。留空则不启用 pstack 集成。", worktreeRoot: "工作树根目录", worktreeHint: "留空则使用默认工作树位置。", defaultLocation: "默认位置", capacity: "执行者容量与唤醒额度", maxWorkers: "在线执行者上限", maxWorkersHint: (min: string, max: string) => `执行者池中最多保留的在线进程数（${min}–${max}）。`, idleEviction: "空闲回收时间（分钟）", idleEvictionHint: (min: string, max: string) => `执行者空闲多久后回收进程（${min}–${max} 分钟）。`, maxWakes: "自动唤醒上限", maxWakesHint: (min: string, max: string) => `两次人工输入之间，中枢最多自动唤醒主对话的次数（${min}–${max}）。超出后，后续通知等待你批准。`, ports: "端口分配", portsHint: (minimum: string, start: string, end: string) => `工作树预留端口的范围（含首尾）：至少 ${minimum} 个端口，介于 ${start} 与 ${end} 之间。`, firstPort: "起始端口", lastPort: "结束端口", save: "保存设置",
 		},
 		notifications: {
 			title: "桌面通知", needsYou: "执行者需要你时", description: "执行者需要你处理，或主对话暂停时，发送桌面通知。浏览器通知仅在此页面隐藏时显示。", enabledToast: "桌面通知已启用", blockedToast: "通知已被屏蔽。可在浏览器的站点设置中启用。", requestError: "无法请求通知权限。", unsupported: "此浏览器不支持桌面通知。", enabled: "通知已启用", blocked: "通知已屏蔽", enable: "启用通知", allowHint: "在浏览器设置中允许此站点发送通知，然后返回此页面。",

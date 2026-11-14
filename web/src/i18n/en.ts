@@ -41,9 +41,8 @@ export const en = {
 			restartDescription: "The main process will stop and resume its saved conversation. Any in-flight turn will be interrupted. Worker sessions are kept.",
 			startNewChat: "Start new chat",
 			restartMain: "Restart main",
-			more: "More",
-			settingsMenu: "Settings…",
-			newChatMenu: "New chat…",
+			newChat: "New chat",
+			newChatHint: "Retire this main session and start a fresh conversation",
 		},
 		now: {
 			title: "Now",
@@ -74,6 +73,7 @@ export const en = {
 			taskActions: (title: string) => `Actions for ${title}`,
 			finished: "Finished",
 			clear: "Clear",
+			allHistory: "All finished tasks and decisions",
 			dismissFinished: (title: string) => `Dismiss finished ${title}`,
 			stopTitle: (sessionId: string) => `Stop ${sessionId}?`,
 			stopDescription: "The worker will stop. Its task and saved conversation remain; open the task to resume it later.",
@@ -349,7 +349,7 @@ export const en = {
 			title: "Models", description: "Choose from omp’s model catalog.", spawnNote: "Model and thinking changes apply to the next spawn, not to running sessions.", catalogMeta: (count: number, formatted: string) => `${formatted} ${count === 1 ? "model" : "models"} · Updated`, saved: "Models saved.", mainChat: "Main chat", workersDefault: "Workers (default)", dispatcher: "Dispatcher", mainModel: "Main model", mainThinking: "Main thinking", workerModel: "Worker model", workerThinking: "Worker thinking", dispatcherModel: "Dispatcher model", save: "Save models",
 		},
 		settings: {
-			title: "General", description: "Configure worker capacity and local paths.", saved: "Settings saved.", saveError: "Could not save settings.", localPaths: "Local paths", ompBinary: "omp binary", ompHint: "Explicit omp executable. Leave empty to use managed omp or PATH.", managedPath: "Managed / PATH", pstackRoot: "pstack root", pstackHint: "Path to your pstack skills. Leave blank to disable pstack integration.", worktreeRoot: "Worktree root", worktreeHint: "Leave blank to use the default worktree location.", defaultLocation: "Default location", capacity: "Worker capacity and wake budget", maxWorkers: "Maximum live workers", maxWorkersHint: (min: string, max: string) => `Maximum worker processes kept live in the pool (${min}–${max}).`, idleEviction: "Idle eviction (minutes)", idleEvictionHint: (min: string, max: string) => `How long an idle worker remains live before eviction (${min}–${max} minutes).`, maxWakes: "Maximum automatic wakes", maxWakesHint: (min: string, max: string) => `Hub-triggered main wakes between human inputs (${min}–${max}); further notices wait for your approval.`, ports: "Port allocation", portsHint: (minimum: string, start: string, end: string) => `Inclusive range for worktree port reservations: at least ${minimum} ports, between ${start} and ${end}.`, firstPort: "First port", lastPort: "Last port", save: "Save settings",
+			title: "General", description: "Main chat, worker capacity and local paths.", mainChat: "Main chat", mainSession: (id: string) => `Session ${id}`, noMainSession: "Not started", wakes: (used: number, max: number) => `Automatic wakes used: ${used} of ${max}`, restartHint: "Stops the main process and resumes its saved conversation. Use it when main is stuck or after changing its model.", saved: "Settings saved.", saveError: "Could not save settings.", localPaths: "Local paths", ompBinary: "omp binary", ompHint: "Explicit omp executable. Leave empty to use managed omp or PATH.", managedPath: "Managed / PATH", pstackRoot: "pstack root", pstackHint: "Path to your pstack skills. Leave blank to disable pstack integration.", worktreeRoot: "Worktree root", worktreeHint: "Leave blank to use the default worktree location.", defaultLocation: "Default location", capacity: "Worker capacity and wake budget", maxWorkers: "Maximum live workers", maxWorkersHint: (min: string, max: string) => `Maximum worker processes kept live in the pool (${min}–${max}).`, idleEviction: "Idle eviction (minutes)", idleEvictionHint: (min: string, max: string) => `How long an idle worker remains live before eviction (${min}–${max} minutes).`, maxWakes: "Maximum automatic wakes", maxWakesHint: (min: string, max: string) => `Hub-triggered main wakes between human inputs (${min}–${max}); further notices wait for your approval.`, ports: "Port allocation", portsHint: (minimum: string, start: string, end: string) => `Inclusive range for worktree port reservations: at least ${minimum} ports, between ${start} and ${end}.`, firstPort: "First port", lastPort: "Last port", save: "Save settings",
 		},
 		notifications: {
 			title: "Desktop notifications", needsYou: "When a worker needs you", description: "Get a desktop notification when a worker needs you or main pauses. Browser notifications appear while this page is hidden.", enabledToast: "Desktop notifications enabled", blockedToast: "Notifications are blocked. You can enable them in your browser’s site settings.", requestError: "Could not request notification permission.", unsupported: "This browser does not support desktop notifications.", enabled: "Notifications enabled", blocked: "Notifications blocked", enable: "Enable notifications", allowHint: "Allow notifications for this site in your browser settings, then return to this page.",

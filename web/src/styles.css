@@ -251,8 +251,8 @@ table.grid.sessions-grid th { white-space: normal; }
 .sessions-grid .actions .btn { width: 100%; min-width: 0; padding-inline: 4px; }
 
 .more-menu { position: relative; }
-.more-trigger { width: 30px; height: 26px; border-radius: 6px; font-size: 1.230769rem; line-height: 1; color: var(--muted); }
-.more-trigger:hover, .more-trigger[aria-expanded="true"] { background: var(--panel-2); color: var(--fg); }
+.more-trigger, .settings-trigger { width: 30px; height: 26px; border-radius: 6px; font-size: 1.230769rem; line-height: 1; color: var(--muted); }
+.more-trigger:hover, .more-trigger[aria-expanded="true"], .settings-trigger:hover { background: var(--panel-2); color: var(--fg); }
 .more-popover { position: absolute; right: 0; top: calc(100% + 6px); width: 300px; z-index: 40; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 6px; box-shadow: 0 12px 32px var(--shadow); }
 .more-item { display: block; width: 100%; text-align: left; padding: 7px 9px; border: 0; border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
 .more-item:hover { background: var(--panel-hover); }

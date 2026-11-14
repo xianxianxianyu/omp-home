@@ -29,11 +29,40 @@ export function SettingsPanel() {
 	return (
 		<div className="stack">
 			<div className="panel-heading"><div><h2>{t.title}</h2><p className="muted">{t.description}</p></div></div>
+			<MainChatSettings />
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data && <SettingsForm settings={data} />}
 			<NotificationSettings />
 		</div>
+	);
+}
+
+function MainChatSettings() {
+	const catalog = useT();
+	const t = catalog.panels.settings;
+	const { state, mutate } = useHub();
+	const [confirming, setConfirming] = useState(false);
+	const [restarting, setRestarting] = useState(false);
+	if (!state) return null;
+	const main = state.main;
+
+	async function restart() {
+		setRestarting(true);
+		try { await mutate("/api/main/restart"); setConfirming(false); }
+		finally { setRestarting(false); }
+	}
+
+	return (
+		<Section title={t.mainChat}>
+			<div className="card main-chat-settings">
+				<div className="row wrap"><h3 className="grow">{main.sessionId ? t.mainSession(main.sessionId) : t.noMainSession}</h3><Status value={main.paused ? "paused" : main.state} /></div>
+				<p className="muted">{t.wakes(main.wakesUsed, main.wakesMax)}</p>
+				{confirming
+					? <div className="inline-confirm" role="group" aria-label={catalog.shell.app.restartTitle}><p>{catalog.shell.app.restartDescription}</p><div className="row"><Button className="danger" disabled={restarting} onClick={() => { void restart(); }}>{catalog.shell.app.restartMain}</Button><Button disabled={restarting} onClick={() => setConfirming(false)}>{catalog.common.keepAsIs}</Button></div></div>
+					: <><p className="hint">{t.restartHint}</p><Button disabled={!main.sessionId} onClick={() => setConfirming(true)}>{catalog.shell.app.restartMain}</Button></>}
+			</div>
+		</Section>
 	);
 }
 

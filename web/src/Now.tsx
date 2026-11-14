@@ -75,7 +75,7 @@ function AttentionCards({ items }: { items: Attention[] }) {
 export function Now({ model }: { model: NowModel }) {
 	const t = useT().shell;
 	const { format } = useI18n();
-	const { openTask, mutate } = useHub();
+	const { openTask, openHistory, mutate } = useHub();
 	const [stop, setStop] = useState<TaskSummary | null>(null);
 	const now = useNow();
 	return <div className="now-view" aria-label={t.now.title}>
@@ -92,6 +92,7 @@ export function Now({ model }: { model: NowModel }) {
 		})}</div></section>}
 		{model.finished.length > 0 && <section className="now-section finished-section" aria-label={t.now.finished}><h2>{t.now.finished} <button className="text-button" onClick={() => model.dismissFinished(model.finished.map(task => task.id))}>{t.now.clear}</button></h2>{model.finished.map(task => <div className="finished-row" key={task.id}><button className="finished-task" onClick={() => openTask(task.id)}><span className={task.status === "done" ? "finished-check" : "muted"}>{task.status === "done" ? "✓" : "−"}</span><span>{task.title}</span><RelativeTime at={task.endedAt} /></button><button className="icon-button" aria-label={t.now.dismissFinished(task.title)} onClick={() => model.dismissFinished([task.id])}>×</button></div>)}</section>}
 		{model.empty && <p className="nothing-in-flight">{t.nothingInFlight}</p>}
+		<button type="button" className="history-link" onClick={openHistory}><span>{t.history}</span><span className="muted">{t.now.allHistory}</span><span aria-hidden="true">→</span></button>
 		{stop && <Confirm title={t.now.stopTitle(stop.sessionId!)} description={t.now.stopDescription} confirmLabel={t.stopWorker} danger onClose={() => setStop(null)} onConfirm={() => mutate(`/api/sessions/${encodeURIComponent(stop.sessionId!)}/evict`)} />}
 	</div>;
 }

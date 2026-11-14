@@ -22,10 +22,10 @@ export function App() {
 }
 function Workspace() {
 	const t = useT().shell;
-	const { state, connected, views, popView, openSettings, settingsSection, mutate } = useHub();
+	const { state, connected, views, popView, openSettings, openHistory, settingsSection, mutate } = useHub();
 	const now = useNowModel();
 	const [left, setLeft] = useState(() => { const stored = Number(localStorage.getItem("omp-home-split")); return stored >= 25 && stored <= 75 ? stored : 52; });
-	const [confirm, setConfirm] = useState<"restart" | "new" | null>(null);
+	const [confirmNewChat, setConfirmNewChat] = useState(false);
 	const search = useRef<HTMLInputElement>(null);
 	const split = useRef<HTMLDivElement>(null);
 	const active = views.at(-1);
@@ -52,26 +52,13 @@ function Workspace() {
 	if (!state) return null;
 	const setSplit = (value: number) => { const next = Math.max(25, Math.min(75, value)); setLeft(next); localStorage.setItem("omp-home-split", String(next)); };
 	return <div className="app">
-		<header className="topbar" data-tauri-drag-region><div className="brand" data-tauri-drag-region><span className="dot" />omp-home</div>{!connected && <span className="pill err">{t.app.disconnected}</span>}<div className="spacer" data-tauri-drag-region /><Search inputRef={search} /><MoreMenu onRestart={() => setConfirm("restart")} onNewChat={() => setConfirm("new")} /></header>
+		<header className="topbar" data-tauri-drag-region><div className="brand" data-tauri-drag-region><span className="dot" />omp-home</div>{!connected && <span className="pill err">{t.app.disconnected}</span>}<div className="spacer" data-tauri-drag-region /><Search inputRef={search} /><button type="button" className="icon-button settings-trigger" aria-label={t.settings} title={`${t.settings} (⌘,)`} onClick={() => openSettings()}>⚙</button></header>
 		<div className={`split ${collapsed ? "right-collapsed" : ""}`} ref={split} style={{ "--left": `${left}%` } as CSSProperties}>
-			<section className="pane main-pane" aria-label={t.app.mainConversation}>{collapsed && <p className="nothing-in-flight">{t.nothingInFlight}</p>}<div className="pane-body">{state.main.sessionId && state.main.state !== "cold" ? <div className="session-wrap"><SessionView key={state.main.sessionId} sessionId={state.main.sessionId} focused main /></div> : <div className="start-main"><Empty title={t.app.mainStartsHere}><p>{t.app.mainIntro}<br />{t.app.mainJudgment}</p><Button className="primary" onClick={() => mutate("/api/main/restart")}>{t.app.startMain}</Button></Empty></div>}</div></section>
+			<section className="pane main-pane" aria-label={t.app.mainConversation}>{collapsed && <p className="nothing-in-flight">{t.nothingInFlight}<button type="button" className="link-button" onClick={openHistory}>{t.history}</button></p>}<div className="pane-body">{state.main.sessionId && state.main.state !== "cold" ? <div className="session-wrap"><SessionView key={state.main.sessionId} sessionId={state.main.sessionId} focused main onNewChat={() => setConfirmNewChat(true)} /></div> : <div className="start-main"><Empty title={t.app.mainStartsHere}><p>{t.app.mainIntro}<br />{t.app.mainJudgment}</p><Button className="primary" onClick={() => mutate("/api/main/restart")}>{t.app.startMain}</Button></Empty></div>}</div></section>
 			{!collapsed && <><div className="gutter" role="separator" aria-label={t.app.resizePanes} aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(left)} tabIndex={0} onKeyDown={event => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplit(left + (event.key === "ArrowLeft" ? -2 : 2)); } }} onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={event => { if (!event.currentTarget.hasPointerCapture(event.pointerId)) return; const bounds = split.current?.getBoundingClientRect(); if (bounds) setSplit((event.clientX - bounds.left) / bounds.width * 100); }} onPointerUp={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }} />
 				<section className="pane workspace-pane" aria-label={t.app.currentWork}>{active?.kind === "task" ? <TaskView key={active.id} id={active.id} /> : active?.kind === "history" ? <History /> : <Now model={now} />}</section></>}
 		</div>
-		{confirm && <Confirm title={confirm === "new" ? t.app.newChatTitle : t.app.restartTitle} description={confirm === "new" ? t.app.newChatDescription : t.app.restartDescription} confirmLabel={confirm === "new" ? t.app.startNewChat : t.app.restartMain} danger onClose={() => setConfirm(null)} onConfirm={() => mutate(`/api/main/${confirm}`)} />}
+		{confirmNewChat && <Confirm title={t.app.newChatTitle} description={t.app.newChatDescription} confirmLabel={t.app.startNewChat} danger onClose={() => setConfirmNewChat(false)} onConfirm={() => mutate("/api/main/new")} />}
 		{settingsSection && <SettingsSheet />}
 	</div>;
-}
-function MoreMenu({ onRestart, onNewChat }: { onRestart: () => void; onNewChat: () => void }) {
-	const t = useT().shell;
-	const { openHistory, openSettings } = useHub();
-	const [open, setOpen] = useState(false);
-	const root = useRef<HTMLDivElement>(null);
-	useEffect(() => {
-		if (!open) return;
-		const close = (event: MouseEvent | KeyboardEvent) => { if (event instanceof KeyboardEvent ? event.key === "Escape" : !root.current?.contains(event.target as Node)) setOpen(false); };
-		document.addEventListener("mousedown", close); document.addEventListener("keydown", close);
-		return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close); };
-	}, [open]);
-	return <div className="more-menu" ref={root}><button className="icon-button more-trigger" aria-label={t.app.more} aria-expanded={open} onClick={() => setOpen(value => !value)}>⋯</button>{open && <div className="more-popover" role="menu" data-menu><button role="menuitem" className="more-item" onClick={() => { setOpen(false); openHistory(); }}>{t.history}</button><button role="menuitem" className="more-item" onClick={() => { setOpen(false); openSettings(); }}>{t.app.settingsMenu} <kbd>⌘,</kbd></button><hr /><button role="menuitem" className="more-item" onClick={() => { setOpen(false); onRestart(); }}>{t.app.restartMain}</button><button role="menuitem" className="more-item danger" onClick={() => { setOpen(false); onNewChat(); }}>{t.app.newChatMenu}</button></div>}</div>;
 }

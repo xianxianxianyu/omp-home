@@ -60,8 +60,10 @@ function useSession(sessionId: string) {
 	return { view, connected, error: error?.kind === "commands" ? t.commandsError(error.message) : error?.kind === "invalidEvent" ? t.invalidEvent : error?.kind === "capacity" ? error.reason || t.noWorkerSlot : null, commands, generation, history, setHistory, blocked, retry: () => setRetryToken(value => value + 1) };
 }
 
-function Composer({ sessionId, connected, running, commands, focused, main, abort, meta, escapeAborts }: { sessionId: string; connected: boolean; running: boolean; commands: CommandDTO[]; focused: boolean; main: boolean; abort: () => Promise<void>; meta: string; escapeAborts: boolean }) {
-	const t = useT().session.composer;
+function Composer({ sessionId, connected, running, commands, focused, main, abort, meta, escapeAborts, onNewChat }: { sessionId: string; connected: boolean; running: boolean; commands: CommandDTO[]; focused: boolean; main: boolean; abort: () => Promise<void>; meta: string; escapeAborts: boolean; onNewChat?: () => void }) {
+	const catalog = useT();
+	const t = catalog.session.composer;
+	const shell = catalog.shell.app;
 	const { noteComposerInput } = useHub();
 	const [text, setText] = useState("");
 	const [mode, setMode] = useState<"auto" | "steer">("auto");
@@ -102,7 +104,7 @@ function Composer({ sessionId, connected, running, commands, focused, main, abor
 			if (menuOpen && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) { if (performance.now() - compositionEnded.current < 80) return; event.preventDefault(); chooseCommand(matches[selected] ?? matches[0]); return; }
 			if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (performance.now() - compositionEnded.current >= 80) void send(); }
 		}} />
-		<div className="composer-actions"><span className="composer-meta mono" title={t.keyboardHint}>{meta}</span><span className="spacer" />{running && <button className={`btn small ${mode === "steer" ? "steer-active" : ""}`} aria-pressed={mode === "steer"} title={t.modeHint} onClick={() => setMode(value => value === "auto" ? "steer" : "auto")}>{mode === "steer" ? t.steer : t.followUp}</button>}<button className="btn primary small" disabled={!connected || pending || !text.trim()} onClick={() => void send()}>{pending ? t.sending : t.send}</button></div>
+		<div className="composer-actions"><span className="composer-meta mono" title={t.keyboardHint}>{meta}</span>{onNewChat && <button type="button" className="link-button composer-new-chat" title={shell.newChatHint} onClick={onNewChat}>{shell.newChat}</button>}<span className="spacer" />{running && <button className={`btn small ${mode === "steer" ? "steer-active" : ""}`} aria-pressed={mode === "steer"} title={t.modeHint} onClick={() => setMode(value => value === "auto" ? "steer" : "auto")}>{mode === "steer" ? t.steer : t.followUp}</button>}<button className="btn primary small" disabled={!connected || pending || !text.trim()} onClick={() => void send()}>{pending ? t.sending : t.send}</button></div>
 		{error && <div className="error-text" role="alert">{error}</div>}
 	</div>;
 }
@@ -129,7 +131,7 @@ function SubagentPanel({ agents, selected, select, close, sessionId, connected }
 	return <aside className="subagent-drawer" aria-label={t.title}><header><h3>{t.title} <span className="muted">{format.number(Object.keys(agents).length)}</span></h3><button className="icon-button" aria-label={t.close} onClick={close}>×</button></header><div className="subagent-list">{Object.values(agents).map(sub => <button className={`subagent-row ${selected === sub.id ? "selected" : ""}`} key={sub.id} onClick={() => select(sub.id)}><span className={`status-dot ${sub.status}`} /><span className="grow"><strong>{sub.agent}</strong><small>{sub.task || sub.id}</small><small className="muted">{sub.lastIntent ?? t.status[sub.status]}</small></span><span className="agent-duration">{format.duration(Math.max(0, (sub.endedAt ?? now) - sub.startedAt))}<span>{t.status[sub.status]}</span></span></button>)}</div>{agent ? <><div className="nested-transcript" aria-label={t.transcript(agent.agent)}>{agent.transcript.items.length > nestedLimit && <button className="text-button" onClick={() => setNestedLimit(value => value + PAGE_SIZE)}>{t.showEarlier}</button>}{agent.transcript.items.slice(-nestedLimit).map(item => <TranscriptItem key={item.id} item={item} view={agent.transcript} openAgent={select} />)}{!agent.transcript.items.length && <p className="empty">{t.waiting}</p>}</div><form className="subagent-controls" onSubmit={event => { event.preventDefault(); void action("steer"); }}><textarea aria-label={t.steerLabel(agent.agent)} rows={2} placeholder={t.placeholder} value={text} disabled={agent.status !== "running" || pending || !connected} onChange={event => { setText(event.target.value); noteComposerInput(); }} /><div className="row"><button className="btn small danger" type="button" disabled={agent.status !== "running" || pending || !connected} onClick={() => void action("cancel")}>{t.cancel}</button><span className="spacer" /><button className="btn small primary" disabled={agent.status !== "running" || pending || !connected || !text.trim()}>{t.steer}</button></div>{error && <p className="error-text" role="alert">{error}</p>}</form></> : <p className="empty">{t.select}</p>}</aside>;
 }
 
-export function SessionView({ sessionId, focused, main = false, escapeAborts = main }: { sessionId: string; focused: boolean; main?: boolean; escapeAborts?: boolean }) {
+export function SessionView({ sessionId, focused, main = false, escapeAborts = main, onNewChat }: { sessionId: string; focused: boolean; main?: boolean; escapeAborts?: boolean; onNewChat?: () => void }) {
 	const t = useT().session;
 	const { format } = useI18n();
 	const { view, connected, error, commands, generation, history, setHistory, blocked, retry } = useSession(sessionId);
@@ -192,7 +194,7 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 		{!following && <button className="jump-latest" onClick={jump}>{t.jumpLatest}</button>}
 		<div className="session-bottom">{actionError && <div className="session-error" role="alert">{actionError}</div>}{(view.status.queue.steering.length > 0 || view.status.queue.followUp.length > 0) && <div className="queue-chips">{(["steering", "followUp"] as const).flatMap(kind => view.status.queue[kind].map((text, index) => <span key={`${kind}-${index}`} title={text} className={`queue-chip ${kind}`}>{kind === "steering" ? t.steer : t.queued} · {text}</span>))}</div>}
 			{Object.entries(view.status.statusLine).map(([key, line]) => <div className="extension-status" key={key}>{line}</div>)}{Object.entries(view.status.widgets).map(([key, lines]) => <details className="extension-widget" key={key}><summary>{key}</summary><pre>{lines.join("\n")}</pre></details>)}
-			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} abort={abort} escapeAborts={escapeAborts} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
+			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} abort={abort} escapeAborts={escapeAborts} onNewChat={onNewChat} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
 		</div>{drawer && <SubagentPanel agents={view.subagents} selected={selectedAgent} select={setSelectedAgent} close={() => setDrawer(false)} sessionId={sessionId} connected={connected} />}
 	</section>;
 }

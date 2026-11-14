@@ -1,6 +1,6 @@
 [package]
 name = "omp-home"
-version = "0.1.3"
+version = "0.1.4"
 description = "A native home for omp"
 authors = ["omp-home contributors"]
 edition = "2021"
