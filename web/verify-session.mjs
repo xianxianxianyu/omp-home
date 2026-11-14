@@ -28,7 +28,7 @@ export async function verifySession(page, outputDirectory) {
 	await page.click(`${main} input[type="checkbox"]`);
 	await page.click(`${main} .request-card:not(.answered) form > button`);
 	await page.waitForFunction(() => document.querySelectorAll('.main-pane .request-card.answered').length === 2);
-	await page.click(`${main} .session-toolbar button[aria-expanded]`);
+	await page.click(`${main} .session-activity button[aria-expanded]`);
 	await page.waitForSelector(`${main} .nested-transcript code`);
 	assert.match(await page.$eval(`${main} .nested-transcript`, element => element.textContent), /index\.update/);
 	await screenshot("04-subagent-transcript");
@@ -90,7 +90,7 @@ export async function verifySession(page, outputDirectory) {
 	await page.$eval('.workspace-pane .transcript-scroll', element => { element.scrollTop = 0; });
 	await screenshot("08-worker-session");
 	await page.focus(composer); await page.keyboard.press("Escape");
-	await page.waitForFunction(() => document.querySelector('.main-pane .session-toolbar')?.textContent.includes("Ready"));
+	await page.waitForFunction(() => !document.querySelector('.main-pane .activity-state'));
 	assert.deepEqual(errors, []);
 	const result = { passed: true, screenshots: 8, checks: ["collapsed thinking/tools", "expanded tool output", "select answered", "ask multi-question answered", "nested transcript", "subagent steer/cancel", "history paging", "edit diff", "confirm/input/editor answered", "fuzzy commands", "CDP Chinese IME does not send before explicit Send", "worker session", "Escape abort"], ime, errors };
 	await writeFile(join(outputDirectory, "result.json"), JSON.stringify(result, null, 2));

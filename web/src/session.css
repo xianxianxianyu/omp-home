@@ -1,7 +1,9 @@
 .session-wrap { position: absolute; inset: 0; background: #0f1115; }
 .session-view { height: 100%; display: flex; flex-direction: column; position: relative; min-width: 0; overflow: hidden; background: #0f1115; }
 .session-view .spacer { flex: 1; }
-.session-toolbar { display: flex; align-items: center; gap: 8px; padding: 9px 16px; min-height: 44px; border-bottom: 1px solid #20242d; font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.session-activity { position: absolute; top: 10px; right: 14px; z-index: 5; display: flex; align-items: center; gap: 6px; padding: 4px 4px 4px 10px; border: 1px solid var(--line-2); border-radius: 999px; background: rgba(18,21,27,.92); backdrop-filter: blur(6px); font-size: 11px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+.session-activity .btn { border-radius: 999px; }
+.activity-state { display: inline-flex; align-items: center; gap: 7px; padding-right: 4px; }
 .phase-indicator { width: 7px; height: 7px; background: var(--ok); border-radius: 50%; }
 .phase-indicator.spinning { width: 11px; height: 11px; border: 1px solid #304355; border-top-color: var(--accent-2); background: transparent; animation: session-spin 1s linear infinite; }
 @keyframes session-spin { to { transform: rotate(360deg); } }
@@ -87,15 +89,13 @@
 .ask-option small { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
 .recommended { color: var(--ok); font-size: 10px; margin-left: 7px; }
 .session-bottom { flex-shrink: 0; background: #11151b; border-top: 1px solid var(--line); }
-.session-status { display: flex; align-items: center; gap: 9px; padding: 0 16px 9px; font-size: 10px; color: var(--dim); }
-.session-status .status-dot { width: 5px; height: 5px; }
 .session-model { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); max-width: 65%; }
 .composer { margin: 10px 12px; padding: 10px 12px 8px; border: 1px solid #353b46; border-radius: 10px; background: #191e26; position: relative; }
 .composer:focus-within { border-color: #60718a; box-shadow: 0 0 0 2px #25314455; }
 .composer > textarea { display: block; width: 100%; min-height: 45px; max-height: 180px; resize: vertical; padding: 0; border: 0; outline: none; background: transparent; font-size: 13px; line-height: 1.6; }
 .composer > textarea::placeholder { color: #646e7e; }
 .composer-actions { display: flex; align-items: center; gap: 7px; padding-top: 8px; }
-.composer-hint { font-size: 10px; color: var(--dim); }
+.composer-meta { font-size: 10px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .steer-active { border-color: #40618a !important; color: var(--accent-2) !important; }
 .queue-chips { display: flex; gap: 6px; padding: 9px 14px 0; overflow: auto; }
 .queue-chip { flex-shrink: 0; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #9aa8ba; font-size: 10px; border: 1px solid #2c3747; background: #1a222e; border-radius: 4px; padding: 3px 7px; }
@@ -131,5 +131,5 @@
 .nested-transcript { flex: 1; min-height: 0; overflow: auto; padding: 18px; font-size: 12px; }
 .subagent-controls { padding: 12px; border-top: 1px solid var(--line); }
 .subagent-controls textarea { display: block; width: 100%; border: 1px solid #354152; background: #1a212b; border-radius: 6px; padding: 9px; resize: vertical; max-height: 140px; font-size: 12px; margin-bottom: 9px; }
-@media (max-width: 1000px) { .transcript-content { padding: 18px 16px 24px; } .composer-hint { display: none; } .session-toolbar { padding-left: 12px; } }
+@media (max-width: 1000px) { .transcript-content { padding: 18px 16px 24px; } }
 @media (prefers-reduced-motion: reduce) { .spinning, .streaming-dot, .tool-dot.running { animation: none; } }

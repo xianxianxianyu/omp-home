@@ -3,25 +3,60 @@
   "productName": "omp-home",
   "version": "../../package.json",
   "identifier": "dev.moyu.omp-home",
-  "build": { "frontendDist": "../loading" },
+  "build": {
+    "frontendDist": "../loading"
+  },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "label": "main", "title": "omp-home", "width": 1320, "height": 880, "minWidth": 900, "minHeight": 600 }],
-    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'" }
+    "windows": [
+      {
+        "label": "main",
+        "title": "omp-home",
+        "width": 1320,
+        "height": 880,
+        "minWidth": 900,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 20
+        }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'"
+    }
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
-    "icon": ["icons/icon.png", "icons/icon.icns"],
-    "externalBin": ["binaries/node"],
-    "resources": { "resources/hub/": "hub/" },
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns"
+    ],
+    "externalBin": [
+      "binaries/node"
+    ],
+    "resources": {
+      "resources/hub/": "hub/"
+    },
     "createUpdaterArtifacts": true,
-    "macOS": { "minimumSystemVersion": "13.5", "signingIdentity": "-", "entitlements": "Entitlements.plist" }
+    "macOS": {
+      "minimumSystemVersion": "13.5",
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    }
   },
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNGNEYwMTY3RkZEOEUxQUUKUldTdTRkai9ad0ZQUDhGQVE3MmlacU4wSnhnSGs0YXpOMXNNRjI1NVdEKzRDOHo1ellEbVdES2MK",
-      "endpoints": ["https://github.com/xianxianxianyu/omp-home/releases/latest/download/latest.json"]
+      "endpoints": [
+        "https://github.com/xianxianxianyu/omp-home/releases/latest/download/latest.json"
+      ]
     }
   }
 }

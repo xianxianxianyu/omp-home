@@ -26,8 +26,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 a { color: var(--accent-2); }
 code, .mono { font-family: var(--mono); font-size: 12px; }
 
-.app { display: grid; grid-template-rows: 44px 1fr; height: 100%; }
-.topbar { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.app { display: grid; grid-template-rows: 40px 1fr; height: 100%; }
+.topbar { display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--panel); -webkit-user-select: none; user-select: none; }
+/* In the macOS app the title bar overlays the page: leave room for the traffic lights. */
+.native-chrome .topbar { padding-left: 84px; }
 .brand { font-weight: 650; letter-spacing: .2px; display: flex; align-items: center; gap: 8px; }
 .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
 .topbar .spacer { flex: 1; }
@@ -42,9 +44,6 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 .gutter { cursor: col-resize; background: var(--line); }
 .gutter:hover { background: var(--line-2); }
 .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
-.pane-head { display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 12px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
-.pane-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
-.pane-head .spacer { flex: 1; }
 .pane-body { flex: 1; min-height: 0; position: relative; }
 
 
@@ -134,17 +133,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
 ::-webkit-scrollbar-thumb { border-radius: 5px; background: var(--line-2); }
 ::-webkit-scrollbar-track { background: transparent; }
 .brand { flex-shrink: 0; }
-.home-path { max-width: 205px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.main-status, .pool-meter { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
-.main-status .hint { white-space: nowrap; }
-.pool-meter { color: var(--muted); font-size: 12px; }
-.pool-meter strong { color: var(--fg); font-weight: 500; }
-.inbox-shortcut { display: flex; align-items: center; gap: 7px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
-.inbox-shortcut span { background: var(--line); border-radius: 5px; padding: 1px 6px; font-size: 11px; }
-.inbox-shortcut.has-unread span { color: var(--accent); background: #342c1f; }
 .model-label { font-size: 10px; max-width: 200px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.pane-head { height: 42px; }
-.pane-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; padding: 4px 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 10px; }
 .connection-indicator { display: inline-flex; align-items: center; gap: 6px; }
 .connection-indicator .status-dot { width: 5px; height: 5px; }
 .gutter { touch-action: none; transition: background .15s; }
@@ -265,13 +254,11 @@ kbd { position: absolute; right: 7px; top: 6px; font: 10px var(--sans); color: v
 .change .pill { min-width: 67px; justify-content: center; }
 .change code { color: var(--fg); }
 @media (max-width: 1200px) {
-	.home-path { display: none; }
-	.topbar { gap: 9px; }
+		.topbar { gap: 9px; }
 	.scroll { padding: 16px; }
 	.model-label { max-width: 120px; }
 }
 @media (max-width: 850px) {
-	.main-status .hint, .pool-meter, .model-label { display: none; }
 	.app { grid-template-rows: auto 1fr; }
 	.topbar { min-height: 48px; flex-wrap: wrap; padding: 8px 10px; gap: 8px; }
 	.global-search { width: auto; flex: 1; min-width: 130px; }
@@ -284,7 +271,7 @@ kbd { position: absolute; right: 7px; top: 6px; font: 10px var(--sans); color: v
 	.setup { padding: 22px; margin-top: 4vh; }
 }
 @media (max-width: 480px) {
-	.main-status, .topbar > .pill { display: none; }
+	.topbar > .pill { display: none; }
 	.two-col { grid-template-columns: 1fr; }
 	.panel-heading { flex-wrap: wrap; }
 	.kv { grid-template-columns: 90px minmax(0, 1fr); }
@@ -308,3 +295,16 @@ table.grid.sessions-grid th { white-space: normal; }
 .sessions-grid td { overflow-wrap: anywhere; }
 .sessions-grid .actions { flex-direction: column; align-items: stretch; min-width: 0; }
 .sessions-grid .actions .btn { width: 100%; min-width: 0; padding-inline: 4px; }
+
+.tab .count { min-width: 16px; padding: 0 5px; border-radius: 8px; background: var(--line-2); color: var(--muted); font-size: 10px; text-align: center; }
+.more-menu { position: relative; }
+.more-trigger { width: 30px; height: 26px; border-radius: 6px; font-size: 16px; line-height: 1; color: var(--muted); }
+.more-trigger:hover, .more-trigger[aria-expanded="true"] { background: var(--panel-2); color: var(--fg); }
+.more-popover { position: absolute; right: 0; top: calc(100% + 6px); width: 300px; z-index: 40; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 6px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
+.more-section { padding: 8px 8px 10px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.more-section .kv { grid-template-columns: 96px 1fr; }
+.more-home { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; }
+.more-home .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.more-item { display: block; width: 100%; text-align: left; padding: 7px 9px; border: 0; border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
+.more-item:hover { background: #1f252e; }
+.more-item.danger { color: var(--err); }
