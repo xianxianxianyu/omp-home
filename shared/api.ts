@@ -11,7 +11,7 @@
  *   PUT  /api/settings        SettingsPatch → SettingsDTO
  *   POST /api/setup           SetupRequest  → StateDTO           (first run; idempotent)
  *   GET  /api/setup/preview   ?home=<path>  → SetupPreview
- *   GET  /api/tasks           ?status&workspace&q → TaskSummary[]
+ *   GET  /api/tasks           ?status&workspace&q → TaskSummary[]  (status=open: pending|working|awaiting; status=closed: done|cancelled)
  *   GET  /api/tasks/:id                     → TaskDetail
  *   POST /api/tasks/:id/cancel  {reason}    → TaskDetail
  *   POST /api/tasks/:id/cleanup             → TaskDetail         (human only: env teardown, worktree removal, branch kept)
@@ -77,6 +77,20 @@ export interface TaskSummary {
 	playbook: string | null;
 	createdAt: number;
 	updatedAt: number;
+	endedAt: number | null;
+	/** Live progress of the task's worker, for the in-flight list. Null once the task is closed. */
+	progress: TaskProgress | null;
+}
+
+export interface TaskProgress {
+	/** queued: waiting for a pool slot; cold: worker stopped (resumes on demand). */
+	phase: "provisioning" | "queued" | "starting" | "running" | "idle" | "approval" | "cold";
+	/** Intent of the tool call the worker is running now, else of its most recent one. */
+	intent: string | null;
+	/** One-line rendering of the latest task event. */
+	lastEvent: string | null;
+	/** When the current phase began (ms). */
+	since: number;
 }
 
 export interface TaskEventDTO {

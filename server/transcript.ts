@@ -127,6 +127,18 @@ function noticeItem(id: string, message: Rec, at: number): Item | null {
 	return { kind: "notice", id, at: at_, source: "custom", from: type || null, text: textOf(message.content) };
 }
 
+/** What the session is doing: the intent of its running tool call, else of its most recent one. */
+export function currentIntent(view: TranscriptView): string | null {
+	let best: ToolView | null = null;
+	for (const tool of Object.values(view.tools)) {
+		if (!tool.intent) continue;
+		const running = tool.status === "running";
+		const bestRunning = best?.status === "running";
+		if (!best || (running && !bestRunning) || (running === bestRunning && tool.startedAt >= best.startedAt)) best = tool;
+	}
+	return best?.intent ?? null;
+}
+
 /** A dialog the human can answer, or null for fire-and-forget methods. */
 export function uiRequestOf(f: Rec): UiRequest | null {
 	const title = str(f.title) ?? "";

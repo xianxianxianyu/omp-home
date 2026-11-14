@@ -1,0 +1,94 @@
+import { useEffect, useMemo, useState } from "react";
+import { z } from "zod";
+import type { EscalationDTO, InboxDTO, TaskProgress, TaskSummary } from "../../shared/api.ts";
+import { useHub, useResource } from "./hub.tsx";
+import { Button, Confirm, ErrorState, Loading, RelativeTime, useNow } from "./ui.tsx";
+import "./now.css";
+
+type Attention =
+	| { kind: "escalation"; id: string; at: number; escalation: EscalationDTO }
+	| { kind: "provision"; id: string; at: number; task: TaskSummary }
+	| { kind: "paused"; id: string; at: number }
+	| { kind: "warning"; id: string; at: number; text: string };
+export interface NowModel {
+	attention: Attention[];
+	inFlight: TaskSummary[];
+	finished: TaskSummary[];
+	empty: boolean;
+	loading: boolean;
+	errors: { error: Error; retry: () => void }[];
+	dismissFinished: (ids: string[]) => void;
+}
+const FINISHED_KEY = "omp-home-dismissed-finished";
+const phaseLabels: Record<TaskProgress["phase"], string> = { provisioning: "Preparing environment", queued: "Queued for a worker", starting: "Starting", running: "Working", idle: "Idle", approval: "Waiting for approval", cold: "Stopped" };
+
+export function useNowModel(): NowModel {
+	const { state } = useHub();
+	const inbox = useResource<InboxDTO>("inbox", "/api/inbox");
+	const tasks = useResource<TaskSummary[]>("tasks", "/api/tasks?status=open");
+	const closed = useResource<TaskSummary[]>("tasks", "/api/tasks?status=closed");
+	const now = useNow();
+	const [dismissed, setDismissed] = useState<string[]>(() => {
+		try { return z.array(z.string()).parse(JSON.parse(localStorage.getItem(FINISHED_KEY) ?? "[]")); }
+		catch { return []; }
+	});
+	const attention = useMemo<Attention[]>(() => [
+		...(inbox.data?.escalations.filter(item => item.resolvedAt === null).map(escalation => ({ kind: "escalation" as const, id: escalation.id, at: escalation.openedAt, escalation })) ?? []),
+		...(tasks.data?.filter(task => task.wait?.kind === "provision_failed").map(task => ({ kind: "provision" as const, id: `provision:${task.id}`, at: task.updatedAt, task })) ?? []),
+		...(state?.main.paused ? [{ kind: "paused" as const, id: "main-paused", at: Date.now() }] : []),
+		...(state?.omp.warning ? [{ kind: "warning" as const, id: "omp-warning", at: Date.now(), text: state.omp.warning }] : []),
+	].sort((a, b) => b.at - a.at), [inbox.data, tasks.data, state?.main.paused, state?.omp.warning]);
+	const finished = (closed.data ?? []).filter(task => task.endedAt !== null && task.endedAt >= now - 86400000 && !dismissed.includes(task.id)).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
+	const errors = [inbox, tasks, closed].flatMap(resource => resource.error ? [{ error: resource.error, retry: resource.reload }] : []);
+	const loading = [inbox, tasks, closed].some(resource => !resource.data && resource.loading);
+	// A task that needs the human is shown once, as its attention card.
+	const needsHuman = new Set(attention.flatMap(item => item.kind === "escalation" ? [item.escalation.taskId] : item.kind === "provision" ? [item.task.id] : []));
+	const inFlight = (tasks.data ?? []).filter(task => !needsHuman.has(task.id));
+	return {
+		attention, inFlight, finished, loading, errors,
+		empty: !loading && !errors.length && !attention.length && !inFlight.length && !finished.length,
+		dismissFinished: ids => setDismissed(current => { const next = [...new Set([...current, ...ids])]; localStorage.setItem(FINISHED_KEY, JSON.stringify(next)); return next; }),
+	};
+}
+
+function AttentionCards({ items }: { items: Attention[] }) {
+	const { openTask, openSettings, mutate } = useHub();
+	const [visible, setVisible] = useState(items);
+	const [dismiss, setDismiss] = useState<EscalationDTO | null>(null);
+	const activeIds = new Set(items.map(item => item.id));
+	useEffect(() => {
+		setVisible(previous => [...items, ...previous.filter(item => !items.some(active => active.id === item.id))]);
+		const timer = window.setTimeout(() => setVisible(items), 180);
+		return () => clearTimeout(timer);
+	}, [items]);
+	if (!visible.length) return null;
+	return <section className="now-section attention-section" aria-label="Attention"><h2>Needs your attention <span>{items.length}</span></h2>{visible.map(item => <article className={`attention-item ${activeIds.has(item.id) ? "" : "leaving"}`} key={item.id} data-attention={item.id} data-task={item.kind === "escalation" ? item.escalation.taskId : item.kind === "provision" ? item.task.id : undefined}>
+		{item.kind === "escalation" ? <><div className="attention-meta">{item.escalation.taskId} · {item.escalation.sessionId}<RelativeTime at={item.at} /></div><h3>{item.escalation.taskTitle}</h3><p>{item.escalation.reason}</p><div className="row"><Button className="small primary" onClick={async () => { openTask(item.escalation.taskId); await mutate(`/api/escalations/${encodeURIComponent(item.escalation.id)}/seen`); }}>Open</Button><Button className="small" onClick={() => setDismiss(item.escalation)}>Dismiss</Button></div></>
+		: item.kind === "provision" ? <><div className="attention-meta">Environment needs help<RelativeTime at={item.at} /></div><h3>{item.task.title}</h3><p>{item.task.wait?.text}</p><Button className="small" onClick={() => openTask(item.task.id)}>Open</Button></>
+		: item.kind === "paused" ? <><h3>Main is waiting for your go-ahead</h3><p>Worker updates are ready. The automatic wake budget is used.</p><Button className="small primary" onClick={() => mutate("/api/main/continue")}>Let main continue</Button></>
+		: <><h3>omp needs attention</h3><p>{item.text}</p><Button className="small" onClick={() => openSettings("About")}>Open Settings</Button></>}
+	</article>)}{dismiss && <Confirm title="Dismiss this request?" description="This removes the attention card without replying to the worker. The task remains in flight." confirmLabel="Dismiss" onClose={() => setDismiss(null)} onConfirm={() => mutate(`/api/escalations/${encodeURIComponent(dismiss.id)}/dismiss`)} />}</section>;
+}
+
+export function Now({ model }: { model: NowModel }) {
+	const { openTask, mutate } = useHub();
+	const [stop, setStop] = useState<TaskSummary | null>(null);
+	const now = useNow();
+	return <div className="now-view" aria-label="Now">
+		<header className="now-heading"><h1>Now</h1><span>Only what needs to stay in view.</span></header>
+		{model.errors.map(({ error, retry }, index) => <ErrorState key={index} error={error} retry={retry} />)}
+		{model.loading && <Loading />}
+		<AttentionCards items={model.attention} />
+		{model.inFlight.length > 0 && <section className="now-section" aria-label="In flight"><h2>In flight <span>{model.inFlight.length}</span></h2><div className="in-flight-list">{model.inFlight.map(task => {
+			const seconds = Math.max(0, Math.floor((now - (task.progress?.since ?? task.createdAt)) / 1000));
+			const elapsed = seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds / 60) % 60}m`;
+			return <article className={`in-flight-card ${task.status} ${task.progress?.phase ?? ""}`} key={task.id} data-task={task.id}>
+				<button className="task-card-main" onClick={() => openTask(task.id)}><span className={`status-dot ${task.progress?.phase === "approval" ? "attention" : task.progress?.phase ?? "cold"}`} /><div className="grow"><h3>{task.title}</h3><div className="task-card-meta"><span>{task.workspace}</span>{task.branch && <span className="mono" title={task.branch}>{task.branch}</span>}{task.playbook && <span className="playbook-chip">{task.playbook}</span>}</div><div className="task-progress-line"><span className="phase-label">{task.progress ? phaseLabels[task.progress.phase] : task.wait ? "Waiting" : "Pending"}</span><span className="elapsed">{elapsed}</span></div><p>{task.wait?.text ?? task.progress?.intent ?? task.progress?.lastEvent ?? "Waiting for the next update"}</p></div></button>
+				{task.sessionId && task.progress?.phase !== "cold" && <details className="task-card-menu"><summary aria-label={`Actions for ${task.title}`}>⋯</summary><button onClick={event => { event.currentTarget.closest("details")?.removeAttribute("open"); setStop(task); }}>Stop worker</button></details>}
+			</article>;
+		})}</div></section>}
+		{model.finished.length > 0 && <section className="now-section finished-section" aria-label="Finished"><h2>Finished <button className="text-button" onClick={() => model.dismissFinished(model.finished.map(task => task.id))}>Clear</button></h2>{model.finished.map(task => <div className="finished-row" key={task.id}><button className="finished-task" onClick={() => openTask(task.id)}><span className={task.status === "done" ? "finished-check" : "muted"}>{task.status === "done" ? "✓" : "−"}</span><span>{task.title}</span><RelativeTime at={task.endedAt} /></button><button className="icon-button" aria-label={`Dismiss finished ${task.title}`} onClick={() => model.dismissFinished([task.id])}>×</button></div>)}</section>}
+		{model.empty && <p className="nothing-in-flight">Nothing in flight. Tell main what you want done.</p>}
+		{stop && <Confirm title={`Stop ${stop.sessionId}?`} description="The worker will stop. Its task and saved conversation remain; open the task to resume it later." confirmLabel="Stop worker" danger onClose={() => setStop(null)} onConfirm={() => mutate(`/api/sessions/${encodeURIComponent(stop.sessionId!)}/evict`)} />}
+	</div>;
+}

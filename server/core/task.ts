@@ -1,4 +1,4 @@
-import type { WaitKind } from "../../shared/api.ts";
+import type { ProcState, TaskProgress, TaskStatus, WaitKind } from "../../shared/api.ts";
 import type { StopReason } from "../../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../../shared/tools.ts";
 
@@ -237,4 +237,16 @@ export function renderEnvelope(i: EnvelopeInput): string {
 		"Report: call home_report before ending each turn (done | blocked | question | progress).",
 	);
 	return lines.join("\n");
+}
+
+const PROC_PHASE: Record<ProcState, TaskProgress["phase"]> = { cold: "cold", starting: "starting", idle: "idle", running: "running", approval: "approval", stopping: "cold" };
+
+/**
+ * The in-flight phase of an open task (null once closed): provisioning until it has a worker
+ * session, queued while that session waits for a pool slot, otherwise the session's process state.
+ */
+export function progressPhase(status: TaskStatus, session: { queued: boolean; state: ProcState } | null): TaskProgress["phase"] | null {
+	if (status === "done" || status === "cancelled") return null;
+	if (!session) return "provisioning";
+	return session.queued ? "queued" : PROC_PHASE[session.state];
 }

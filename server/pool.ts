@@ -106,6 +106,8 @@ export class Pool {
 	readonly #d: PoolDeps;
 	readonly #live = new Map<string, Live>();
 	#queue: string[] = [];
+	/** When each session's ProcState last changed (this hub's lifetime only). */
+	readonly #stateSince = new Map<string, { state: ProcState; at: number }>();
 	#mainFailures: number[] = [];
 	#restartTimer: NodeJS.Timeout | undefined;
 	#shuttingDown = false;
@@ -156,7 +158,7 @@ export class Pool {
 				input.kind === "main" ? s.mainThinking : s.workerThinking,
 				Date.now(),
 			);
-			this.#d.changed();
+			this.#changed();
 			return this.must(id);
 		});
 	}
@@ -175,6 +177,23 @@ export class Pool {
 
 	state(id: string): ProcState {
 		return procState(this.#live.get(id)?.proc ?? { s: "cold" });
+	}
+
+	/** When the session entered its current state; null when it has not changed since the hub started. */
+	stateSince(id: string): number | null {
+		const mark = this.#stateSince.get(id);
+		return mark && mark.state === this.state(id) ? mark.at : null;
+	}
+
+	/** Every process state change ends here: stamp what changed, then tell the hub. */
+	#changed(): void {
+		const now = Date.now();
+		for (const [id, mark] of this.#stateSince) if (!this.#live.has(id) && mark.state !== "cold") this.#stateSince.set(id, { state: "cold", at: now });
+		for (const id of this.#live.keys()) {
+			const state = this.state(id);
+			if (this.#stateSince.get(id)?.state !== state) this.#stateSince.set(id, { state, at: now });
+		}
+		this.#d.changed();
 	}
 
 	rssMb(id: string): number | null {
@@ -276,7 +295,7 @@ export class Pool {
 			helloTimer: undefined,
 		};
 		this.#live.set(row.id, live);
-		this.#d.changed();
+		this.#changed();
 		this.#launch(row, live).catch(err => {
 			if (this.#live.get(row.id) !== live) return;
 			this.#live.delete(row.id);
@@ -284,7 +303,7 @@ export class Pool {
 			this.#d.log(`${row.id}: could not start omp: ${errorText(err)}`);
 			this.#d.db.run("UPDATE session SET pid = NULL, last_exit = 'clean' WHERE id = ?", row.id);
 			this.#d.exited(this.must(row.id), { intentional: false, wasRunning: false, neverConnected: true, exitCode: -1, incarnation: live.incarnation, detail: errorText(err) });
-			this.#d.changed();
+			this.#changed();
 			if (row.kind === "main") this.#mainCrashed(row.id);
 			this.#drainQueue();
 		});
@@ -353,7 +372,7 @@ export class Pool {
 			this.#d.log(`${row.id}: omp did not ${live.initialized ? "connect to the hub" : "finish RPC setup"} within ${HELLO_TIMEOUT_MS / 1000}s; stopping it`);
 			void rpc.stop(SHUTDOWN_GRACE_MS);
 		}, HELLO_TIMEOUT_MS);
-		this.#d.changed();
+		this.#changed();
 		void rpc.exited.then(exit => this.#onExit(row.id, live, exit));
 		void this.#initialize(row.id, live, rpc);
 	}
@@ -409,7 +428,7 @@ export class Pool {
 		if (live.proc.s === "starting") {
 			const now = Date.now();
 			live.proc = { s: "live", pid: live.proc.pid, since: now, run: "idle", approval: false, asyncJobs: 0, lastActivity: now };
-			this.#d.changed();
+			this.#changed();
 		}
 		if (live.proc.s === "live") this.#d.ready(id);
 	}
@@ -425,7 +444,7 @@ export class Pool {
 		if (!intentional) this.#d.log(`${id}: omp exited (${exit.signal ?? `code ${exitCode}`})${exit.detail ? `: ${exit.detail.slice(-1000)}` : ""}`);
 		const row = this.must(id);
 		this.#d.exited(row, { intentional, wasRunning: live.running, neverConnected: !live.connected, exitCode, incarnation: live.incarnation, detail: exit.detail });
-		this.#d.changed();
+		this.#changed();
 		if (row.kind === "main" && !intentional && !this.#shuttingDown && row.retired_at === null) this.#mainCrashed(id);
 		this.#drainQueue();
 	}
@@ -476,11 +495,11 @@ export class Pool {
 		if (!live.rpc) {
 			this.#live.delete(id);
 			live.client.reject(new HubError("unavailable", `${id} was stopped`));
-			this.#d.changed();
+			this.#changed();
 			return;
 		}
 		live.proc = { s: "stopping", pid: live.rpc.pid, why };
-		this.#d.changed();
+		this.#changed();
 		await live.rpc.stop(SHUTDOWN_GRACE_MS);
 	}
 
@@ -515,7 +534,7 @@ export class Pool {
 		this.#queue = this.#queue.filter(q => q !== id);
 		await this.stop(id, "retire");
 		this.#d.db.run("UPDATE session SET retired_at = coalesce(retired_at, ?) WHERE id = ?", Date.now(), id);
-		this.#d.changed();
+		this.#changed();
 	}
 
 	async stopAll(): Promise<void> {
@@ -537,7 +556,7 @@ export class Pool {
 		if (!live) return;
 		live.connected = true;
 		this.#d.db.run("UPDATE session SET omp_session_id = ?, omp_session_file = coalesce(?, omp_session_file) WHERE id = ?", hello.ompSessionId, hello.sessionFile, id);
-		this.#d.changed();
+		this.#changed();
 		this.#settle(id, live);
 	}
 
@@ -553,14 +572,14 @@ export class Pool {
 		live.running = phase === "start";
 		if (live.proc.s === "live") live.proc = { ...live.proc, run: phase === "start" ? "running" : "idle", asyncJobs, lastActivity: now, approval: false };
 		this.#d.db.run("UPDATE session SET last_activity = ? WHERE id = ?", now, id);
-		this.#d.changed();
+		this.#changed();
 	}
 
 	onApproval(id: string, open: boolean): void {
 		const live = this.#live.get(id);
 		if (live?.proc.s === "live") {
 			live.proc = { ...live.proc, approval: open };
-			this.#d.changed();
+			this.#changed();
 		}
 	}
 
@@ -597,7 +616,7 @@ export class Pool {
 				.map(([pid, kb]) => [pid!, kb!]),
 		);
 		for (const live of this.#live.values()) if (live.rpc) live.rssKb = rss.get(live.rpc.pid) ?? null;
-		this.#d.changed();
+		this.#changed();
 	}
 
 	/**

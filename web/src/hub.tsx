@@ -1,14 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
-import type { SessionDTO, StateDTO, Topic, UiEvent } from "../../shared/api.ts";
+import type { SessionDTO, StateDTO, TaskSummary, Topic, UiEvent } from "../../shared/api.ts";
 import { api } from "./api.ts";
 import { uiEvent } from "./schemas.ts";
 import { connectSocket } from "./transport.ts";
 import type { HubSocket } from "./transport.ts";
 import { notify } from "./native.ts";
 
-export const PANELS = ["Inbox", "Tasks", "Sessions", "Workspaces", "Decisions", "Resources", "Settings"] as const;
-export type Panel = typeof PANELS[number];
+export type RightView = { kind: "history" } | { kind: "task"; id: string };
+export type SettingsSection = "General" | "Workspaces" | "Environment" | "Sessions" | "About";
 interface Snapshot<T> { data: T | undefined; error: Error | null; loading: boolean }
 interface Entry { topic: Topic; path: string; snapshot: Snapshot<unknown>; listeners: Set<() => void>; dirty: boolean; pending: boolean }
 class Cache {
@@ -56,14 +56,14 @@ interface Hub {
 	stateError: Error | null;
 	reload: () => void;
 	connected: boolean;
-	active: string;
-	setActive: (tab: string) => void;
-	tabs: SessionDTO[];
-	closeTab: (id: string) => void;
+	views: RightView[];
+	popView: () => void;
+	openHistory: () => void;
 	openSession: (id: string) => Promise<void>;
-	taskId: string | null;
 	openTask: (id: string) => void;
-	closeTask: () => void;
+	settingsSection: SettingsSection | null;
+	openSettings: (section?: SettingsSection) => void;
+	closeSettings: () => void;
 	toast: (text: string, level?: "info" | "error") => void;
 	toasts: Toast[];
 	dismissToast: (id: number) => void;
@@ -93,9 +93,26 @@ export function HubProvider({ children }: { children: ReactNode }) {
 function HubController({ cache, children }: { cache: Cache; children: ReactNode }) {
 	const state = useResource<StateDTO>("state", "/api/state");
 	const [connected, setConnected] = useState(false);
-	const [active, setActive] = useState<string>("Inbox");
-	const [tabs, setTabs] = useState<SessionDTO[]>([]);
-	const [taskId, setTaskId] = useState<string | null>(null);
+	const [views, setViews] = useState<RightView[]>([]);
+	const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
+	const openTask = useCallback((id: string) => {
+		setSettingsSection(null);
+		setViews(current => {
+			const existing = current.findIndex(view => view.kind === "task" && view.id === id);
+			return existing < 0 ? [...current, { kind: "task", id }] : current.slice(0, existing + 1);
+		});
+		window.dispatchEvent(new CustomEvent("focus-task", { detail: id }));
+	}, []);
+	const popView = useCallback(() => setViews(current => current.slice(0, -1)), []);
+	const openHistory = useCallback(() => {
+		setSettingsSection(null);
+		setViews(current => {
+			const existing = current.findIndex(view => view.kind === "history");
+			return existing < 0 ? [...current, { kind: "history" }] : current.slice(0, existing + 1);
+		});
+	}, []);
+	const openSettings = useCallback((section: SettingsSection = "General") => setSettingsSection(section), []);
+	const closeSettings = useCallback(() => setSettingsSection(null), []);
 	const [toasts, setToasts] = useState<Toast[]>([]);
 	const lastComposerInput = useRef(0);
 	const wasPaused = useRef(false);
@@ -115,8 +132,6 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 			toastTimers.current.add(timer);
 		}
 	}, [dismissToast]);
-	const ompWarning = state.data?.omp.warning;
-	useEffect(() => { if (ompWarning) addToast(ompWarning, "error"); }, [ompWarning, addToast]);
 	useEffect(() => () => toastTimers.current.forEach(clearTimeout), []);
 	const toast = useCallback((text: string, level?: "info" | "error") => addToast(text, level), [addToast]);
 	const mutate = useCallback(async <T,>(path: string, body?: unknown, method = "POST"): Promise<T> => {
@@ -126,16 +141,18 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 	const openSession = useCallback(async (id: string) => {
 		const session = await mutate<SessionDTO>(`/api/sessions/${encodeURIComponent(id)}/attach`);
 		if (session.kind === "main") {
+			setSettingsSection(null);
 			window.dispatchEvent(new Event("focus-main"));
 			return;
 		}
-		setTabs(current => current.some(tab => tab.id === id) ? current.map(tab => tab.id === id ? session : tab) : [...current, session]);
-		setActive(id);
-	}, [mutate]);
-	const closeTab = useCallback((id: string) => {
-		setTabs(current => current.filter(tab => tab.id !== id));
-		setActive(current => current === id ? "Inbox" : current);
-	}, []);
+		if (session.openTask) openTask(session.openTask.id);
+		else {
+			const tasks = await api<TaskSummary[]>("/api/tasks");
+			const task = tasks.filter(task => task.sessionId === id).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+			if (task) openTask(task.id);
+			else toast(`${id} attached. No task is associated with this session.`);
+		}
+	}, [mutate, openTask, toast]);
 	const handleEvent = useCallback((event: UiEvent) => {
 		if (event.t === "invalidate") cache.invalidate(event.topics);
 		else if (event.t === "toast") toast(event.text, event.level);
@@ -170,6 +187,6 @@ function HubController({ cache, children }: { cache: Cache; children: ReactNode 
 		connect();
 		return () => { disposed = true; clearTimeout(timer); socket?.close(); };
 	}, [cache, handleEvent, toast]);
-	const value = useMemo<Hub>(() => ({ state: state.data, stateError: state.error, reload: state.reload, connected, active, setActive, tabs, closeTab, openSession, taskId, openTask: setTaskId, closeTask: () => setTaskId(null), toast, toasts, dismissToast, mutate, noteComposerInput: () => { lastComposerInput.current = Date.now(); } }), [state.data, state.error, state.reload, connected, active, tabs, closeTab, openSession, taskId, toast, toasts, dismissToast, mutate]);
+	const value = useMemo<Hub>(() => ({ state: state.data, stateError: state.error, reload: state.reload, connected, views, popView, openHistory, openSession, openTask, settingsSection, openSettings, closeSettings, toast, toasts, dismissToast, mutate, noteComposerInput: () => { lastComposerInput.current = Date.now(); } }), [state.data, state.error, state.reload, connected, views, popView, openHistory, openSession, openTask, settingsSection, openSettings, closeSettings, toast, toasts, dismissToast, mutate]);
 	return <HubContext.Provider value={value}>{children}</HubContext.Provider>;
 }

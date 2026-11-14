@@ -16,7 +16,7 @@ it routes the work to omp worker sessions in isolated git worktrees, and it only
 
 [**Download**](https://github.com/xianxianxianyu/omp-home/releases/latest) · [Features](#features) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Architecture](docs/ARCHITECTURE.md) · [简体中文](README.zh.md)
 
-<img src="docs/images/main-chat.png" alt="omp-home: the main chat on the left with folded thinking and tool cards, the Inbox on the right" width="100%">
+<img src="docs/images/main-chat.png" alt="omp-home: the main chat on the left; on the right, what needs you and the progress of tasks in flight" width="100%">
 
 </div>
 
@@ -46,11 +46,7 @@ Running agents on several repositories at once means juggling terminals, re-expl
 
 1. Download `omp-home_<version>_aarch64.dmg` from the [latest release](https://github.com/xianxianxianyu/omp-home/releases/latest). `aarch64` is the Apple Silicon (M-series) build.
 2. Drag **omp-home** into **Applications**.
-3. The app is ad-hoc signed, not notarized. Clear the quarantine flag once, then open it:
-
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/omp-home.app
-   ```
+3. Open it. Releases are signed with a Developer ID and notarized by Apple, so Gatekeeper lets it open directly.
 
 **Requirements:** an Apple Silicon Mac running macOS 13.5 or later, `git`, and [`omp`](https://omp.sh) installed and logged in (`omp login`). The app bundles its own Node runtime. [pstack](https://github.com/cursor/plugins/tree/main/harness/pstack/claude-code) is optional but recommended.
 
@@ -72,7 +68,7 @@ Running agents on several repositories at once means juggling terminals, re-expl
 
    > The discounted total in my-shop is wrong. Fix it and verify with npm test.
 
-   Watch the task appear in **Tasks**, the worker run in its own tab, and the main chat close the task once it has checked the evidence.
+   Watch the task appear under **In flight** on the right with its live progress; click it to see the worker's session. The main chat closes the task once it has checked the evidence, and the right side clears.
 
 ## How it works
 
@@ -97,7 +93,7 @@ Read more in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Every pipeline is dra
 <table>
   <tr>
     <td width="50%"><img src="docs/images/subagents.png" alt="Subagent drawer with a nested transcript"></td>
-    <td width="50%"><img src="docs/images/approval.png" alt="Inline approval and ask cards"></td>
+    <td width="50%"><img src="docs/images/task-view.png" alt="A task opened from the right: the worker's session, answered in place"></td>
   </tr>
   <tr>
     <td align="center"><sub><b>Subagents</b>: each subagent's own transcript, with steer and cancel</sub></td>

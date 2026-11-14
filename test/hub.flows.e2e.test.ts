@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import { after, test } from "node:test";
-import type { ResourcesDTO, SessionDTO, StateDTO, TaskDetail } from "../shared/api.ts";
+import type { ResourcesDTO, SessionDTO, StateDTO, TaskDetail, TaskSummary, UiEvent } from "../shared/api.ts";
+import WebSocket from "ws";
 import { killHubs, sandbox, startHub, Stream, until } from "./hub-harness.ts";
 
 /**
@@ -117,6 +120,24 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	});
 	assert.ok(fs.existsSync(`${t4.worktreePath}/.setup-ok`));
 	assert.equal(t4.env?.state, "ready");
+
+	// The in-flight list follows the worker's own progress: a new tool intent publishes `tasks` without any task
+	// event. Main handles T-4's notice first, so its own turns cannot refresh the list in the window below.
+	await main.expect(/T-4 Needs setup \(deckhand, W-\d+\) — done/);
+	await until("main settled", async () => (await hub.api<StateDTO>("GET", "/api/state")).body.main.state === "idle" && main.view.status.settled);
+	const uiEvents: UiEvent[] = [];
+	const ui = new WebSocket(`ws://127.0.0.1:${hub.port}/api/events?token=${hub.token}`);
+	ui.on("message", d => uiEvents.push(JSON.parse(String(d)) as UiEvent));
+	await once(ui, "open");
+	const t4Progress = async () => (await hub.api<TaskSummary[]>("GET", "/api/tasks?status=open")).body.find(t => t.id === "T-4")?.progress;
+	assert.equal((await hub.api("POST", `/api/sessions/${t4.sessionId}/prompt`, { text: "Walk through the steps [fake:intents]" })).status, 200);
+	await until("step one in flight", async () => (await t4Progress())?.intent === "Step one");
+	await sleep(200);
+	const seen = uiEvents.length;
+	await until("tasks invalidated", async () => uiEvents.slice(seen).some(e => e.t === "invalidate" && e.topics.includes("tasks")));
+	assert.deepEqual([(await t4Progress())?.phase, (await t4Progress())?.intent], ["running", "Step two"]);
+	await until("T-4 done again", async () => (await task("T-4")).status === "done");
+	ui.close();
 
 	// A decision revert reaches main as a prompt and resets the wake budget.
 	mark = main.out.length;

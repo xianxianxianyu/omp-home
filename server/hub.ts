@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, PromptRequest, SessionDTO, StateDTO, TaskDetail, Topic } from "../shared/api.ts";
+import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
 import type { BridgeToHub } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { TranscriptEvent, UiResponse } from "../shared/transcript.ts";
 import { Bridge, type CallFrame, type CallResult } from "./bridge.ts";
 import { homePaths, type HomePaths } from "./config.ts";
+import { progressPhase } from "./core/task.ts";
 import { Db } from "./db.ts";
 import { Env } from "./env.ts";
 import { errorText, HubError } from "./errors.ts";
@@ -16,6 +17,7 @@ import { isOpen, Ledger, waitOf, type ApplyResult, type DecisionRow, type Escala
 import { Notifier } from "./notify.ts";
 import type { OmpManager } from "./omp.ts";
 import { Pool, type ExitInfo, type SessionRow } from "./pool.ts";
+import { ProgressWatch } from "./progress-watch.ts";
 import { Provisioner } from "./provisioner.ts";
 import type { Resources } from "./resources.ts";
 import { RpcError, type RpcFrame } from "./rpc.ts";
@@ -58,6 +60,7 @@ export class Hub {
 	readonly provisioner: Provisioner;
 	readonly views: SessionViews;
 	readonly omp: OmpManager;
+	readonly #progress = new ProgressWatch(taskId => this.changed("tasks", `task:${taskId}`));
 	readonly #ui: UiChannel;
 	readonly #log: (message: string) => void;
 	readonly #callTool: (session: SessionRow, frame: CallFrame) => Promise<CallResult>;
@@ -98,7 +101,10 @@ export class Hub {
 			},
 			log: this.#log,
 			exited: (session, info) => this.#onExit(session, info),
-			changed: () => this.changed("sessions", "state"),
+			changed: () => {
+				this.changed("sessions", "state");
+				this.#watchOpenTasks();
+			},
 			mainFailed: message => {
 				this.#ui.send({ t: "toast", level: "error", text: message });
 				this.changed("state", "inbox");
@@ -164,6 +170,7 @@ export class Hub {
 		this.#stopping = true;
 		clearInterval(this.#tick);
 		this.notifier.stop();
+		this.#progress.stop();
 		await Promise.race([this.provisioner.idle(), sleep(5000)]);
 		await this.pool.stopAll();
 		this.bridge.closeAll();
@@ -245,6 +252,10 @@ export class Hub {
 	/** RPC frames feed the session's view; a finished run also refreshes model and context usage. */
 	#onRpcFrame(id: string, frame: RpcFrame): void {
 		this.views.frame(id, frame);
+		if (frame.type === "tool_execution_start" || frame.type === "tool_execution_end") {
+			const task = this.ledger.openForSession(id);
+			if (task) this.#progress.observe(task.id, this.progressOf(task));
+		}
 		if (frame.type === "agent_end" || frame.type === "model_changed") {
 			void this.pool
 				.client(id)
@@ -298,6 +309,15 @@ export class Hub {
 		for (const e of r.opened) this.#focus(e);
 		if (r.notices.length) this.notifier.evaluate();
 		this.changed("tasks", `task:${taskId}`, "state", "inbox", "sessions");
+		const task = this.ledger.mustTask(taskId);
+		this.#progress.observe(taskId, this.progressOf(task));
+	}
+
+	/** A process state changed somewhere: open tasks whose worker phase moved refresh the in-flight list. */
+	#watchOpenTasks(): void {
+		const open = this.ledger.listTasks({ status: "open" });
+		this.#progress.retain(new Set(open.map(t => t.id)));
+		for (const task of open) this.#progress.observe(task.id, this.progressOf(task));
 	}
 
 	#focus(e: EscalationRow): boolean {
@@ -596,6 +616,24 @@ export class Hub {
 
 	// ── views ────────────────────────────────────────────────────────────────
 
+	/** Live progress of an open task: its phase, what its worker is doing, and since when. Null once closed. */
+	progressOf(t: TaskRow): TaskProgress | null {
+		const session = t.session_id ? { queued: this.pool.queued(t.session_id), state: this.pool.state(t.session_id) } : null;
+		const phase = progressPhase(t.status, session);
+		if (!phase) return null;
+		const since =
+			phase === "provisioning"
+				? this.ledger.lastEventAt(t.id, ["created", "provision_retry"])
+				: phase === "queued"
+					? this.ledger.lastEventAt(t.id, ["queued_for_capacity"])
+					: this.pool.stateSince(t.session_id!);
+		return { phase, intent: t.session_id ? this.views.intent(t.session_id) : null, lastEvent: this.ledger.lastEventSummary(t.id), since: since ?? t.updated_at };
+	}
+
+	taskSummary(t: TaskRow): TaskSummary {
+		return { ...this.ledger.summary(t, this.branchOf(t.worktree_id)), progress: this.progressOf(t) };
+	}
+
 	branchOf(worktreeId: string | null): string | null {
 		return worktreeId ? (this.worktrees.get(worktreeId)?.branch ?? null) : null;
 	}
@@ -607,6 +645,7 @@ export class Hub {
 		const envRow = wt ? this.env.envRow(wt.id) : undefined;
 		return {
 			...this.ledger.summary(t, wt?.branch ?? null),
+			progress: this.progressOf(t),
 			brief: t.brief,
 			envelope: t.envelope,
 			checkout: JSON.parse(t.checkout) as CheckoutSpec,

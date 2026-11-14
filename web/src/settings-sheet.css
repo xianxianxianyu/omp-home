@@ -1,0 +1,114 @@
+.dialog.wide:has(> .settings-sheet) {
+	width: min(900px, 94vw);
+	height: min(640px, 84vh);
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.dialog:has(> .settings-sheet) > .dialog-head {
+	flex-shrink: 0;
+	margin: 0;
+	padding: 18px 22px;
+	border-bottom: 1px solid var(--line);
+}
+
+.settings-sheet {
+	flex: 1;
+	min-height: 0;
+	display: grid;
+	grid-template-columns: 164px minmax(0, 1fr);
+}
+
+.settings-sheet-nav {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 12px;
+	border-right: 1px solid var(--line);
+	background: var(--bg);
+	overflow: auto;
+	overscroll-behavior: contain;
+}
+
+.settings-sheet-nav button {
+	flex-shrink: 0;
+	border: 0;
+	border-radius: 6px;
+	padding: 9px 12px;
+	text-align: left;
+	background: transparent;
+	color: var(--muted);
+	cursor: pointer;
+}
+
+.settings-sheet-nav button:hover {
+	background: var(--panel);
+	color: var(--fg);
+}
+
+.settings-sheet-nav button[aria-current="page"] {
+	background: var(--panel-2);
+	color: var(--accent);
+	font-weight: 600;
+}
+
+.settings-sheet-nav button:focus-visible {
+	outline: 2px solid var(--accent-2);
+	outline-offset: -2px;
+}
+
+.settings-sheet-content {
+	min-width: 0;
+	min-height: 0;
+	padding: 22px;
+	overflow: auto;
+	overscroll-behavior: contain;
+	scrollbar-gutter: stable;
+}
+
+.settings-sheet-content:focus-visible {
+	outline: 2px solid var(--accent-2);
+	outline-offset: -2px;
+}
+
+.settings-sheet-content > .scroll {
+	position: static;
+	inset: auto;
+	padding: 0;
+	overflow: visible;
+}
+
+.settings-sheet-content .panel-heading h2 {
+	font-size: 19px;
+}
+
+@media (max-width: 850px) {
+	.dialog.wide:has(> .settings-sheet) {
+		height: min(640px, 94vh);
+	}
+}
+
+@media (max-width: 600px) {
+	.settings-sheet {
+		grid-template-columns: 118px minmax(0, 1fr);
+	}
+
+	.settings-sheet-nav {
+		padding: 8px;
+	}
+
+	.settings-sheet-nav button {
+		padding-inline: 8px;
+		font-size: 12px;
+	}
+
+	.settings-sheet-content {
+		padding: 16px;
+	}
+
+	.settings-sheet-content .two-col {
+		grid-template-columns: 1fr;
+	}
+}

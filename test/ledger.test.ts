@@ -157,3 +157,40 @@ test("search finds Chinese text with short and long terms, and chat pages are ex
 	assert.deepEqual(indexer.chat({ after: 4, limit: 10 }).map(r => r.id), [5]);
 	assert.deepEqual(indexer.chatAround(3, 1, 1).map(r => r.id), [2, 3, 4]);
 });
+
+test("open and closed task lists, endedAt, and the latest event for the in-flight list", () => {
+	let clock = 1_000;
+	const db = new Db(":memory:");
+	db.run("INSERT INTO workspace (id, name, repo_path, default_base, created_at) VALUES ('deck', 'deck', '/r/deck', 'main', 0)");
+	const ledger = new Ledger(db, () => clock);
+	const create = (key: string) =>
+		ledger.createTask({ title: key, workspaceId: "deck", checkout: { kind: "readonly" }, playbook: null, brief: "b", related: [], dispatchKey: key, actor: "dispatcher" }).task;
+	const a = create("a");
+	const b = create("b");
+	const c = create("c");
+	clock = 2_000;
+	ledger.apply(b.id, { kind: "queued_for_capacity", live: 4, cap: 4 }, "hub");
+	clock = 3_000;
+	ledger.apply(c.id, { kind: "cancelled", by: "human", reason: "no" }, "human");
+	ledger.apply(a.id, { kind: "accepted", reason: "fine", decision: null }, "main");
+
+	const ids = (status: "open" | "closed") => ledger.listTasks({ status }).map(t => t.id).sort();
+	assert.deepEqual(ids("open"), [b.id]);
+	assert.deepEqual(ids("closed"), [a.id, c.id]);
+	assert.deepEqual(ledger.listTasks({ status: "pending" }).map(t => t.id), [b.id]);
+
+	assert.equal(ledger.summary(ledger.mustTask(b.id), null).endedAt, null);
+	assert.equal(ledger.summary(ledger.mustTask(c.id), null).endedAt, 3_000);
+	assert.equal(ledger.lastEventSummary(b.id), "waiting for a worker slot (4/4 live)");
+	assert.equal(ledger.lastEventAt(b.id, ["queued_for_capacity"]), 2_000);
+	assert.equal(ledger.lastEventAt(b.id, ["created", "provision_retry"]), 1_000);
+	assert.equal(ledger.lastEventAt(b.id, ["provision_retry"]), null);
+
+	// Reopening a finished task clears endedAt.
+	clock = 4_000;
+	ledger.apply(a.id, { kind: "message_sent", by: "human", text: "one more thing", mode: "next", decision: null }, "human");
+	assert.equal(ledger.mustTask(a.id).status, "working");
+	assert.equal(ledger.summary(ledger.mustTask(a.id), null).endedAt, null);
+	assert.deepEqual(ids("open"), [a.id, b.id]);
+});
+

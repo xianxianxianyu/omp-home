@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
-import type { StateDTO, TaskSummary } from "../shared/api.ts";
+import type { StateDTO } from "../shared/api.ts";
 import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId } from "../shared/ids.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError } from "./errors.ts";
@@ -59,6 +59,7 @@ const setupSchema = z.strictObject({
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(2000).optional() });
 const textSchema = z.object({ text: z.string().min(1).max(20_000) });
 const recipeSchema = z.object({ text: z.string().max(200_000) });
+const taskStatusFilter = z.enum(["pending", "working", "awaiting", "done", "cancelled", "open", "closed"]);
 const promptSchema = z.strictObject({ text: z.string().min(1).max(20_000), mode: z.enum(["auto", "steer", "followUp"]).optional() });
 const respondSchema = z.strictObject({
 	requestId: z.string().min(1),
@@ -351,7 +352,10 @@ export class HubServer {
 
 		r("GET", "/api/tasks", ({ url }) => {
 			const h = hub();
-			const status = url.searchParams.get("status") || undefined;
+			const rawStatus = url.searchParams.get("status");
+			const parsed = rawStatus ? taskStatusFilter.safeParse(rawStatus) : null;
+			if (parsed && !parsed.success) throw new HubError("invalid", `status must be one of ${taskStatusFilter.options.join(", ")}`);
+			const status = parsed?.data;
 			const workspace = url.searchParams.get("workspace") || undefined;
 			const q = url.searchParams.get("q")?.trim();
 			let ids: string[] | undefined;
@@ -361,7 +365,7 @@ export class HubServer {
 				for (const t of h.ledger.listTasks({ status, workspace })) if (t.id.toLowerCase() === needle || t.title.toLowerCase().includes(needle)) hits.add(t.id);
 				ids = [...hits];
 			}
-			return h.ledger.listTasks({ status, workspace, ids }).map((t): TaskSummary => h.ledger.summary(t, h.branchOf(t.worktree_id)));
+			return h.ledger.listTasks({ status, workspace, ids }).map(t => h.taskSummary(t));
 		});
 		r("GET", "/api/tasks/:id", ({ params }) => hub().taskDetail(parseTaskId(params[0])));
 		r("POST", "/api/tasks/:id/cancel", ({ params, body }) => {

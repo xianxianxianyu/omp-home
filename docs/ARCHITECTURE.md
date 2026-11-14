@@ -11,7 +11,7 @@ flowchart LR
   Worker -- run end + home_report --> Hub
   Hub -- coalesced notice --> Main
   Main -- home_send / home_escalate --> Hub
-  Hub -- focus --> UI[UI: worker session tab]
+  Hub -- focus --> UI[UI: task view with the worker session]
   Human -->|composer| Worker
 ```
 

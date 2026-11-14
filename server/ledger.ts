@@ -252,10 +252,11 @@ export class Ledger {
 		return result;
 	}
 
-	listTasks(filter: { status?: string; workspace?: string; ids?: string[] } = {}): TaskRow[] {
+	listTasks(filter: { status?: TaskStatus | "open" | "closed"; workspace?: string; ids?: string[] } = {}): TaskRow[] {
 		const where: string[] = [];
 		const params: string[] = [];
 		if (filter.status === "open") where.push("status NOT IN ('done','cancelled')");
+		else if (filter.status === "closed") where.push("status IN ('done','cancelled')");
 		else if (filter.status) {
 			where.push("status = ?");
 			params.push(filter.status);
@@ -313,7 +314,8 @@ export class Ledger {
 			.map(r => r.id);
 	}
 
-	summary(row: TaskRow, branch: string | null): TaskSummary {
+	/** Everything of a TaskSummary the ledger knows; live progress comes from the hub. */
+	summary(row: TaskRow, branch: string | null): Omit<TaskSummary, "progress"> {
 		return {
 			id: row.id,
 			title: row.title,
@@ -325,7 +327,19 @@ export class Ledger {
 			playbook: row.playbook,
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
+			endedAt: row.ended_at,
 		};
+	}
+
+	/** One-line rendering of the task's latest event. */
+	lastEventSummary(taskId: string): string | null {
+		const e = this.#db.get<EventRow>("SELECT * FROM task_event WHERE task_id = ? ORDER BY id DESC LIMIT 1", taskId);
+		return e ? describeEvent(JSON.parse(e.data) as TaskEvent) : null;
+	}
+
+	/** When the latest event of one of `kinds` happened. */
+	lastEventAt(taskId: string, kinds: readonly TaskEvent["kind"][]): number | null {
+		return this.#db.get<{ at: number }>(`SELECT at FROM task_event WHERE task_id = ? AND kind IN (${kinds.map(() => "?").join(",")}) ORDER BY id DESC LIMIT 1`, taskId, ...kinds)?.at ?? null;
 	}
 
 	reports(taskId: string): ReportDTO[] {

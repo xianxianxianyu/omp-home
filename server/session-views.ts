@@ -2,7 +2,7 @@ import type { CommandDTO } from "../shared/api.ts";
 import { emptyStatus, emptyTranscript, MAX_ITEMS, reduceTranscript, type Item, type ToolView, type TranscriptEvent, type TranscriptView, type UiRequest } from "../shared/transcript.ts";
 import { HubError } from "./errors.ts";
 import type { RpcFrame } from "./rpc.ts";
-import { commandsOf, historyView, Normalizer, statusFromState } from "./transcript.ts";
+import { commandsOf, currentIntent, historyView, Normalizer, statusFromState } from "./transcript.ts";
 
 /** Items per `history?before=` page. */
 const HISTORY_PAGE = 100;
@@ -64,6 +64,12 @@ export class SessionViews {
 		e.subscribers.add(send);
 		send({ t: "reset", view: e.view });
 		return () => e.subscribers.delete(send);
+	}
+
+	/** The session's current tool intent; null when it has no view in this hub. */
+	intent(id: string): string | null {
+		const e = this.#entries.get(id);
+		return e ? currentIntent(e.view) : null;
 	}
 
 	subscribers(id: string): number {

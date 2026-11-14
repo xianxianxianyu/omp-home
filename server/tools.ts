@@ -65,7 +65,7 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 				`Auto-wakes left: ${Math.max(0, main.wakesMax - main.wakesUsed)}/${main.wakesMax}${main.paused ? " (paused: waiting for the human)" : ""}`,
 				`Playbooks: ${books.length ? books.join(", ") : "none (pstack not configured)"}`,
 			];
-			return { text: lines.join("\n"), details: { workspaces, openTasks: open.map(t => hub.ledger.summary(t, null)), main, playbooks: books } };
+			return { text: lines.join("\n"), details: { workspaces, openTasks: open.map(t => hub.taskSummary(t)), main, playbooks: books } };
 		},
 
 		home_search(p) {

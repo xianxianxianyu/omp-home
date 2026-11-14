@@ -27,12 +27,22 @@ The app version comes from root `package.json`; `OMP_HOME_APP_VERSION` overrides
 
 ## First launch
 
-Drag the app from the DMG into Applications. It is ad-hoc signed, not Apple-notarized. Only for a download you trust, remove quarantine before opening:
+Drag the app from the DMG into Applications and open it. Release builds are signed with the Developer ID certificate and notarized, with the ticket stapled to both the app and the DMG, so a browser-downloaded copy passes Gatekeeper. Local builds without Apple credentials are ad-hoc signed; open those with `xattr -dr com.apple.quarantine /Applications/omp-home.app` only if they were copied through a browser.
 
-```sh
-xattr -dr com.apple.quarantine /Applications/omp-home.app
-open /Applications/omp-home.app
+## Developer ID signing and notarization
+
+`pnpm build:app` signs with a Developer ID and notarizes when Apple credentials are present; otherwise it builds ad-hoc and says so. Credentials are read from `APPLE_SIGNING_IDENTITY`, `APPLE_API_ISSUER`, `APPLE_API_KEY` and `APPLE_API_KEY_PATH`, or locally from `~/.config/omp-home-release/apple.json`:
+
+```json
+{
+  "signingIdentity": "Developer ID Application: <name> (<team id>)",
+  "apiIssuer": "<App Store Connect issuer id>",
+  "apiKey": "<key id>",
+  "apiKeyPath": "~/.config/omp-home-release/AuthKey_<key id>.p8"
+}
 ```
+
+Tauri signs the app and its bundled Node (hardened runtime, `allow-jit`), notarizes and staples the app; the script then signs, notarizes and staples the DMG and runs `spctl` on both. In CI the same comes from secrets: `APPLE_CERTIFICATE` (base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_P8` (the `.p8` contents). Notarization requires the team's current Apple Developer Program License Agreement to be accepted.
 
 Closing the window hides it. The menu-bar icon offers **Open omp-home**, **Check for updates…**, and **Quit omp-home**. A second launch focuses the existing window. Quit sends SIGTERM to an owned hub and waits up to ten seconds for it to stop its omp children. An attached, independently started hub is never stopped by the desktop app. A crashed owned hub restarts with bounded exponential backoff and reloads the window. If an attached hub disappears, the app starts a replacement only after its existing lock is free.
 

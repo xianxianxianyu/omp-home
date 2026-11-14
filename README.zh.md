@@ -16,7 +16,7 @@
 
 [**下载**](https://github.com/xianxianxianyu/omp-home/releases/latest) · [功能](#功能) · [快速上手](#快速上手) · [工作原理](#工作原理) · [架构](docs/ARCHITECTURE.md) · [English](README.md)
 
-<img src="docs/images/main-chat.png" alt="omp-home：左边是主聊天（思考已折叠、工具调用是卡片），右边是收件箱" width="100%">
+<img src="docs/images/main-chat.png" alt="omp-home：左边是主聊天；右边是需要你处理的事和进行中任务的进度" width="100%">
 
 </div>
 
@@ -46,11 +46,7 @@
 
 1. 从[最新 release](https://github.com/xianxianxianyu/omp-home/releases/latest) 下载 `omp-home_<版本>_aarch64.dmg`。`aarch64` 就是 Apple Silicon（M 系列芯片）版本。
 2. 把 **omp-home** 拖进「应用程序」。
-3. 应用是临时签名（ad-hoc），没有经过 Apple 公证。第一次打开前清除一次隔离标记：
-
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/omp-home.app
-   ```
+3. 直接打开。发布版用 Developer ID 签名并经过 Apple 公证，Gatekeeper 不会再拦。
 
 **环境要求：** Apple Silicon Mac，macOS 13.5 及以上；`git`；已安装并登录的 [`omp`](https://omp.sh)（`omp login`）。应用自带 Node 运行时。[pstack](https://github.com/cursor/plugins/tree/main/harness/pstack/claude-code) 可选，推荐安装。
 
@@ -72,7 +68,7 @@
 
    > my-shop 里打折后的总价算错了，帮我修好，用 npm test 验证
 
-   你会看到 **Tasks** 里出现任务，worker 在自己的标签页里干活；主聊天核对证据后关闭任务。
+   你会看到右边 **In flight** 里出现这个任务和它的实时进度，点开能看 worker 的会话；主聊天核对证据后关闭任务，右边随之清空。
 
 ## 工作原理
 
@@ -97,7 +93,7 @@ flowchart TB
 <table>
   <tr>
     <td width="50%"><img src="docs/images/subagents.png" alt="子 agent 抽屉和嵌套的对话记录"></td>
-    <td width="50%"><img src="docs/images/approval.png" alt="内嵌的审批和 ask 卡片"></td>
+    <td width="50%"><img src="docs/images/task-view.png" alt="从右边打开的任务：worker 的会话，直接在里面回复"></td>
   </tr>
   <tr>
     <td align="center"><sub><b>子 agent</b>：每个子 agent 自己的对话记录，可补充指示或取消</sub></td>

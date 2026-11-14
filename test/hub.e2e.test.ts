@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { after, test } from "node:test";
 import WebSocket from "ws";
-import type { ChatRecordDTO, CommandDTO, InboxDTO, SessionDTO, StateDTO, TaskDetail, UiEvent } from "../shared/api.ts";
+import type { ChatRecordDTO, CommandDTO, InboxDTO, SessionDTO, StateDTO, TaskDetail, TaskSummary, UiEvent } from "../shared/api.ts";
 import type { TranscriptEvent } from "../shared/transcript.ts";
 import { killHubs, repoDir, runHub, sandbox, startHub, Stream, until } from "./hub-harness.ts";
 
@@ -181,8 +181,21 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	const hits = (await hub.api<{ taskId: string | null }[]>("GET", "/api/search?q=exercise&scope=tasks")).body;
 	assert.ok(hits.some(h => h.taskId === "T-3"));
 
-	// T-4 hangs mid-run; escalation focuses its terminal.
+	// T-4 hangs mid-run. The in-flight list shows it provisioning (setup takes a second), then running
+	// with what the worker is doing; escalation focuses its session.
+	assert.equal((await hub.api("PUT", "/api/workspaces/deckhand/recipe", { text: recipe.replace("setup: [", 'setup: ["sleep 1", ') })).status, 200);
+	const inFlight = async () => (await hub.api<TaskSummary[]>("GET", "/api/tasks?status=open")).body.find(t => t.id === "T-4");
 	main.agent(dispatch("Hanging task", "[fake:hang]"));
+	const provisioning = await until("T-4 in flight", async () => (await inFlight())?.progress);
+	assert.equal(provisioning.phase, "provisioning");
+	assert.equal(provisioning.intent, null);
+	const running = await until("T-4 running with an intent", async () => {
+		const p = (await inFlight())?.progress;
+		return p?.phase === "running" && p.intent === "Waiting for the human" && p;
+	});
+	assert.ok(running.since > provisioning.since);
+	assert.ok(running.lastEvent);
+	assert.equal((await inFlight())?.endedAt, null);
 	await until("T-4 running", async () => (await task("T-4")).events.some(e => e.kind === "run_started"));
 	mark = main.out.length;
 	main.agent(`/call home_escalate ${JSON.stringify({ task: "T-4", reason: "needs the human to choose" })}`);
@@ -214,6 +227,7 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 		return t.wait?.kind === "interrupted" && t;
 	});
 	assert.match(t4.wait!.text, /hub restarted/);
+	assert.deepEqual([t4.progress?.phase, t4.progress?.intent], ["cold", null]);
 	const sessions = (await hub.api<SessionDTO[]>("GET", "/api/sessions")).body;
 	assert.deepEqual(
 		sessions.filter(s => s.kind === "worker").map(s => [s.id, s.state, s.pid]),
@@ -244,6 +258,16 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	await w1.expect(/FAKE worker W-1 up resume=yes/);
 	assert.equal((await hub.api<SessionDTO[]>("GET", "/api/sessions")).body.find(s => s.id === "W-1")!.state, "idle");
 	w1.close();
+
+	// Closing a task ends its progress and moves it from the open to the closed list.
+	const closed = await hub.api<TaskDetail>("POST", "/api/tasks/T-4/cancel", { reason: "testing is over" });
+	assert.equal(closed.body.progress, null);
+	assert.ok(closed.body.endedAt);
+	assert.deepEqual((await hub.api<TaskSummary[]>("GET", "/api/tasks?status=open")).body, []);
+	const finished = (await hub.api<TaskSummary[]>("GET", "/api/tasks?status=closed")).body;
+	assert.deepEqual(finished.map(t => [t.id, t.progress]).sort(), [["T-1", null], ["T-2", null], ["T-3", null], ["T-4", null]]);
+	assert.ok(finished.every(t => t.endedAt !== null && t.endedAt >= t.createdAt));
+	assert.equal((await hub.api("GET", "/api/tasks?status=nope")).status, 400);
 
 	// Graceful stop ends every omp process, promptly even while a UI is connected.
 	const watcher = await new Stream(hub, "M-1", home).open();

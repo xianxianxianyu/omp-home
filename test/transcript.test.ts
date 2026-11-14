@@ -4,7 +4,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { emptyTranscript, MAX_ITEMS, reduceTranscript, type Item, type TranscriptEvent, type TranscriptView } from "../shared/transcript.ts";
 import { SessionViews } from "../server/session-views.ts";
-import { answerText, historyView, Normalizer, responseFits, uiRequestOf } from "../server/transcript.ts";
+import { answerText, currentIntent, historyView, Normalizer, responseFits, uiRequestOf } from "../server/transcript.ts";
 
 /**
  * Recorded omp 18.20 RPC frames (main session: home_status, bash, a `task` subagent that
@@ -227,3 +227,16 @@ test("extension UI side channels: status line, widgets, toasts, withdrawn dialog
 	apply({ type: "message_end", messageId: "n1", message: { role: "custom", customType: "omp-home.notice", content: "[omp-home · 1 update]", display: true, timestamp: 9 } });
 	assert.deepEqual(view.items.at(-1), { kind: "notice", id: "n1", at: 9, source: "omp-home", from: null, text: "[omp-home · 1 update]" });
 });
+
+test("current intent: the running tool's, else the most recent one's", () => {
+	const at = (n: number) => replay(n).view;
+	const bashStart = frames.findIndex(f => f.type === "tool_execution_start" && f.toolName === "bash");
+	assert.equal(currentIntent(emptyTranscript()), null);
+	assert.equal(currentIntent(at(bashStart + 1)), "Listing directory", "running bash");
+	assert.equal(currentIntent(at(frames.findIndex(f => f.type === "message_start" && f.messageId === "msg-6"))), "Listing directory", "bash finished, nothing newer");
+	const view = replay().view;
+	assert.equal(currentIntent(view), "Waiting for Pinger completion", "the last of five finished tools");
+	const tools = { ...view.tools, early: { ...view.tools.toolu_01BzWAVKSmgBYdsr5ktMWHsr!, callId: "early", status: "running" as const, intent: "Still running" } };
+	assert.equal(currentIntent({ ...view, tools }), "Still running", "a running tool wins over newer finished ones");
+});
+

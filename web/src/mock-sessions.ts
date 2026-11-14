@@ -8,6 +8,7 @@ import { uiResponse } from "./transcript-schema.ts";
 const commands: CommandDTO[] = [
 	{ name: "focus", description: "Demo: a worker needs your attention", source: "demo" },
 	{ name: "pause", description: "Demo: main has used its wake budget", source: "demo" },
+	{ name: "dispatch", description: "Demo: add an in-flight task", source: "demo" },
 	{ name: "new", description: "Start a new conversation", source: "omp" },
 	{ name: "model", description: "Choose a model", source: "omp" },
 	{ name: "compact", description: "Compact the context window", source: "omp" },
@@ -21,6 +22,12 @@ function seed(sessionId: string): TranscriptView {
 	const isMain = sessionId.startsWith("M-");
 	let view = emptyTranscript();
 	const apply = (event: TranscriptEvent) => { view = reduceTranscript(view, event); };
+	if (isMain && new URLSearchParams(location.search).get("scene") === "empty") {
+		apply({ t: "item", item: { kind: "user", id: "quiet-user", at: now - 60000, text: "今天的工作先到这里。保留记录，下一步再一起看。", images: 0, from: "human" } });
+		apply({ t: "item", item: assistant("quiet-assistant", "好的。今天的工作已经收尾，任务与决定都留在 **History** 里。\n\n随时告诉我下一件想完成的事。", now - 50000) });
+		apply({ t: "status", patch: { model: "openai-codex/gpt-6-astra", contextPercent: 19 } });
+		return view;
+	}
 	const tools: ToolView[] = [
 		{ callId: "read-1", name: "read", intent: "Reading search boundaries", args: { path: "src/search/index.ts:30-80" }, output: "export async function indexChanged(paths: string[]) {\n  return index.update(paths);\n}", status: "done", startedAt: now - 85000, endedAt: now - 83000 },
 		{ callId: "bash-1", name: "bash", intent: "Verifying incremental indexing", args: { command: "pnpm test -- search", cwd: "/worktrees/atlas/T-11" }, output: "Running search tests…", status: "running", startedAt: now - 3000, endedAt: null },
@@ -90,7 +97,7 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 				if (!views.has(id)) { views.set(id, seed(id)); history.set(id, oldHistory()); }
 				const listeners = subscribers.get(id) ?? new Set<SocketHandlers>(); listeners.add(handlers); subscribers.set(id, listeners);
 				handlers.message(JSON.stringify({ t: "reset", view: views.get(id)! } satisfies TranscriptEvent));
-				if (!scripted.has(id)) {
+				if (!scripted.has(id) && views.get(id)!.tools["bash-1"]) {
 					scripted.add(id);
 					const parts = ["搜索的边界已经确认。", " **两个 worker 正在独立推进。**", "\n\n你可以展开工具查看原始证据，或打开 **Subagents** 跟进每一步。"];
 					parts.forEach((text, index) => window.setTimeout(() => emit(id, { t: "delta", id: "stream-1", index: 0, kind: "text", text }), 350 + index * 450));

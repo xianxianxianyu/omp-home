@@ -22,12 +22,35 @@ const tasks: TaskDetail[] = [
 	{ id: "T-12", title: escalation.taskTitle, workspace: "console", status: "awaiting", sessionId: "W-12", wait: { kind: "approval", text: "Confirm the account migration strategy." } },
 	{ id: "T-9", title: "Fix search timeout handling", workspace: "atlas", status: "done", sessionId: "W-11", wait: null },
 	{ id: "T-8", title: "Replace the existing logging framework", workspace: "console", status: "cancelled", sessionId: null, wait: null },
-	{ id: "T-13", title: "校验导入数据的边界条件", workspace: "atlas", status: "awaiting", sessionId: null, wait: { kind: "interrupted", text: "The hub restarted during the last turn. Review before resuming." } },
-].map((item, index) => {
+	{ id: "T-13", title: "校验导入数据的边界条件", workspace: "atlas", status: "awaiting", sessionId: null, wait: { kind: "provision_failed", text: "Preview database could not start: port 5432 is already in use. Review the environment before continuing." } },
+].map((item, index): TaskDetail => {
 	const branch = item.status === "pending" ? null : `task/${item.id.toLowerCase()}-${item.workspace}`;
 	const path = branch ? `${home}/worktrees/${item.workspace}/${item.id}` : null;
-	return { ...item, status: item.status as TaskDetail["status"], wait: item.wait as TaskDetail["wait"], branch, playbook: "feature", createdAt: now - (index + 1) * 3600000, updatedAt: now - (index + 1) * 60000, brief: `## Goal\n${item.title}.\n\n## Background\nKeep behavior consistent with the existing workspace conventions. The main session has reviewed the scope and isolated this work in its own git worktree.\n\n## Constraints\nDo not publish changes or modify production data. Preserve the existing public API.\n\n## Acceptance\nRun the focused tests, report the observed results, and explain any remaining decisions.`, envelope: `Task: ${item.id}\nWorkspace: ${item.workspace}\nAudience: worker\nPolicy: work locally; report to main first.`, checkout: { kind: "worktree" }, worktreePath: path, related: [], reports: item.status === "pending" ? [] : [{ at: now - 240000, status: item.status === "done" ? "done" : item.status === "awaiting" ? "question" : "progress", summary: item.status === "done" ? "Fixed the timeout boundary; focused tests pass." : "Reviewed the existing implementation and narrowed the change.", details: "The implementation follows the existing error boundary. No external services or production data were changed." }], events: [{ id: index * 3 + 1, at: now - (index + 1) * 3600000, actor: "dispatcher", kind: "created", summary: "Task dispatched by main", data: {} }, ...(item.status === "pending" ? [] : [{ id: index * 3 + 2, at: now - 300000, actor: "worker" as const, kind: item.status === "awaiting" ? "awaiting" : "working", summary: item.status === "awaiting" ? "Worker needs a decision before continuing" : "Worker started the implementation", data: {} }])], decisions: decisions.filter(decision => decision.taskId === item.id), escalations: item.id === escalation.taskId ? [escalation] : [], git: path ? { dirty: item.status === "working", ahead: item.status === "done" ? 1 : 0, head: "a1b2c3d" } : null, env: path ? { worktreeId: `WT-${index + 1}`, worktreePath: path, workspace: item.workspace, state: "ready", error: null, vars: { NODE_ENV: "test", DATABASE_URL: `postgres://local:demo-secret@127.0.0.1:5432/${item.workspace}_test`, PORT: String(4100 + index) }, updatedAt: now - 300000 } : null };
+	const closed = item.status === "done" || item.status === "cancelled";
+	const progress: TaskDetail["progress"] = closed ? null : {
+		phase: item.id === "T-14" ? "queued" : item.id === "T-12" ? "approval" : item.id === "T-13" ? "cold" : "running",
+		intent: item.id === "T-11" ? "Tracing changed-file ownership" : null,
+		lastEvent: item.id === "T-14" ? "Waiting for an available worker slot" : item.wait?.text ?? "Worker started the implementation",
+		since: now - (index + 1) * 60000,
+	};
+	return {
+		...item, status: item.status as TaskDetail["status"], wait: item.wait as TaskDetail["wait"], branch, playbook: item.id === "T-14" ? "docs" : "feature",
+		createdAt: now - (index + 1) * 3600000, updatedAt: now - (index + 1) * 60000,
+		endedAt: item.status === "done" ? now - 180000 : item.status === "cancelled" ? now - 172800000 : null, progress,
+		brief: `## Goal\n${item.title}.\n\n## Constraints\nKeep work isolated. Do not publish changes or modify production data.\n\n## Acceptance\nRun focused tests and report the observed results.`,
+		envelope: `Task: ${item.id}\nWorkspace: ${item.workspace}\nAudience: worker\nPolicy: work locally; report to main first.`,
+		checkout: { kind: "worktree" }, worktreePath: path, related: [],
+		reports: item.status === "pending" ? [] : [{ at: now - 240000, status: item.status === "done" ? "done" : item.status === "awaiting" ? "question" : "progress", summary: item.status === "done" ? "Fixed the timeout boundary; focused tests pass." : "Reviewed the implementation and narrowed the change.", details: "No external services or production data were changed." }],
+		events: [{ id: index * 3 + 1, at: now - (index + 1) * 3600000, actor: "dispatcher", kind: "created", summary: "Task dispatched by main", data: {} }, ...(item.status === "pending" ? [] : [{ id: index * 3 + 2, at: now - 300000, actor: "worker" as const, kind: item.wait?.kind ?? item.status, summary: item.wait?.text ?? "Worker started the implementation", data: {} }])],
+		decisions: decisions.filter(decision => decision.taskId === item.id), escalations: item.id === escalation.taskId ? [escalation] : [],
+		git: path ? { dirty: item.status === "working", ahead: item.status === "done" ? 1 : 0, head: "a1b2c3d" } : null,
+		env: path ? { worktreeId: `WT-${index + 1}`, worktreePath: path, workspace: item.workspace, state: item.id === "T-13" ? "failed" : "ready", error: item.id === "T-13" ? item.wait?.text ?? null : null, vars: { NODE_ENV: "test", DATABASE_URL: `postgres://local:demo-secret@127.0.0.1:5432/${item.workspace}_test`, PORT: String(4100 + index) }, updatedAt: now - 300000 } : null,
+	};
 });
+if (new URLSearchParams(location.search).get("scene") === "empty") {
+	for (const task of tasks) { task.status = "done"; task.wait = null; task.progress = null; task.endedAt = now - 172800000; }
+	escalation.resolvedAt = now; escalation.resolution = "task_moved";
+}
 const sessions: SessionDTO[] = [{ id: "M-1", kind: "main", workspace: null, worktreePath: null, branch: "main", cwd: home, model: settings.mainModel!, state: "idle", pid: 42310, rssMb: 182.4, lastActivity: now - 30000, openTask: null, retired: false, createdAt: now - 7200000 }, ...["W-11", "W-12"].map((id, index): SessionDTO => {
 	const task = tasks.find(task => task.sessionId === id)!;
 	return { id, kind: "worker", workspace: task.workspace, worktreePath: task.worktreePath, branch: task.branch, cwd: task.worktreePath!, model: settings.workerModel!, state: index ? "approval" : "running", pid: 42311 + index, rssMb: index ? 146.8 : 211.2, lastActivity: now - (index + 1) * 45000, openTask: { id: task.id, title: task.title, status: task.status }, retired: false, createdAt: now - 3600000 };
@@ -44,8 +67,27 @@ function response(data: unknown, status = 200) { return new Response(JSON.string
 const sessionMock = createMockSessions((command, sessionId) => {
 	if (command === "/focus") { escalation.resolvedAt = null; escalation.resolution = null; emit({ t: "focus", sessionId: "W-12", escalationId: escalation.id, reason: escalation.reason }); invalidate(["inbox", "state"]); }
 	else if (command === "/pause") { main.paused = true; main.wakesUsed = main.wakesMax; invalidate(["state", "inbox"]); }
-	else { chat.push({ id: chat.length + 1, role: "user", at: Date.now(), text: command }); if (sessionId === escalation.sessionId) { escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied"; invalidate(["inbox", "state"]); } }
+	else if (command === "/dispatch") {
+		const task = tasks.find(task => task.id === "T-14")!;
+		task.status = "pending"; task.endedAt = null; task.progress = { phase: "queued", intent: null, lastEvent: "Waiting for an available worker slot", since: Date.now() };
+		invalidate(["tasks", "state"]);
+	}
+	else {
+		chat.push({ id: chat.length + 1, role: "user", at: Date.now(), text: command });
+		if (sessionId === escalation.sessionId) {
+			escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied";
+			const task = tasks.find(task => task.id === escalation.taskId)!;
+			task.status = "working"; task.wait = null; task.progress = { phase: "running", intent: "Following migration guidance", lastEvent: command, since: Date.now() };
+			invalidate(["inbox", "state", "tasks", `task:${task.id}`]);
+		}
+	}
 });
+const intents = ["Reading changed-file ownership", "Verifying incremental index updates", "Reviewing search test evidence"];
+let intentIndex = 0;
+window.setInterval(() => {
+	const task = tasks.find(task => task.id === "T-11");
+	if (task?.progress?.phase === "running") { task.progress.intent = intents[intentIndex++ % intents.length]; invalidate(["tasks", `task:${task.id}`]); }
+}, 8000);
 
 	const realFetch = window.fetch.bind(window);
 	window.fetch = async (input, init) => {
@@ -66,19 +108,40 @@ const sessionMock = createMockSessions((command, sessionId) => {
 			if (route === "inbox") return response({ main, escalations: escalation.resolvedAt === null ? [escalation] : [] });
 			if (route === "escalations") { if (action === "seen") escalation.seenAt = Date.now(); else { escalation.resolvedAt = Date.now(); escalation.resolution = "dismissed"; } invalidate(["inbox", "state", "task:T-12"]); return response(escalation); }
 			if (route === "tasks") {
-				if (!id) return response(tasks.filter(task => (!url.searchParams.get("status") || task.status === url.searchParams.get("status")) && (!url.searchParams.get("workspace") || task.workspace === url.searchParams.get("workspace")) && (!url.searchParams.get("q") || `${task.title} ${task.id} ${task.brief}`.toLowerCase().includes(url.searchParams.get("q")!.toLowerCase()))));
+				if (!id) {
+					const status = url.searchParams.get("status");
+					return response(tasks.filter(task => (!status || (status === "open" ? task.status !== "done" && task.status !== "cancelled" : status === "closed" ? task.status === "done" || task.status === "cancelled" : task.status === status)) && (!url.searchParams.get("workspace") || task.workspace === url.searchParams.get("workspace")) && (!url.searchParams.get("q") || `${task.title} ${task.id} ${task.brief}`.toLowerCase().includes(url.searchParams.get("q")!.toLowerCase()))));
+				}
 				const task = tasks.find(task => task.id === id); if (!task) return response({ error: "Task not found" }, 404);
 				if (method === "POST") {
-					if (action === "cancel") { task.status = "cancelled"; task.wait = null; }
-					if (action === "message") { task.status = "working"; task.wait = null; if (task.id === escalation.taskId) { escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied"; } }
+					if (action === "cancel") { task.status = "cancelled"; task.wait = null; task.progress = null; task.endedAt = Date.now(); if (task.id === escalation.taskId) { escalation.resolvedAt = Date.now(); escalation.resolution = "task_moved"; } }
+					if (action === "message") { task.status = "working"; task.wait = null; task.endedAt = null; task.progress = { phase: "running", intent: "Following human guidance", lastEvent: text(body, "text"), since: Date.now() }; if (task.id === escalation.taskId) { escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied"; } }
 					if (action === "cleanup") { task.worktreePath = null; if (task.env) task.env.state = "torn_down"; }
 					task.updatedAt = Date.now(); task.events.push({ id: Date.now(), at: Date.now(), actor: "human", kind: action ?? "message", summary: text(body, "text") || text(body, "reason") || "Environment torn down; worktree removed; branch retained.", data: body });
 					invalidate(["tasks", `task:${id}`, "resources", "state", "inbox"]);
 				}
 				return response(task);
 			}
-			if (route === "sessions" && id && action && ["prompt", "abort", "respond", "commands", "history", "subagents"].includes(action)) return response(sessionMock.request(id, action, body, parts, url.searchParams.get("before")));
-			if (route === "sessions") { if (!id) return response(sessions); const session = sessions.find(item => item.id === id); if (!session) return response({ error: "Session not found" }, 404); if (action === "attach") session.state = session.state === "cold" ? "idle" : session.state; else { session.state = "cold"; session.pid = null; if (action === "retire") session.retired = true; } if (session.kind === "main") main.state = session.state; invalidate(["sessions", "state", "workspaces"]); return response(session); }
+			if (route === "sessions" && id && action && ["prompt", "abort", "respond", "commands", "history", "subagents"].includes(action)) {
+				const result = sessionMock.request(id, action, body, parts, url.searchParams.get("before"));
+				if (action === "respond" && id === escalation.sessionId) {
+					escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied";
+					const task = tasks.find(task => task.id === escalation.taskId)!;
+					task.status = "working"; task.wait = null; task.progress = { phase: "running", intent: "Continuing the migration review", lastEvent: "Approval answered", since: Date.now() };
+					invalidate(["tasks", `task:${task.id}`, "inbox", "state"]);
+				}
+				return response(result);
+			}
+			if (route === "sessions") {
+				if (!id) return response(sessions);
+				const session = sessions.find(item => item.id === id);
+				if (!session) return response({ error: "Session not found" }, 404);
+				if (action === "attach") session.state = session.state === "cold" ? "idle" : session.state;
+				else { session.state = "cold"; session.pid = null; if (action === "retire") session.retired = true; }
+				if (session.kind === "main") main.state = session.state;
+				for (const task of tasks) if (task.sessionId === id && task.progress) task.progress = { ...task.progress, phase: session.state === "cold" ? "cold" : session.state === "approval" ? "approval" : session.state === "running" ? "running" : "idle", since: Date.now() };
+				invalidate(["sessions", "state", "workspaces", "tasks"]); return response(session);
+			}
 			if (route === "decisions") { if (!id) return response(decisions.filter(item => !url.searchParams.get("task") || item.taskId === url.searchParams.get("task"))); const decision = decisions.find(item => item.id === id); if (!decision) return response({ error: "Decision not found" }, 404); decision.revertRequestedAt = Date.now(); invalidate(["decisions", ...(decision.taskId ? [`task:${decision.taskId}` as Topic] : [])]); return response(decision); }
 			if (route === "workspaces") {
 				if (id === "scan") return response(["atlas", "console", "notes", "website"].map(name => ({ name, repoPath: `${root}/${name}`, alreadyAdded: workspaces.some(item => item.repoPath === `${root}/${name}`), isGitRepo: true })));

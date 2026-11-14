@@ -57,7 +57,7 @@ function useSession(sessionId: string) {
 	return { view, connected, error, commands, generation, history, setHistory, blocked, retry: () => setRetryToken(value => value + 1) };
 }
 
-function Composer({ sessionId, connected, running, commands, focused, main, abort, meta }: { sessionId: string; connected: boolean; running: boolean; commands: CommandDTO[]; focused: boolean; main: boolean; abort: () => Promise<void>; meta: string }) {
+function Composer({ sessionId, connected, running, commands, focused, main, abort, meta, escapeAborts }: { sessionId: string; connected: boolean; running: boolean; commands: CommandDTO[]; focused: boolean; main: boolean; abort: () => Promise<void>; meta: string; escapeAborts: boolean }) {
 	const { noteComposerInput } = useHub();
 	const [text, setText] = useState("");
 	const [mode, setMode] = useState<"auto" | "steer">("auto");
@@ -69,11 +69,15 @@ function Composer({ sessionId, connected, running, commands, focused, main, abor
 	const composing = useRef(false);
 	const compositionEnded = useRef(0);
 	const query = text.match(/^\/([^\s]*)$/)?.[1].toLowerCase();
-	const matches = query === undefined ? [] : commands.filter(command => {
-		let index = 0;
-		for (const char of `${command.name} ${command.description ?? ""}`.toLowerCase()) if (char === query[index]) index++;
-		return index === query.length;
-	}).slice(0, 8);
+	const matches = query === undefined ? [] : commands.flatMap(command => {
+		if (command.name.toLowerCase().startsWith(query)) return [{ command, score: 0 }];
+		for (const [score, value] of [command.name, command.description ?? ""].entries()) {
+			let index = 0;
+			for (const char of value.toLowerCase()) if (char === query[index]) index++;
+			if (index === query.length) return [{ command, score: score + 1 }];
+		}
+		return [];
+	}).sort((a, b) => a.score - b.score).slice(0, 8).map(match => match.command);
 	const menuOpen = matches.length > 0 && !menuDismissed;
 	useEffect(() => { if (focused && !main) input.current?.focus(); }, [focused, main]);
 	useEffect(() => { const focus = () => { if (main) input.current?.focus(); }; window.addEventListener("focus-main", focus); return () => window.removeEventListener("focus-main", focus); }, [main]);
@@ -89,7 +93,7 @@ function Composer({ sessionId, connected, running, commands, focused, main, abor
 		{menuOpen && <div className="command-menu" role="listbox" aria-label="Slash commands">{matches.map((command, index) => <button role="option" aria-selected={index === selected} key={command.name} className={index === selected ? "selected" : ""} onMouseDown={event => event.preventDefault()} onClick={() => chooseCommand(command)}><strong>/{command.name}</strong><span>{command.description ?? command.source}</span></button>)}</div>}
 		<textarea ref={input} aria-label={`${sessionId} message`} placeholder={running && mode === "steer" ? "调整正在进行的工作…" : "给 omp 一个目标，或输入 / 查看命令…"} value={text} rows={2} disabled={pending} onChange={event => { setText(event.target.value); setSelected(0); setMenuDismissed(false); noteComposerInput(); }} onCompositionStart={() => { composing.current = true; noteComposerInput(); }} onCompositionEnd={() => { composing.current = false; compositionEnded.current = performance.now(); }} onKeyDown={event => {
 			if (event.nativeEvent.isComposing || composing.current || event.keyCode === 229) return;
-			if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (menuOpen) setMenuDismissed(true); else if (running) void abort(); return; }
+			if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (menuOpen) setMenuDismissed(true); else if (running && escapeAborts) void abort(); return; }
 			if (menuOpen && (event.key === "ArrowDown" || event.key === "ArrowUp")) { event.preventDefault(); setSelected(index => (index + (event.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length); return; }
 			if (menuOpen && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) { if (performance.now() - compositionEnded.current < 80) return; event.preventDefault(); chooseCommand(matches[selected] ?? matches[0]); return; }
 			if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (performance.now() - compositionEnded.current >= 80) void send(); }
@@ -119,7 +123,7 @@ function SubagentPanel({ agents, selected, select, close, sessionId, connected }
 	return <aside className="subagent-drawer" aria-label="Subagents"><header><h3>Subagents <span className="muted">{Object.keys(agents).length}</span></h3><button className="icon-button" aria-label="Close subagents" onClick={close}>×</button></header><div className="subagent-list">{Object.values(agents).map(sub => <button className={`subagent-row ${selected === sub.id ? "selected" : ""}`} key={sub.id} onClick={() => select(sub.id)}><span className={`status-dot ${sub.status}`} /><span className="grow"><strong>{sub.agent}</strong><small>{sub.task || sub.id}</small><small className="muted">{sub.lastIntent ?? sub.status}</small></span><span className="agent-duration">{Math.max(0, Math.round(((sub.endedAt ?? now) - sub.startedAt) / 1000))}s<span>{sub.status}</span></span></button>)}</div>{agent ? <><div className="nested-transcript" aria-label={`${agent.agent} transcript`}>{agent.transcript.items.length > nestedLimit && <button className="text-button" onClick={() => setNestedLimit(value => value + PAGE_SIZE)}>Show earlier</button>}{agent.transcript.items.slice(-nestedLimit).map(item => <TranscriptItem key={item.id} item={item} view={agent.transcript} openAgent={select} />)}{!agent.transcript.items.length && <p className="empty">Waiting for the agent’s first message…</p>}</div><form className="subagent-controls" onSubmit={event => { event.preventDefault(); void action("steer"); }}><textarea aria-label={`Steer ${agent.agent}`} rows={2} placeholder="给子 agent 补充方向…" value={text} disabled={agent.status !== "running" || pending || !connected} onChange={event => { setText(event.target.value); noteComposerInput(); }} /><div className="row"><button className="btn small danger" type="button" disabled={agent.status !== "running" || pending || !connected} onClick={() => void action("cancel")}>Cancel agent</button><span className="spacer" /><button className="btn small primary" disabled={agent.status !== "running" || pending || !connected || !text.trim()}>Steer</button></div>{error && <p className="error-text" role="alert">{error}</p>}</form></> : <p className="empty">Select an agent to follow its work.</p>}</aside>;
 }
 
-export function SessionView({ sessionId, focused, main = false }: { sessionId: string; focused: boolean; main?: boolean }) {
+export function SessionView({ sessionId, focused, main = false, escapeAborts = main }: { sessionId: string; focused: boolean; main?: boolean; escapeAborts?: boolean }) {
 	const { view, connected, error, commands, generation, history, setHistory, blocked, retry } = useSession(sessionId);
 	const [endId, setEndId] = useState<string | null>(null);
 	const [loadingHistory, setLoadingHistory] = useState(false);
@@ -168,8 +172,8 @@ export function SessionView({ sessionId, focused, main = false }: { sessionId: s
 	}, [base]);
 	const respond = useCallback(async (requestId: string, response: UiResponse) => { await api(`${base}/respond`, { body: { requestId, response } satisfies RespondRequest }); }, [base]);
 	const openAgent = useCallback((id: string) => { setSelectedAgent(id); setDrawer(true); }, []);
-	return <section className="session-view" aria-label={`${sessionId} session`} onKeyDown={event => { if (event.key === "Escape" && running && !event.nativeEvent.isComposing && !document.querySelector("[data-modal]")) { event.preventDefault(); void abort(); } }}>
-		{(running || view.status.phase === "compacting" || !view.status.settled || Object.keys(view.subagents).length > 0) && <div className="session-activity">{(running || view.status.phase === "compacting" || !view.status.settled) && <span className="activity-state"><span className={`phase-indicator ${running ? "spinning" : ""}`} />{view.status.phase === "running" ? "Working" : view.status.phase === "compacting" ? "Compacting" : "Waiting for agents"}</span>}{Object.keys(view.subagents).length > 0 && <button className={`btn small ${drawer ? "steer-active" : ""}`} aria-expanded={drawer} onClick={() => { setDrawer(value => !value); if (!selectedAgent) setSelectedAgent(Object.keys(view.subagents)[0] ?? null); }}>Subagents <span className="agent-count">{Object.keys(view.subagents).length}</span></button>}{running && <button className="btn small danger" disabled={!connected} title="Stop the current turn (Esc)" onClick={() => void abort()}>Stop</button>}</div>}
+	return <section className="session-view" aria-label={`${sessionId} session`} onKeyDown={event => { if (event.key === "Escape" && escapeAborts && running && !event.nativeEvent.isComposing && !document.querySelector("[data-modal]")) { event.preventDefault(); void abort(); } }}>
+		{(running || view.status.phase === "compacting" || !view.status.settled || Object.keys(view.subagents).length > 0) && <div className="session-activity">{(running || view.status.phase === "compacting" || !view.status.settled) && <span className="activity-state"><span className={`phase-indicator ${running ? "spinning" : ""}`} />{view.status.phase === "running" ? "Working" : view.status.phase === "compacting" ? "Compacting" : "Waiting for agents"}</span>}{Object.keys(view.subagents).length > 0 && <button className={`btn small ${drawer ? "steer-active" : ""}`} aria-expanded={drawer} onClick={() => { setDrawer(value => !value); if (!selectedAgent) setSelectedAgent(Object.keys(view.subagents)[0] ?? null); }}>Subagents <span className="agent-count">{Object.keys(view.subagents).length}</span></button>}{running && <button className="btn small danger" disabled={!connected} title={escapeAborts ? "Stop the current turn (Esc)" : "Stop the current turn"} onClick={() => void abort()}>Stop</button>}</div>}
 		{(!connected || error) && <div className="session-connection" role="status">{error ?? `Connecting to ${sessionId}… waiting for a fresh transcript.`}{blocked && <button className="btn small" onClick={retry}>Retry</button>}</div>}
 		<div className="transcript-scroll" ref={scroll} onScroll={() => { const element = scroll.current; if (!element) return; const atBottom = endId === null && element.scrollHeight - element.scrollTop - element.clientHeight < 60; follow.current = atBottom; setFollowing(atBottom); }}><div className="transcript-content" ref={content}>
 			{(start > 0 || cursor) && <button className="history-button" disabled={loadingHistory || !connected} onClick={() => void earlier()}>{loadingHistory ? "Loading history…" : "↑ Show earlier messages"}</button>}
@@ -180,7 +184,7 @@ export function SessionView({ sessionId, focused, main = false }: { sessionId: s
 		{!following && <button className="jump-latest" onClick={jump}>↓ Jump to latest</button>}
 		<div className="session-bottom">{actionError && <div className="session-error" role="alert">{actionError}</div>}{(view.status.queue.steering.length > 0 || view.status.queue.followUp.length > 0) && <div className="queue-chips">{(["steering", "followUp"] as const).flatMap(kind => view.status.queue[kind].map((text, index) => <span key={`${kind}-${index}`} title={text} className={`queue-chip ${kind}`}>{kind === "steering" ? "Steer" : "Queued"} · {text}</span>))}</div>}
 			{Object.entries(view.status.statusLine).map(([key, line]) => <div className="extension-status" key={key}>{line}</div>)}{Object.entries(view.status.widgets).map(([key, lines]) => <details className="extension-widget" key={key}><summary>{key}</summary><pre>{lines.join("\n")}</pre></details>)}
-			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} abort={abort} meta={[view.status.model, view.status.contextPercent !== null ? `context ${Math.round(view.status.contextPercent)}%` : null].filter(Boolean).join(" · ")} />
+			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} abort={abort} escapeAborts={escapeAborts} meta={[view.status.model, view.status.contextPercent !== null ? `context ${Math.round(view.status.contextPercent)}%` : null].filter(Boolean).join(" · ")} />
 		</div>{drawer && <SubagentPanel agents={view.subagents} selected={selectedAgent} select={setSelectedAgent} close={() => setDrawer(false)} sessionId={sessionId} connected={connected} />}
 	</section>;
 }

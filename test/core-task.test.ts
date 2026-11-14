@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { escalationResolution, foldTask, INITIAL, NOTICE_POLICY, noticeFor, renderEnvelope, type TaskEvent, type TaskState } from "../server/core/task.ts";
+import { escalationResolution, foldTask, INITIAL, NOTICE_POLICY, noticeFor, progressPhase, renderEnvelope, type TaskEvent, type TaskState } from "../server/core/task.ts";
 
 /** Replay events from a fresh task; returns the final state and the notice each event produced. */
 function replay(events: TaskEvent[], from: TaskState = INITIAL): { state: TaskState; notices: (string | null)[] } {
@@ -133,3 +133,19 @@ test("the envelope names the worktree, env, playbook skills and the rules", () =
 	assert.match(readonly, /read-only investigation/);
 	assert.doesNotMatch(readonly, /poteto-mode/);
 });
+
+test("in-flight phase: provisioning without a session, queued for a slot, else the worker's process state; none once closed", () => {
+	assert.equal(progressPhase("pending", null), "provisioning");
+	assert.equal(progressPhase("awaiting", null), "provisioning", "a failed setup is still in the provisioning pipeline");
+	assert.equal(progressPhase("pending", { queued: true, state: "cold" }), "queued");
+	assert.equal(progressPhase("working", { queued: true, state: "stopping" }), "queued");
+	assert.equal(progressPhase("pending", { queued: false, state: "starting" }), "starting");
+	assert.equal(progressPhase("working", { queued: false, state: "running" }), "running");
+	assert.equal(progressPhase("awaiting", { queued: false, state: "approval" }), "approval");
+	assert.equal(progressPhase("awaiting", { queued: false, state: "idle" }), "idle");
+	assert.equal(progressPhase("working", { queued: false, state: "stopping" }), "cold");
+	assert.equal(progressPhase("awaiting", { queued: false, state: "cold" }), "cold");
+	assert.equal(progressPhase("done", { queued: false, state: "running" }), null);
+	assert.equal(progressPhase("cancelled", null), null);
+});
+

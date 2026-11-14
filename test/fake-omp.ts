@@ -14,7 +14,8 @@
  *   /call <tool> <json>     any tool as the main agent
  * Each runs as a turn ending in an assistant line "RESULT ok|err ...".
  * Worker role: every prompt runs one turn that calls home_report, shaped by markers
- * [fake:question] [fake:noreport] [fake:hang] (until abort) [fake:env] (home_env + home_lease).
+ * [fake:question] [fake:noreport] [fake:hang] (until abort) [fake:env] (home_env + home_lease)
+ * [fake:intents] (tools "Step one" for 1.2 s, then "Step two" for 1.5 s, before reporting).
  * FAKE_OMP_START_DELAY_MS: like real omp's slow first launch, nothing is read or written until then.
  */
 import { randomUUID } from "node:crypto";
@@ -149,9 +150,8 @@ function assistant(text: string, stopReason = "stop", sub: string | null = null)
 }
 
 /** One tool call as omp shows it: assistant toolCall, execution start/end, tool result message. */
-async function toolCall(name: string, args: Json, run: () => Promise<{ text: string; isError: boolean }>, sub: string | null = null): Promise<{ text: string; isError: boolean }> {
+async function toolCall(name: string, args: Json, run: () => Promise<{ text: string; isError: boolean }>, sub: string | null = null, intent = `Calling ${name}`): Promise<{ text: string; isError: boolean }> {
 	const id = randomUUID();
-	const intent = `Calling ${name}`;
 	const block = { type: "toolCall", id, name, arguments: args, intent };
 	const messageId = `msg-${++msgSeq}`;
 	const msg = { role: "assistant", content: [block], model: "fake-model", usage: USAGE, stopReason: "toolUse", timestamp: Date.now() };
@@ -228,13 +228,24 @@ function workerTurn(prompt: string): void {
 	turn(async signal => {
 		user(prompt);
 		if (prompt.includes("[fake:hang]")) {
-			await untilAborted(signal);
+			await toolCall("bash", { command: "sleep infinity" }, async () => {
+				await untilAborted(signal);
+				return { text: "aborted", isError: true };
+			}, null, "Waiting for the human");
 			assistant("aborted while hanging", "aborted");
 			return { stop: "aborted", text: "aborted while hanging" };
 		}
 		if (prompt.includes("[fake:noreport]")) {
 			assistant("finished without a report");
 			return { stop: "completed", text: "finished without a report" };
+		}
+		if (prompt.includes("[fake:intents]")) {
+			for (const [intent, ms] of [["Step one", 1200], ["Step two", 1500]] as const) {
+				await toolCall("bash", { command: "true" }, async () => {
+					await sleep(ms);
+					return { text: "ok", isError: false };
+				}, null, intent);
+			}
 		}
 		let probe = "";
 		if (prompt.includes("[fake:env]")) {
