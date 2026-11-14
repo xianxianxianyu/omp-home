@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import fs from "node:fs";
-import { setTimeout as sleep } from "node:timers/promises";
 import { after, test } from "node:test";
 import type { ResourcesDTO, SessionDTO, StateDTO, TaskDetail, TaskSummary, UiEvent } from "../shared/api.ts";
 import WebSocket from "ws";
@@ -131,11 +130,18 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	await once(ui, "open");
 	const t4Progress = async () => (await hub.api<TaskSummary[]>("GET", "/api/tasks?status=open")).body.find(t => t.id === "T-4")?.progress;
 	assert.equal((await hub.api("POST", `/api/sessions/${t4.sessionId}/prompt`, { text: "Walk through the steps [fake:intents]" })).status, 200);
-	await until("step one in flight", async () => (await t4Progress())?.intent === "Step one");
-	await sleep(200);
-	const seen = uiEvents.length;
-	await until("tasks invalidated", async () => uiEvents.slice(seen).some(e => e.t === "invalidate" && e.topics.includes("tasks")));
-	assert.deepEqual([(await t4Progress())?.phase, (await t4Progress())?.intent], ["running", "Step two"]);
+	const stepOne = await until("step one in flight", async () => { const p = await t4Progress(); return p?.intent === "Step one" && p; });
+	// Only an invalidation that lands before the worker's report counts: the report is a task event and would
+	// refresh the list even without the intent watch. Earlier invalidations (trailing ones for step one) are skipped.
+	let checked = uiEvents.length;
+	const stepTwo = await until("an invalidation shows step two", async () => {
+		if (!uiEvents.slice(checked).some(e => e.t === "invalidate" && e.topics.includes("tasks"))) return false;
+		checked = uiEvents.length;
+		const p = await t4Progress();
+		return p?.intent === "Step two" && p;
+	});
+	assert.equal(stepTwo.phase, "running");
+	assert.equal(stepTwo.lastEvent, stepOne.lastEvent);
 	await until("T-4 done again", async () => (await task("T-4")).status === "done");
 	ui.close();
 
