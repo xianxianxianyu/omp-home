@@ -55,6 +55,20 @@ if (!env.TAURI_SIGNING_PRIVATE_KEY) {
 }
 env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
 
+// Developer ID signing + notarization. Tauri reads APPLE_SIGNING_IDENTITY and APPLE_API_{ISSUER,KEY,KEY_PATH}
+// itself; locally they come from ~/.config/omp-home-release/apple.json so release credentials live in one place.
+const appleConfig = path.join(homedir(), '.config/omp-home-release/apple.json');
+if (!env.APPLE_SIGNING_IDENTITY && await exists(appleConfig)) {
+  const apple = JSON.parse(await readFile(appleConfig, 'utf8'));
+  for (const key of ['signingIdentity', 'apiIssuer', 'apiKey', 'apiKeyPath']) {
+    if (typeof apple[key] !== 'string' || !apple[key]) throw new Error(`${appleConfig}: "${key}" must be a non-empty string`);
+  }
+  Object.assign(env, { APPLE_SIGNING_IDENTITY: apple.signingIdentity, APPLE_API_ISSUER: apple.apiIssuer, APPLE_API_KEY: apple.apiKey, APPLE_API_KEY_PATH: apple.apiKeyPath.replace(/^~(?=\/)/, homedir()) });
+}
+const notarize = Boolean(env.APPLE_SIGNING_IDENTITY && env.APPLE_API_ISSUER && env.APPLE_API_KEY && env.APPLE_API_KEY_PATH);
+if (env.APPLE_SIGNING_IDENTITY && !notarize) throw new Error('APPLE_SIGNING_IDENTITY is set but APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_PATH are missing: a Developer ID build without notarization still fails Gatekeeper.');
+if (notarize && !await exists(env.APPLE_API_KEY_PATH)) throw new Error(`App Store Connect key not found: ${env.APPLE_API_KEY_PATH}`);
+
 await run(process.execPath, ['scripts/build-hub.mjs']);
 await mkdir(cache, { recursive: true });
 const base = `https://nodejs.org/dist/v${runtimeVersion}/`;
@@ -80,6 +94,17 @@ const config = {
   version,
   plugins: { updater: { endpoints: [endpoint.href], dangerousInsecureTransportProtocol: localUpdate } },
 };
-console.log(`Building omp-home ${version}; updater ${endpoint.href}`);
+console.log(`Building omp-home ${version}; updater ${endpoint.href}; ${notarize ? `signing as ${env.APPLE_SIGNING_IDENTITY} and notarizing` : 'ad-hoc signed (no Developer ID configured)'}`);
 await run('pnpm', ['exec', 'tauri', 'build', '--config', JSON.stringify(config)], desktop, env);
+if (notarize) {
+  // Tauri notarizes and staples the .app; the DMG wrapping it is signed, notarized and stapled here so a
+  // browser-quarantined download also passes Gatekeeper before the app inside is ever opened.
+  const bundle = path.join(native, 'target/release/bundle');
+  const dmg = path.join(bundle, 'dmg', `omp-home_${version}_aarch64.dmg`);
+  await run('codesign', ['--force', '--timestamp', '--sign', env.APPLE_SIGNING_IDENTITY, dmg]);
+  await run('xcrun', ['notarytool', 'submit', dmg, '--key', env.APPLE_API_KEY_PATH, '--key-id', env.APPLE_API_KEY, '--issuer', env.APPLE_API_ISSUER, '--wait']);
+  await run('xcrun', ['stapler', 'staple', dmg]);
+  await run('spctl', ['--assess', '--type', 'execute', '--verbose=2', path.join(bundle, 'macos/omp-home.app')]);
+  await run('spctl', ['--assess', '--type', 'open', '--context', 'context:primary-signature', '--verbose=2', dmg]);
+}
 console.log(`App, DMG and signed updater artifacts: ${path.join(native, 'target/release/bundle')}`);
