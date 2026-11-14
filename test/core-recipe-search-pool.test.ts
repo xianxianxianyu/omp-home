@@ -93,7 +93,7 @@ test("workers with viewers, escalations, async jobs or open runs are never evict
 test("launch spec: resume, optional model and pstack, worker git guard env", () => {
 	const spec = launchSpec({
 		bin: "omp",
-		session: { id: "W-3", kind: "worker", cwd: "/wt", sessionDir: "/h/.omp-home/sessions/W-3", resumeFile: "/h/s.jsonl", model: null, thinking: "high" },
+		session: { id: "W-3", kind: "worker", cwd: "/wt", sessionDir: "/h/.omp-home/sessions/W-3", resumeFile: "/h/s.jsonl", model: null, thinking: "max" },
 		paths: { plugin: "/app/omp-plugin/worker", overlay: "/h/.omp-home/run/worker.yml", pstackPackage: "/h/.omp-home/run/pstack", gitGuard: "/app/git-guard" },
 		bridge: { url: "ws://127.0.0.1:4777/bridge", token: "tok" },
 		baseEnv: { PATH: "/bin", OMP_HOME_ROLE: "spoofed" },
@@ -102,7 +102,7 @@ test("launch spec: resume, optional model and pstack, worker git guard env", () 
 	assert.deepEqual(spec.args, [
 		"--mode", "rpc-ui", "--cwd", "/wt", "--session-dir", "/h/.omp-home/sessions/W-3", "--config", "/h/.omp-home/run/worker.yml",
 		"-e", "/app/omp-plugin/worker", "-e", "/h/.omp-home/run/pstack",
-		"--thinking", "high", "--approval-mode", "yolo", "--no-title", "--resume", "/h/s.jsonl",
+		"--thinking", "max", "--approval-mode", "yolo", "--no-title", "--resume", "/h/s.jsonl",
 	]);
 	assert.equal(spec.env.OMP_HOME_ROLE, "worker");
 	assert.equal(spec.env.OMP_HOME_TOKEN, "tok");
@@ -112,12 +112,13 @@ test("launch spec: resume, optional model and pstack, worker git guard env", () 
 	assert.equal(spec.env.OMP_HOME_REPO_HOOKS, "/repo/.git/hooks");
 	const main = launchSpec({
 		bin: "omp",
-		session: { id: "M-1", kind: "main", cwd: "/h", sessionDir: "/h/.omp-home/chat/M-1", resumeFile: null, model: "opus", thinking: "high" },
+		session: { id: "M-1", kind: "main", cwd: "/h", sessionDir: "/h/.omp-home/chat/M-1", resumeFile: null, model: "opus", thinking: "max" },
 		paths: { plugin: "/app/omp-plugin/main", overlay: "/h/.omp-home/run/main.yml", pstackPackage: null, gitGuard: "/app/git-guard" },
 		bridge: { url: "ws://x/bridge", token: "t" },
 		baseEnv: {},
 		worker: null,
 	});
 	assert.ok(main.args.includes("--model") && !main.args.includes("--resume"));
+	assert.equal(main.args[main.args.indexOf("--thinking") + 1], "max");
 	assert.equal(main.env.GIT_CONFIG_COUNT, undefined);
 });

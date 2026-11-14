@@ -175,7 +175,7 @@ No. Finished work stays uncommitted in the task's worktree. Committing, opening 
 <details>
 <summary><b>What does it cost?</b></summary>
 
-omp-home adds no service of its own. You pay for the model usage of the main chat, the dispatcher and the workers through your existing omp providers. Choose cheaper worker models in **Settings**.
+omp-home adds no service of its own. You pay for the model usage of the main chat, the dispatcher and the workers through your existing omp providers. Choose cheaper worker models in **Settings → Models** (the list comes from `omp models`); the look (theme, accent, text size, density) is under **Settings → Appearance**.
 </details>
 
 <details>

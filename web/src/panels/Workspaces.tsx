@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import type { FieldError, RecipeDTO, ScanCandidate, WorkspaceCreate, WorkspaceDTO, WorkspacePatch } from "../../../shared/api.ts";
+import type { FieldError, RecipeDTO, ScanCandidate, SettingsDTO, WorkspaceCreate, WorkspaceDTO, WorkspacePatch } from "../../../shared/api.ts";
 import { api, ApiError } from "../api.ts";
 import { useHub, useResource } from "../hub.tsx";
 import { Button, Confirm, CopyButton, Empty, ErrorState, Field, Loading, Modal, Section, Status } from "../ui.tsx";
+import { ModelPicker, useModelCatalog } from "../ModelPicker.tsx";
 
 const RECIPE_EXAMPLE = `# Environment recipe for this workspace.
 # Uncomment and adapt only the settings your project needs.
@@ -76,6 +77,8 @@ export function WorkspacesPanel() {
 
 function WorkspaceEditor({ workspace, onClose }: { workspace?: WorkspaceDTO; onClose: () => void }) {
 	const { mutate, toast } = useHub();
+	const catalog = useModelCatalog();
+	const settings = useResource<SettingsDTO>("settings", "/api/settings");
 	const [repoPath, setRepoPath] = useState(workspace?.repoPath ?? "");
 	const [name, setName] = useState(workspace?.name ?? "");
 	const [id, setId] = useState("");
@@ -181,10 +184,11 @@ function WorkspaceEditor({ workspace, onClose }: { workspace?: WorkspaceDTO; onC
 					<Field label={workspace ? "Default base" : "Default base (optional)"} hint="Base branch used for new worktrees.">
 						<input required={!!workspace} value={defaultBase} onChange={(event) => setDefaultBase(event.target.value)} placeholder="Repository default" disabled={busy} />
 					</Field>
-					<Field label="Worker model (optional)" hint="Leave blank to use the model in Settings.">
-						<input value={workerModel} onChange={(event) => setWorkerModel(event.target.value)} placeholder="provider/model" disabled={busy} />
-					</Field>
+					<ModelPicker label="Worker model" value={workerModel || null} storedValue={workspace?.workerModel} onChange={selector => setWorkerModel(selector ?? "")} catalog={catalog.data} disabled={busy} defaultLabel="Workers default" defaultModel={settings.data?.workerModel ?? catalog.data?.defaultModel} />
 				</div>
+				<p className="hint">Workers default inherits the model in Settings. Changes apply to the next worker spawn.</p>
+				{catalog.error && <ErrorState error={catalog.error} retry={catalog.reload} />}
+				{catalog.data?.error && <p className="error-text" role="alert">{catalog.data.error}</p>}
 				{formError && <div className="error-box" role="alert"><p>{formError}</p>{fieldErrors.length > 0 && <ul>{fieldErrors.map((error, index) => <li key={`${error.path}:${index}`}><code>{error.path || "workspace"}</code>: {error.message}</li>)}</ul>}</div>}
 				<div className="dialog-actions">
 					<Button onClick={onClose} disabled={busy}>Cancel</Button>

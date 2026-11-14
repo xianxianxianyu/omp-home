@@ -3,11 +3,15 @@ import { ResourcesPanel } from "./panels/Resources.tsx";
 import { SessionsPanel } from "./panels/Sessions.tsx";
 import { SettingsPanel } from "./panels/Settings.tsx";
 import { WorkspacesPanel } from "./panels/Workspaces.tsx";
+import { ModelsPanel } from "./panels/Models.tsx";
+import { AppearancePanel } from "./panels/Appearance.tsx";
 import { CopyButton, Loading, Modal, Section } from "./ui.tsx";
 import "./settings-sheet.css";
 
 const SECTIONS = [
 	{ name: "General", Panel: SettingsPanel },
+	{ name: "Models", Panel: ModelsPanel },
+	{ name: "Appearance", Panel: AppearancePanel },
 	{ name: "Workspaces", Panel: WorkspacesPanel },
 	{ name: "Environment", Panel: ResourcesPanel },
 	{ name: "Sessions", Panel: SessionsPanel },
@@ -28,7 +32,7 @@ export function SettingsSheet() {
 						</button>
 					))}
 				</nav>
-				<div className="settings-sheet-content" role="region" aria-label={`${settingsSection} settings`} tabIndex={0}>
+				<div key={settingsSection} className="settings-sheet-content" role="region" aria-label={`${settingsSection} settings`} tabIndex={0}>
 					{SECTIONS.map(({ name, Panel }) => settingsSection === name ? <Panel key={name} /> : null)}
 				</div>
 			</div>

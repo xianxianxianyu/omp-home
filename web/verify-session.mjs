@@ -3,11 +3,13 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // Run with a Puppeteer Chromium page against VITE_MOCK=1. The browser prelude can
-// import this module in tab.run and call verifySession(page, outputDirectory).
-export async function verifySession(page, outputDirectory) {
+// import this module in tab.run and call verifySession(page, outputDirectory, expression => tab.evaluate(expression)).
+// evaluateApp keeps mocked fetch in the application realm when the driver isolates raw page evaluation.
+export async function verifySession(page, outputDirectory, evaluateApp = expression => page.evaluate(expression)) {
 	await mkdir(outputDirectory, { recursive: true });
 	const errors = [];
 	page.on("pageerror", error => errors.push(String(error)));
+	await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
 	await page.evaluate(() => localStorage.removeItem("omp-home-dismissed-finished"));
 	await page.goto(new URL("/", page.url()).href, { waitUntil: "networkidle0" });
 	await page.waitForSelector('.main-pane [data-tool="bash"] .tool-status.done');
@@ -121,11 +123,72 @@ export async function verifySession(page, outputDirectory) {
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: ",", code: "Comma", modifiers: 4, windowsVirtualKeyCode: 188 });
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: ",", code: "Comma", modifiers: 4, windowsVirtualKeyCode: 188 });
 	await page.waitForSelector('.settings-sheet');
-	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.length), 5);
+	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.map(element => element.textContent).join("|")), "General|Models|Appearance|Workspaces|Environment|Sessions|About");
 	await screenshot("12-settings-sheet");
 	await page.click('.settings-sheet-nav button:last-child');
 	await page.waitForFunction(() => document.querySelector('.settings-sheet-content')?.textContent.includes("Managed runtime"));
 	await screenshot("13-settings-about");
+	await page.click('.settings-sheet-nav button:nth-child(2)');
+	await page.waitForSelector('select[aria-label="Main model"] optgroup[label="anthropic"]');
+	assert.equal(await page.$$eval('select[aria-label="Main model"] optgroup', elements => elements.length), 2);
+	assert.match(await page.$eval('select[aria-label="Main model"]', element => element.textContent), /Claude Opus 5.5.*1M context.*\$5 in \/ \$25 out per Mtok/);
+	assert.match(await page.$eval('select[aria-label="Main model"] option:first-child', element => element.textContent), /omp default.*anthropic\/claude-opus-5-5/);
+	await page.select('select[aria-label="Main model"]', "anthropic/claude-sonnet-4-6");
+	assert.equal(await page.$$eval('select[aria-label="Main thinking"] option', elements => elements.map(element => element.value).join("|")), "off|low|medium|high");
+	await page.select('select[aria-label="Main model"]', "anthropic/claude-opus-5-5");
+	assert.equal(await page.$$eval('select[aria-label="Main thinking"] option', elements => elements.map(element => element.value).join("|")), "off|low|medium|high|xhigh|max");
+	await page.select('select[aria-label="Main model"]', "anthropic/claude-haiku-3");
+	assert.equal(await page.$eval('select[aria-label="Main thinking"]', element => element.disabled), true);
+	assert.match(await page.$eval('select[aria-label="Main thinking"] option:checked', element => element.textContent), /unsupported/);
+	assert.match(await page.$eval('.model-role', element => element.textContent), /no reasoning/);
+	await page.select('select[aria-label="Main model"]', "");
+	assert.equal(await page.$$eval('select[aria-label="Main thinking"] option', elements => elements.length), 7);
+	await page.type('input[aria-label="Search main model"]', "sonnet");
+	assert.equal(await page.$$eval('select[aria-label="Main model"] optgroup option', elements => elements.length), 1);
+	await page.$eval('input[aria-label="Search main model"]', element => { element.focus(); element.select(); });
+	await page.keyboard.press("Backspace");
+	await page.select('select[aria-label="Main model"]', "openai-codex/gpt-6-astra");
+	await page.click('.model-settings button[type="submit"]');
+	await page.waitForFunction(() => document.querySelector('.model-settings button[type="submit"]')?.disabled);
+	await page.$eval('.settings-sheet-content', element => { element.scrollTop = 0; });
+	await screenshot("15-settings-models");
+	await page.click('.settings-sheet-nav button:nth-child(3)');
+	await page.waitForSelector('.appearance-settings');
+	const darkBackground = await page.$eval('.app', element => getComputedStyle(element).backgroundColor);
+	const amberAccent = await page.$eval('html', element => getComputedStyle(element).getPropertyValue("--accent"));
+	await page.click('.appearance-settings fieldset:nth-of-type(1) button:nth-child(3)');
+	await page.waitForFunction(before => getComputedStyle(document.querySelector('.app')).backgroundColor !== before, {}, darkBackground);
+	await page.click('button[aria-label="Blue accent"]');
+	await page.waitForFunction(before => getComputedStyle(document.documentElement).getPropertyValue("--accent") !== before, {}, amberAccent);
+	await page.waitForFunction(() => document.querySelector('.appearance-status')?.textContent.startsWith("Saved"));
+	await screenshot("16-settings-appearance");
+	await page.keyboard.press("Escape");
+	await page.$eval('.main-pane [data-tool="edit"]', element => element.scrollIntoView({ block: "center" }));
+	await screenshot("17-main-light");
+	await page.click('.main-pane .session-activity button[aria-expanded]');
+	await page.waitForSelector('.main-pane .nested-transcript pre code');
+	await page.click('.topbar [aria-label="More"]');
+	await screenshot("19-light-code-and-menu");
+	await page.click('.main-pane [aria-label="Close subagents"]');
+	await page.click('.topbar [aria-label="More"]');
+	await page.click('.more-popover [role="menuitem"]:nth-child(2)');
+	await page.click('.settings-sheet-nav button:nth-child(3)');
+	await page.click('.appearance-settings fieldset:nth-of-type(1) button:first-child');
+	await page.waitForFunction(() => document.documentElement.dataset.theme === "system");
+	assert.equal(await page.$eval('.app', element => getComputedStyle(element).backgroundColor), darkBackground);
+	await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "light" }]);
+	await page.waitForFunction(before => getComputedStyle(document.querySelector('.app')).backgroundColor !== before, {}, darkBackground);
+	await page.click('.appearance-settings fieldset:nth-of-type(1) button:nth-child(2)');
+	await page.click('button[aria-label="Violet accent"]');
+	await page.click('.appearance-settings fieldset:nth-of-type(3) button:nth-child(3)');
+	await page.click('.appearance-settings fieldset:nth-of-type(4) button:nth-child(2)');
+	await page.waitForFunction(() => document.querySelector('.appearance-status')?.textContent.startsWith("Saved"));
+	assert.equal(await evaluateApp('(async () => { const { theme, accent, textSize, density } = (await (await window.fetch("/api/settings")).json()).appearance; return [theme, accent, textSize, density].join("|"); })()'), "dark|violet|large|compact");
+	assert.equal(await page.$eval('html', element => getComputedStyle(element).fontSize), "14.5px");
+	await page.keyboard.press("Escape");
+	await screenshot("18-main-dark-violet-compact-large");
+	await page.click('.topbar [aria-label="More"]');
+	await page.click('.more-popover [role="menuitem"]:nth-child(2)');
 	await page.keyboard.press("Escape");
 	await page.waitForFunction(() => !document.querySelector('[data-modal]'));
 	await page.click('.finished-section .text-button');
@@ -142,7 +205,7 @@ export async function verifySession(page, outputDirectory) {
 	await page.waitForSelector('.workspace-pane [data-task="T-14"]');
 	assert.equal(await page.$('.right-collapsed'), null);
 	assert.deepEqual(errors, []);
-	const result = { passed: true, screenshots: screenshots.length, screenshotFiles: screenshots, checks: ["collapsed thinking/tools", "expanded tool output", "select answered", "ask multi-question answered", "nested transcript", "subagent steer/cancel", "history paging", "edit diff", "confirm/input/editor answered", "fuzzy commands", "CDP Chinese IME does not send before explicit Send", "worker session", "Escape aborts main only; task Escape pops without aborting", "Now attention, queued/approval/live progress and finished", "History tasks and decisions", "Settings sheet via Command comma", "About runtime metadata", "finished dismissal persisted", "empty right column collapses", "dispatch automatically reveals right column"], ime, errors };
+	const result = { passed: true, screenshots: screenshots.length, screenshotFiles: screenshots, checks: ["collapsed thinking/tools", "expanded tool output", "select answered", "ask multi-question answered", "nested transcript", "subagent steer/cancel", "history paging", "edit diff", "confirm/input/editor answered", "fuzzy commands", "CDP Chinese IME does not send before explicit Send", "worker session", "Escape aborts main only; task Escape pops without aborting", "Now attention, queued/approval/live progress and finished", "History tasks and decisions", "Settings sheet via Command comma", "catalog groups, prices and model search", "thinking capabilities, unsupported levels and non-reasoning model", "live theme and accent", "live system color scheme", "appearance persistence across rapid changes", "large type and compact density", "About runtime metadata", "finished dismissal persisted", "empty right column collapses", "dispatch automatically reveals right column"], ime, errors };
 	await writeFile(join(outputDirectory, "result.json"), JSON.stringify(result, null, 2));
 	await cdp.detach();
 	return result;

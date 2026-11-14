@@ -8,7 +8,7 @@ import type { HubSocket } from "./transport.ts";
 import { notify } from "./native.ts";
 
 export type RightView = { kind: "history" } | { kind: "task"; id: string };
-export type SettingsSection = "General" | "Workspaces" | "Environment" | "Sessions" | "About";
+export type SettingsSection = "General" | "Models" | "Appearance" | "Workspaces" | "Environment" | "Sessions" | "About";
 interface Snapshot<T> { data: T | undefined; error: Error | null; loading: boolean }
 interface Entry { topic: Topic; path: string; snapshot: Snapshot<unknown>; listeners: Set<() => void>; dirty: boolean; pending: boolean }
 class Cache {
@@ -33,8 +33,13 @@ class Cache {
 		entry.dirty = false;
 		entry.snapshot = { ...entry.snapshot, loading: true, error: null };
 		entry.listeners.forEach(listener => listener());
-		try { entry.snapshot = { data: await api<unknown>(entry.path), error: null, loading: false }; }
-		catch (error) { entry.snapshot = { ...entry.snapshot, error: error instanceof Error ? error : new Error(String(error)), loading: false }; }
+		try {
+			const data = await api<unknown>(entry.path);
+			// An invalidation during this request means its response predates a newer write.
+			if (!entry.dirty) entry.snapshot = { data, error: null, loading: false };
+		} catch (error) {
+			if (!entry.dirty) entry.snapshot = { ...entry.snapshot, error: error instanceof Error ? error : new Error(String(error)), loading: false };
+		}
 		finally {
 			entry.pending = false;
 			entry.listeners.forEach(listener => listener());

@@ -17,6 +17,8 @@
  * [fake:question] [fake:noreport] [fake:hang] (until abort) [fake:env] (home_env + home_lease)
  * [fake:intents] (tools "Step one" for 1.2 s, then "Step two" for 1.5 s, before reporting).
  * FAKE_OMP_START_DELAY_MS: like real omp's slow first launch, nothing is read or written until then.
+ * Catalog commands: FAKE_OMP_CATALOG_FILE overrides models/defaultModel or fails a named command;
+ * FAKE_OMP_CATALOG_LOG records catalog invocations for endpoint tests.
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -28,9 +30,10 @@ import { toolsFor } from "../shared/tools.ts";
 
 type Json = Record<string, unknown>;
 
-const { values } = parseArgs({
+const { values, positionals } = parseArgs({
 	options: {
 		version: { type: "boolean" },
+		json: { type: "boolean" },
 		mode: { type: "string" },
 		cwd: { type: "string" },
 		"session-dir": { type: "string" },
@@ -43,10 +46,54 @@ const { values } = parseArgs({
 		resume: { type: "string" },
 	},
 	strict: true,
+	allowPositionals: true,
 });
 if (values.version) {
 	process.stdout.write("omp/0.0.0-fake\n");
 	process.exit(0);
+}
+
+if (positionals[0] === "models" || positionals[0] === "config") {
+	const command = positionals.join(" ");
+	if (positionals[0] === "config" && process.argv.indexOf("--config") > process.argv.indexOf("config")) {
+		process.stderr.write("error: Unknown option '--config' (global options must precede the config command)\n");
+		process.exit(1);
+	}
+	const file = process.env.FAKE_OMP_CATALOG_FILE;
+	const fixture = (file && fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {}) as {
+		models?: unknown;
+		defaultModel?: unknown;
+		fail?: string;
+		invalidJson?: string;
+	};
+	if (process.env.FAKE_OMP_CATALOG_LOG) fs.appendFileSync(process.env.FAKE_OMP_CATALOG_LOG, `${JSON.stringify({ command, args: process.argv.slice(2), cwd: process.cwd(), config: values.config ?? null })}\n`);
+	if (fixture.fail === command) {
+		process.stderr.write(`fake catalog failure: ${command}\n`);
+		process.exit(1);
+	}
+	if (fixture.invalidJson === command) {
+		process.stdout.write("not JSON\n");
+		process.exit(0);
+	}
+	if (command === "models refresh") {
+		process.stdout.write("Models refreshed\n");
+		process.exit(0);
+	}
+	if (command === "models" && values.json) {
+		process.stdout.write(`${JSON.stringify({ models: fixture.models ?? [
+			{ kind: "chat", selector: "anthropic/claude-test", provider: "anthropic", id: "claude-test", name: "Claude Test", contextWindow: 200000, maxTokens: 64000, reasoning: true, thinking: ["off", "low", "high", "xhigh", "max", "future"], input: ["text", "image"], cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } },
+			{ kind: "chat", selector: "openai-codex/gpt-test", provider: "openai-codex", id: "gpt-test", name: "GPT Test", reasoning: true, thinking: ["medium", "max"], input: ["text"] },
+			{ kind: "chat", selector: "local/plain", provider: "local", id: "plain", name: "Plain", reasoning: false, thinking: ["high"], input: ["text"], cost: null },
+			{ kind: "embedding" },
+		] })}\n`);
+		process.exit(0);
+	}
+	if (command === "config get modelRoles" && values.json) {
+		process.stdout.write(`${JSON.stringify({ key: "modelRoles", value: { default: "defaultModel" in fixture ? fixture.defaultModel : "anthropic/claude-test:high" } })}\n`);
+		process.exit(0);
+	}
+	process.stderr.write(`unsupported catalog command: ${command}\n`);
+	process.exit(1);
 }
 
 const role = process.env.OMP_HOME_ROLE === "worker" ? "worker" : "main";

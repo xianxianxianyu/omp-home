@@ -2,17 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { stringify } from "yaml";
 import { z } from "zod";
-import type { SettingsDTO } from "../shared/api.ts";
+import { ACCENTS, DENSITIES, TEXT_SIZES, THEMES, THINKING_LEVELS, type AppearanceDTO, type SettingsDTO } from "../shared/api.ts";
 import { writeFileAtomic, type HomePaths } from "./config.ts";
 import type { Db } from "./db.ts";
 import { fieldErrors, HubError } from "./errors.ts";
 
 export const DEFAULT_PSTACK_ROOT = "/Volumes/NVMe2T/project/opensource/cursor-plugins/harness/pstack/claude-code";
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 /** omp config every hub-spawned omp gets (also the compatibility self-check). */
 export const OVERLAY_BASE = { startup: { setupWizard: false }, update: { auto: false } };
 
 export type Settings = Omit<SettingsDTO, "homePath">;
+const DEFAULT_APPEARANCE: AppearanceDTO = { theme: "system", accent: "amber", textSize: "default", density: "comfortable" };
 
 export function isPstackRoot(dir: string): boolean {
 	return fs.existsSync(path.join(dir, "skills", "poteto-mode", "SKILL.md"));
@@ -32,10 +32,17 @@ export function defaultSettings(): Settings {
 		portRange: [41000, 41999],
 		worktreeRoot: null,
 		ompPath: null,
+		appearance: { ...DEFAULT_APPEARANCE },
 	};
 }
 
 const model = z.string().trim().min(1).nullable();
+const appearanceFields = {
+	theme: z.enum(THEMES),
+	accent: z.enum(ACCENTS),
+	textSize: z.enum(TEXT_SIZES),
+	density: z.enum(DENSITIES),
+};
 const fields = {
 	pstackRoot: z
 		.string()
@@ -61,8 +68,16 @@ const fields = {
 		.nullable()
 		.refine(v => v === null || path.isAbsolute(v), "must be an absolute path"),
 };
-const patchSchema = z.strictObject(fields).partial();
-const storedSchema = z.object(fields).partial();
+const patchSchema = z.strictObject({ ...fields, appearance: z.strictObject(appearanceFields).partial() }).partial();
+const storedSchema = z.object({
+	...fields,
+	appearance: z.object({
+		theme: appearanceFields.theme.catch(DEFAULT_APPEARANCE.theme),
+		accent: appearanceFields.accent.catch(DEFAULT_APPEARANCE.accent),
+		textSize: appearanceFields.textSize.catch(DEFAULT_APPEARANCE.textSize),
+		density: appearanceFields.density.catch(DEFAULT_APPEARANCE.density),
+	}).catch({ ...DEFAULT_APPEARANCE }),
+}).partial();
 
 /** Settings live in meta('settings'); overlays derived from them are rewritten on every change. */
 export class SettingsStore {
@@ -87,7 +102,8 @@ export class SettingsStore {
 	update(patch: unknown): Settings {
 		const parsed = patchSchema.safeParse(patch);
 		if (!parsed.success) throw new HubError("unprocessable", "invalid settings", fieldErrors(parsed.error.issues));
-		const next = { ...this.get(), ...parsed.data };
+		const current = this.get();
+		const next = { ...current, ...parsed.data, appearance: { ...current.appearance, ...parsed.data.appearance } };
 		this.#db.setMeta("settings", JSON.stringify(next));
 		this.writeOverlays();
 		return next;

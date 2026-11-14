@@ -2,6 +2,16 @@
 <html lang="en">
 	<head>
 		<meta charset="UTF-8" />
+		<script>
+			try {
+				const hint = JSON.parse(localStorage.getItem("omp-home-appearance") || "null");
+				if (hint) for (const key of ["theme", "accent", "textSize", "density"]) {
+					if (typeof hint[key] === "string") document.documentElement.dataset[key] = hint[key];
+				}
+			} catch {}
+			document.documentElement.dataset.theme ||= "system";
+			document.documentElement.dataset.colorScheme = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+		</script>
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<meta name="theme-color" content="#12151b" />
 		<meta name="description" content="Your local control room for main and worker omp sessions." />

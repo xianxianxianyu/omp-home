@@ -12,6 +12,7 @@ import { errorText, fieldErrors, HubError } from "./errors.ts";
 import { GitError } from "./git.ts";
 import type { Resources } from "./resources.ts";
 import { Hub } from "./hub.ts";
+import { ModelCatalog } from "./models.ts";
 import { OmpManager } from "./omp.ts";
 import { generatePstackPackage } from "./pstack.ts";
 import { defaultSettings } from "./settings.ts";
@@ -89,7 +90,7 @@ function loopbackHost(header: string | undefined): boolean {
 	}
 }
 
-/** HTTP + WebSocket front of the hub. Works before setup (no home yet) with the setup routes only. */
+/** HTTP + WebSocket front of the hub. Setup, defaults and the omp catalog work before a home is configured. */
 export class HubServer {
 	readonly #o: ServerOptions;
 	readonly #ui = new UiChannel();
@@ -98,6 +99,7 @@ export class HubServer {
 	readonly #routes: Route[] = [];
 	readonly #dist: string;
 	readonly #omp: OmpManager;
+	readonly #models: ModelCatalog;
 	#hub: Hub | null = null;
 	#port = 0;
 
@@ -105,6 +107,7 @@ export class HubServer {
 		this.#o = opts;
 		this.#dist = opts.resources.web;
 		this.#omp = new OmpManager({ configDir: opts.configDir, pluginDir: opts.resources.plugin, log: opts.log });
+		this.#models = new ModelCatalog(() => ({ bin: this.#omp.bin(), cwd: this.#hub?.home, overlay: this.#hub?.paths.overlay("worker") }));
 		this.#server = http.createServer((req, res) => {
 			this.#handle(req, res).catch(err => {
 				this.#o.log(`${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
@@ -308,6 +311,7 @@ export class HubServer {
 		const uiKey = () => `ui:${randomUUID()}`;
 
 		r("GET", "/api/state", () => this.#state());
+		r("GET", "/api/models", ({ url }) => this.#models.get(url.searchParams.get("refresh") === "1"));
 		r("GET", "/api/settings", () => this.#hub?.settings.dto() ?? { homePath: this.#o.config.homePath ?? DEFAULT_HOME, ...defaultSettings() });
 		r("PUT", "/api/settings", ({ body }) => {
 			const h = hub();

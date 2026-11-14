@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ACCENTS, DENSITIES, TEXT_SIZES, THEMES, THINKING_LEVELS } from "../../shared/api.ts";
 import { commands, historyPage } from "./transcript-schema.ts";
 
 const nullableText = z.string().nullable();
@@ -16,7 +17,9 @@ const environment = z.object({ worktreeId: z.string(), worktreePath: z.string(),
 const service = z.object({ id: z.string(), workspace: z.string(), name: z.string(), kind: z.enum(["external", "run"]), state: z.enum(["down", "starting", "up", "failed"]), pid: z.number().nullable(), checkedAt: z.number().nullable(), error: nullableText, logTail: z.string() });
 const lease = z.object({ id: z.number(), kind: z.enum(["port", "db", "account"]), key: z.string(), label: z.string(), holderKind: z.enum(["worktree", "session", "service"]), holderId: z.string(), acquiredAt: z.number(), expiresAt: z.number().nullable() });
 const detail = task.extend({ brief: z.string(), envelope: nullableText, checkout: z.discriminatedUnion("kind", [z.object({ kind: z.literal("worktree"), base: z.string().optional(), branch: z.string().optional() }), z.object({ kind: z.literal("continue"), task: z.string(), session: z.enum(["reuse", "fresh"]) }), z.object({ kind: z.literal("readonly") })]), worktreePath: nullableText, related: z.array(z.string()), reports: z.array(z.object({ at: z.number(), status: z.enum(["done", "blocked", "question", "progress"]), summary: z.string(), details: nullableText })), events: z.array(z.object({ id: z.number(), at: z.number(), actor: z.enum(["main", "dispatcher", "worker", "human", "hub"]), kind: z.string(), summary: z.string(), data: z.record(z.string(), z.unknown()) })), decisions: z.array(decision), escalations: z.array(escalation), git: z.object({ dirty: z.boolean(), ahead: z.number(), head: z.string() }).nullable(), env: environment.nullable() });
-const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.string(), workerModel: nullableText, workerThinking: z.string(), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText });
+export const appearance = z.object({ theme: z.enum(THEMES), accent: z.enum(ACCENTS), textSize: z.enum(TEXT_SIZES), density: z.enum(DENSITIES) });
+const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.enum(THINKING_LEVELS), workerModel: nullableText, workerThinking: z.enum(THINKING_LEVELS), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText, appearance });
+const modelCatalog = z.object({ models: z.array(z.object({ selector: z.string(), provider: z.string(), id: z.string(), name: z.string(), contextWindow: z.number().nullable(), maxTokens: z.number().nullable(), reasoning: z.boolean(), thinking: z.array(z.enum(THINKING_LEVELS)), input: z.array(z.string()), cost: z.object({ input: z.number(), output: z.number() }).nullable() })), defaultModel: nullableText, fetchedAt: z.number(), error: nullableText });
 const recipe = z.object({ workspace: z.string(), path: z.string(), text: z.string(), status: z.enum(["missing", "ok", "invalid"]), errors: z.array(fieldError) });
 const topic = z.union([z.enum(["state", "tasks", "sessions", "inbox", "decisions", "workspaces", "resources", "settings"]), z.templateLiteral(["task:", z.string()])]);
 export const uiEvent = z.discriminatedUnion("t", [z.object({ t: z.literal("invalidate"), topics: z.array(topic) }), z.object({ t: z.literal("focus"), sessionId: z.string(), escalationId: nullableText, reason: z.string() }), z.object({ t: z.literal("toast"), level: z.enum(["info", "error"]), text: z.string() })]);
@@ -27,6 +30,7 @@ export function parseResponse(path: string, data: unknown): unknown {
 	if (p === "/api/state" || p === "/api/setup" || p.startsWith("/api/main/")) schema = state;
 	else if (p === "/api/setup/preview") schema = z.object({ homePath: z.string(), exists: z.boolean(), isGitRepo: z.boolean(), changes: z.array(z.object({ path: z.string(), action: z.enum(["create", "replace", "backup"]), reason: z.string() })), pstackCandidates: z.array(z.string()) });
 	else if (p === "/api/settings") schema = settings;
+	else if (p === "/api/models") schema = modelCatalog;
 	else if (p === "/api/tasks") schema = z.array(task);
 	else if (p.startsWith("/api/tasks/")) schema = detail;
 	else if (p === "/api/sessions") schema = z.array(session);

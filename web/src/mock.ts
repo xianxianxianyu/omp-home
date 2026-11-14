@@ -1,18 +1,28 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { ChatRecordDTO, DecisionDTO, EscalationDTO, RecipeDTO, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
+import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeDTO, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { createMockSessions } from "./mock-sessions.ts";
 
 export function installMock() {
 const now = Date.now();
-const home = "/Volumes/NVMe2T/project/home";
-const root = "/Volumes/NVMe2T/project";
+const home = "/tmp/omp-home-demo/home";
+const root = "/tmp/omp-home-demo";
 const subscribers = new Set<SocketHandlers>();
 const main: StateDTO["main"] = { sessionId: "M-1", state: "idle", wakesUsed: 2, wakesMax: 3, paused: false, pendingNotices: 1 };
 let setupDone = new URLSearchParams(location.search).get("setup") !== "1";
-let settings: SettingsDTO = { homePath: home, ompPath: null, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees` };
+let settings: SettingsDTO = { homePath: home, ompPath: null, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees`, appearance: { theme: "system", accent: "amber", textSize: "default", density: "comfortable" } };
+const catalog: ModelCatalogDTO = {
+	defaultModel: "anthropic/claude-opus-5-5", fetchedAt: now, error: null,
+	models: [
+		{ selector: "anthropic/claude-opus-5-5", provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5", contextWindow: 1000000, maxTokens: 128000, reasoning: true, thinking: ["low", "medium", "high", "xhigh", "max"], input: ["text", "image"], cost: { input: 5, output: 25 } },
+		{ selector: "anthropic/claude-sonnet-4-6", provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", contextWindow: 1000000, maxTokens: 64000, reasoning: true, thinking: ["low", "medium", "high"], input: ["text", "image"], cost: { input: 3, output: 15 } },
+		{ selector: "anthropic/claude-haiku-3", provider: "anthropic", id: "claude-haiku-3", name: "Claude Haiku 3", contextWindow: 200000, maxTokens: 4096, reasoning: false, thinking: [], input: ["text", "image"], cost: { input: 0.25, output: 1.25 } },
+		{ selector: "openai-codex/gpt-6-astra", provider: "openai-codex", id: "gpt-6-astra", name: "GPT-6 Astra", contextWindow: 1000000, maxTokens: 128000, reasoning: true, thinking: ["low", "medium", "high", "xhigh"], input: ["text", "image"], cost: { input: 5, output: 30 } },
+		{ selector: "openai-codex/gpt-5.3-codex", provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 400000, maxTokens: 128000, reasoning: true, thinking: ["low", "medium", "high", "xhigh"], input: ["text", "image"], cost: { input: 1.75, output: 14 } },
+	],
+};
 const workspaces: WorkspaceDTO[] = ["atlas", "console"].map((id, index) => ({ id, name: index ? "Console" : "Atlas", repoPath: `${root}/${id}`, defaultBase: "main", workerModel: null, notesPath: `${home}/repos/${id}.md`, recipePath: `${home}/repos/${id}.env.yaml`, recipeStatus: index ? "missing" : "ok", liveSessions: 1, totalSessions: 1, openTasks: index ? 1 : 3, archived: false }));
 const escalation: EscalationDTO = { id: "E-3", taskId: "T-12", taskTitle: "Choose the account migration strategy", sessionId: "W-12", reason: "The account migration removes a legacy column. I need your approval before changing the data contract.", openedBy: "main", openedAt: now - 180000, seenAt: null, resolvedAt: null, resolution: null };
 const decisions: DecisionDTO[] = [{ id: "D-7", taskId: "T-11", at: now - 420000, summary: "Keep the search index local to each worktree", why: "Isolation makes parallel tests deterministic and avoids shared writes.", revert: "Point SEARCH_DB at the shared development index and restart the service.", reverts: null, revertRequestedAt: null, revertedBy: null }, { id: "D-6", taskId: "T-9", at: now - 3600000, summary: "Use the existing retry policy for transient reads", why: "The established boundary already distinguishes transient errors.", revert: "Revert commit a1b2c3d on task/search-timeouts.", reverts: null, revertRequestedAt: null, revertedBy: null }];
@@ -103,7 +113,15 @@ window.setInterval(() => {
 				if (id === "preview") { const homePath = url.searchParams.get("home") ?? home; return response({ homePath, exists: true, isGitRepo: true, changes: [{ path: "AGENTS.md", action: "backup", reason: "Preserve your current instructions before migration." }, { path: "AGENTS.md", action: "replace", reason: "Add the main chat workflow and workspace registry." }, { path: "repos/", action: "create", reason: "Store workspace notes and environment recipes." }], pstackCandidates: [`${root}/pstack`] } satisfies SetupPreview); }
 				settings.homePath = text(body, "homePath", home); settings.pstackRoot = body.pstackRoot === null ? null : text(body, "pstackRoot"); setupDone = true; invalidate(["state", "settings"]); return response(state());
 			}
-			if (route === "settings") { if (method === "PUT") { settings = { ...settings, ...body } as SettingsDTO; main.wakesMax = settings.maxAutoWakes; invalidate(["settings", "state"]); } return response(settings); }
+			if (route === "models") { if (url.searchParams.get("refresh") === "1") catalog.fetchedAt = Date.now(); return response(catalog); }
+			if (route === "settings") {
+				if (method === "PUT") {
+					const nextAppearance = body.appearance === undefined ? settings.appearance : { ...settings.appearance, ...bodySchema.parse(body.appearance) };
+					settings = { ...settings, ...body, appearance: nextAppearance } as SettingsDTO;
+					main.wakesMax = settings.maxAutoWakes; invalidate(["settings", "state"]);
+				}
+				return response(settings);
+			}
 			if (route === "main") { main.state = "idle"; main.paused = false; main.wakesUsed = 0; main.pendingNotices = 0; if (id === "new") { const old = sessions.find(session => session.id === main.sessionId); if (old) { old.retired = true; old.state = "cold"; } main.sessionId = `M-${sessions.length + 1}`; sessions.unshift({ ...sessions[0], id: main.sessionId, state: "idle", retired: false, createdAt: Date.now() }); } invalidate(["state", "sessions", "inbox"]); return response(state()); }
 			if (route === "inbox") return response({ main, escalations: escalation.resolvedAt === null ? [escalation] : [] });
 			if (route === "escalations") { if (action === "seen") escalation.seenAt = Date.now(); else { escalation.resolvedAt = Date.now(); escalation.resolution = "dismissed"; } invalidate(["inbox", "state", "task:T-12"]); return response(escalation); }

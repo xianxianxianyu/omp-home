@@ -9,6 +9,7 @@
  *   GET  /api/state                         → StateDTO
  *   GET  /api/settings                      → SettingsDTO
  *   PUT  /api/settings        SettingsPatch → SettingsDTO
+ *   GET  /api/models          ?refresh=1    → ModelCatalogDTO    (omp's chat models for the configured omp; refresh re-queries providers)
  *   POST /api/setup           SetupRequest  → StateDTO           (first run; idempotent)
  *   GET  /api/setup/preview   ?home=<path>  → SetupPreview
  *   GET  /api/tasks           ?status&workspace&q → TaskSummary[]  (status=open: pending|working|awaiting; status=closed: done|cancelled)
@@ -280,13 +281,31 @@ export interface StateDTO {
 	omp: OmpDTO;
 }
 
+/** omp's thinking levels, lowest to highest. A model accepts "off" plus the levels in its ModelDTO.thinking. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export const THEMES = ["system", "dark", "light"] as const;
+export const ACCENTS = ["amber", "blue", "green", "violet", "rose", "graphite"] as const;
+export const TEXT_SIZES = ["small", "default", "large"] as const;
+export const DENSITIES = ["comfortable", "compact"] as const;
+
+/** How the UI looks. Stored with the hub settings: the app's page origin changes every launch, so localStorage cannot hold it. */
+export interface AppearanceDTO {
+	theme: (typeof THEMES)[number];
+	accent: (typeof ACCENTS)[number];
+	textSize: (typeof TEXT_SIZES)[number];
+	density: (typeof DENSITIES)[number];
+}
+
 export interface SettingsDTO {
 	homePath: string;
 	pstackRoot: string | null;
+	/** omp model selectors ("provider/id"); null = omp's own default (ModelCatalogDTO.defaultModel). */
 	mainModel: string | null;
-	mainThinking: string;
+	mainThinking: ThinkingLevel;
 	workerModel: string | null;
-	workerThinking: string;
+	workerThinking: ThinkingLevel;
 	dispatcherModel: string | null;
 	maxLiveWorkers: number;
 	idleEvictMinutes: number;
@@ -295,9 +314,36 @@ export interface SettingsDTO {
 	worktreeRoot: string | null;
 	/** Explicit omp binary; null = managed copy, else PATH. */
 	ompPath: string | null;
+	appearance: AppearanceDTO;
 }
 
-export type SettingsPatch = Partial<Omit<SettingsDTO, "homePath">>;
+export type SettingsPatch = Partial<Omit<SettingsDTO, "homePath" | "appearance">> & { appearance?: Partial<AppearanceDTO> };
+
+/** One entry of `omp models --json` (chat kind). */
+export interface ModelDTO {
+	/** What omp's --model takes and what settings store: "provider/id". */
+	selector: string;
+	provider: string;
+	id: string;
+	name: string;
+	contextWindow: number | null;
+	maxTokens: number | null;
+	reasoning: boolean;
+	/** Thinking levels the model supports besides "off"; empty when it has no reasoning. */
+	thinking: ThinkingLevel[];
+	input: string[];
+	/** USD per million tokens; null when omp has no pricing. */
+	cost: { input: number; output: number } | null;
+}
+
+export interface ModelCatalogDTO {
+	models: ModelDTO[];
+	/** omp's `modelRoles.default` (selector, thinking suffix stripped), used when a role's model is null. */
+	defaultModel: string | null;
+	fetchedAt: number;
+	/** Set when omp could not list models (omp missing, provider error); models may then be empty. */
+	error: string | null;
+}
 
 export interface SetupPreview {
 	homePath: string;

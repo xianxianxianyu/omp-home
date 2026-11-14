@@ -7,17 +7,12 @@ import { Button, ErrorState, Field, Loading, Section, Status } from "../ui.tsx";
 import { notificationPermission } from "../native.ts";
 import type { NotificationState } from "../native.ts";
 
-type SettingsValues = { [Key in Exclude<keyof SettingsDTO, "homePath" | "portRange">]: string } & { portStart: string; portEnd: string };
+type SettingsValues = { [Key in "ompPath" | "pstackRoot" | "worktreeRoot" | "maxLiveWorkers" | "idleEvictMinutes" | "maxAutoWakes" | "portStart" | "portEnd"]: string };
 
 function formValues(settings: SettingsDTO): SettingsValues {
 	return {
 		ompPath: settings.ompPath ?? "",
 		pstackRoot: settings.pstackRoot ?? "",
-		mainModel: settings.mainModel ?? "",
-		mainThinking: settings.mainThinking,
-		workerModel: settings.workerModel ?? "",
-		workerThinking: settings.workerThinking,
-		dispatcherModel: settings.dispatcherModel ?? "",
 		maxLiveWorkers: String(settings.maxLiveWorkers),
 		idleEvictMinutes: String(settings.idleEvictMinutes),
 		maxAutoWakes: String(settings.maxAutoWakes),
@@ -31,7 +26,7 @@ export function SettingsPanel() {
 	const { data, error, loading, reload } = useResource<SettingsDTO>("settings", "/api/settings");
 	return (
 		<div className="stack">
-			<div className="panel-heading"><div><h2>General</h2><p className="muted">Configure models, worker capacity, and local paths.</p></div></div>
+			<div className="panel-heading"><div><h2>General</h2><p className="muted">Configure worker capacity and local paths.</p></div></div>
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data && <SettingsForm settings={data} />}
@@ -39,8 +34,6 @@ export function SettingsPanel() {
 		</div>
 	);
 }
-
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 function SettingsForm({ settings }: { settings: SettingsDTO }) {
 	const { mutate, toast } = useHub();
@@ -67,11 +60,6 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 		const patch: SettingsPatch = {
 			ompPath: values.ompPath.trim() || null,
 			pstackRoot: values.pstackRoot.trim() || null,
-			mainModel: values.mainModel.trim() || null,
-			mainThinking: values.mainThinking.trim(),
-			workerModel: values.workerModel.trim() || null,
-			workerThinking: values.workerThinking.trim(),
-			dispatcherModel: values.dispatcherModel.trim() || null,
 			maxLiveWorkers: Number(values.maxLiveWorkers),
 			idleEvictMinutes: Number(values.idleEvictMinutes),
 			maxAutoWakes: Number(values.maxAutoWakes),
@@ -81,7 +69,7 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 		try {
 			const saved = await mutate<SettingsDTO>("/api/settings", patch, "PUT");
 			setForm({ values: formValues(saved), dirty: false });
-			toast("Settings saved. Model changes apply to the next spawn.");
+			toast("Settings saved.");
 		} catch (failure) {
 			setError(failure instanceof Error ? failure.message : "Could not save settings.");
 			if (failure instanceof ApiError) setErrors(failure.errors);
@@ -100,16 +88,6 @@ function SettingsForm({ settings }: { settings: SettingsDTO }) {
 				<Field label="Worktree root" hint="Leave blank to use the default worktree location.">
 					<input value={values.worktreeRoot} onChange={(event) => change("worktreeRoot", event.target.value)} placeholder="Default location" disabled={saving} />
 				</Field>
-			</Section>
-			<Section title="Models and thinking">
-				<p className="hint">Model and thinking changes apply to the next spawn, not to running sessions. Leave a model blank to use its default.</p>
-				<div className="two-col">
-					<Field label="Main model"><input value={values.mainModel} onChange={(event) => change("mainModel", event.target.value)} placeholder="provider/model" disabled={saving} /></Field>
-					<Field label="Main thinking"><select value={values.mainThinking} onChange={(event) => change("mainThinking", event.target.value)} disabled={saving}>{THINKING_LEVELS.map((level) => <option key={level} value={level}>{level}</option>)}</select></Field>
-					<Field label="Worker model"><input value={values.workerModel} onChange={(event) => change("workerModel", event.target.value)} placeholder="provider/model" disabled={saving} /></Field>
-					<Field label="Worker thinking"><select value={values.workerThinking} onChange={(event) => change("workerThinking", event.target.value)} disabled={saving}>{THINKING_LEVELS.map((level) => <option key={level} value={level}>{level}</option>)}</select></Field>
-					<Field label="Dispatcher model"><input value={values.dispatcherModel} onChange={(event) => change("dispatcherModel", event.target.value)} placeholder="provider/model" disabled={saving} /></Field>
-				</div>
 			</Section>
 			<Section title="Worker capacity and wake budget">
 				<div className="two-col">
