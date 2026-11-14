@@ -30,7 +30,7 @@ Running agents on several repositories at once means juggling terminals, re-expl
 
 ## Features
 
-|  |  |
+| Feature | What it does |
 | --- | --- |
 | 🧭 **Intent routing** | Related tasks and past messages are looked up before every dispatch. The main chat chooses the workspace, a new or reused worktree, and the pstack playbook (bug fix, feature, investigation, …). |
 | 🌳 **Worktree per task** | Every task gets `<repo>.worktrees/<branch>` and a worker session from a capped pool. Idle workers are stopped and resumed later from their transcript. |
@@ -77,7 +77,7 @@ Running agents on several repositories at once means juggling terminals, re-expl
 ## How it works
 
 ```mermaid
-flowchart LR
+flowchart TB
   You -->|composer| Main["Main chat<br/>(omp, RPC)"]
   Main -- "task · agent=dispatcher" --> Dispatcher
   Dispatcher -- home_dispatch --> Hub[("Hub<br/>SQLite ledger")]

@@ -30,7 +30,7 @@
 
 ## 功能
 
-|  |  |
+| 功能 | 说明 |
 | --- | --- |
 | 🧭 **意图路由** | 每次派发前都会检索相关任务和过往消息。主聊天决定用哪个仓库、新开还是沿用 worktree、走哪个 pstack 流程（修 bug、新功能、调查……）。 |
 | 🌳 **每个任务一个 worktree** | 每个任务得到 `<repo>.worktrees/<branch>` 和进程池里的一个 worker 会话；池子有上限，空闲的 worker 会被停掉，用到时再从记录恢复。 |
@@ -77,7 +77,7 @@
 ## 工作原理
 
 ```mermaid
-flowchart LR
+flowchart TB
   You["你"] -->|输入框| Main["主聊天<br/>(omp, RPC)"]
   Main -- "task · agent=dispatcher" --> Dispatcher
   Dispatcher -- home_dispatch --> Hub[("Hub<br/>SQLite 任务台账")]
