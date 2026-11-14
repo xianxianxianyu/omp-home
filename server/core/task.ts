@@ -1,6 +1,7 @@
 import type { Language, ProcState, TaskProgress, TaskStatus, WaitKind } from "../../shared/api.ts";
 import type { StopReason } from "../../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../../shared/tools.ts";
+import type { RetireReason } from "./worktree.ts";
 import { taskMessages } from "../i18n-task.ts";
 import { type Message, render } from "../i18n.ts";
 
@@ -24,14 +25,16 @@ export interface TaskState {
 	runOpen: boolean;
 	/** The report filed during the open run; applied when the run ends. */
 	runReport: Report | null;
+	/** Accepted, cancelled or merged, and not reopened since: only a settled task lets the hub retire its worktree. */
+	settled: boolean;
 }
 export type ProvisionStep = "checkout" | "env" | "session";
 export type EscalationResolution = "human_replied" | "task_moved" | "dismissed";
 
 export type TaskEvent =
-	| { kind: "created"; title: string; workspace: string; checkout: CheckoutSpec; playbook: string | null; related: string[] }
+	| { kind: "created"; title: string; workspace: string; checkout: CheckoutSpec; playbook: string | null; related: string[]; worktree: string | null }
 	| { kind: "checked_out"; worktree: string; path: string; branch: string }
-	| { kind: "provisioned"; session: string; reusedSession: boolean }
+	| { kind: "provisioned"; session: string }
 	| { kind: "provision_failed"; step: ProvisionStep; message: string; messageText?: Message }
 	| { kind: "provision_retry"; text: string }
 	| { kind: "queued_for_capacity"; live: number; cap: number }
@@ -50,11 +53,14 @@ export type TaskEvent =
 	| { kind: "decided"; decision: string; summary: string; summaryMessage?: Message; revertMessage?: Message }
 	| { kind: "accepted"; reason: string; decision: string | null }
 	| { kind: "cancelled"; by: "main" | "human"; reason: string; reasonMessage?: Message }
-	| { kind: "cleaned_up" };
+	/** The human merged the branch into the base: acceptance. */
+	| { kind: "merged"; branch: string; into: string; sha: string }
+	/** The hub removed the worktree; `sha` was the branch tip (recoverable until git gc), null when the branch was already gone or kept. */
+	| { kind: "worktree_retired"; reason: RetireReason; branch: string; sha: string | null; branchDeleted: boolean };
 
 export type TaskEventKind = TaskEvent["kind"];
 
-export const INITIAL: TaskState = { status: { s: "pending" }, runOpen: false, runReport: null };
+export const INITIAL: TaskState = { status: { s: "pending" }, runOpen: false, runReport: null, settled: false };
 const WORKING: Status = { s: "working" };
 const awaiting = (kind: WaitKind, text: string | Message): Status => ({
 	s: "awaiting",
@@ -83,6 +89,13 @@ function stopStatus(e: Extract<TaskEvent, { kind: "run_ended" }>, progress: Repo
 }
 
 export function foldTask(t: TaskState, e: TaskEvent): TaskState {
+	const next = advance(t, e);
+	// Closing settles; anything that reopens the task (a run, a message, human input) unsettles it.
+	const settled = e.kind === "accepted" || e.kind === "cancelled" || e.kind === "merged" ? true : isTerminal(next.status) ? t.settled : false;
+	return { ...next, settled };
+}
+
+function advance(t: TaskState, e: TaskEvent): TaskState {
 	switch (e.kind) {
 		case "created":
 			return INITIAL;
@@ -93,7 +106,7 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 		case "delivered":
 			return t.status.s === "pending" ? { ...t, status: WORKING } : t;
 		case "run_started":
-			return { status: t.status.s === "cancelled" ? t.status : WORKING, runOpen: true, runReport: null };
+			return { ...t, status: t.status.s === "cancelled" ? t.status : WORKING, runOpen: true, runReport: null };
 		case "reported": {
 			const report: Report = { status: e.status, summary: e.summary, details: e.details };
 			if (t.runOpen) return { ...t, runReport: report };
@@ -102,7 +115,7 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 		}
 		case "run_ended":
 			if (isTerminal(t.status)) return { ...t, runOpen: false, runReport: null };
-			return { status: applyReport(t.runReport) ?? stopStatus(e, t.runReport), runOpen: false, runReport: null };
+			return { ...t, status: applyReport(t.runReport) ?? stopStatus(e, t.runReport), runOpen: false, runReport: null };
 		case "approval_requested":
 			return isTerminal(t.status) ? t : { ...t, status: awaiting("approval", taskMessages.waitApproval(e.tool, e.summary)) };
 		case "approval_resolved":
@@ -112,12 +125,14 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 		case "message_sent":
 			return t.status.s === "pending" ? t : { ...t, status: WORKING };
 		case "process_lost":
-			if (t.status.s === "working" || isWaiting(t.status, "approval")) return { status: awaiting("interrupted", e.reasonMessage ?? e.reason), runOpen: false, runReport: null };
+			if (t.status.s === "working" || isWaiting(t.status, "approval")) return { ...t, status: awaiting("interrupted", e.reasonMessage ?? e.reason), runOpen: false, runReport: null };
 			return { ...t, runOpen: false, runReport: null };
 		case "accepted":
 			return { ...t, status: { s: "done" } };
 		case "cancelled":
 			return { ...t, status: { s: "cancelled" } };
+		case "merged":
+			return t.status.s === "cancelled" ? t : { ...t, status: { s: "done" } };
 		default:
 			return t;
 	}
@@ -136,7 +151,8 @@ export type NoticeKind =
 	| "queued"
 	| "human_replied"
 	| "policy_blocked"
-	| "cancelled";
+	| "cancelled"
+	| "merged";
 export type Priority = "urgent" | "normal" | "info";
 
 /** One table for every notice: how loud it is, and whether the hub escalates it to the human itself. */
@@ -155,6 +171,7 @@ export const NOTICE_POLICY: Record<NoticeKind, { priority: Priority; autoEscalat
 	human_replied: { priority: "info", autoEscalate: false },
 	policy_blocked: { priority: "info", autoEscalate: false },
 	cancelled: { priority: "info", autoEscalate: false },
+	merged: { priority: "info", autoEscalate: false },
 };
 
 const WAIT_NOTICE: Record<WaitKind, NoticeKind> = {
@@ -172,6 +189,8 @@ export function noticeFor(before: TaskState, after: TaskState, e: TaskEvent): No
 	switch (e.kind) {
 		case "accepted":
 			return null;
+		case "merged":
+			return "merged";
 		case "cancelled":
 			return e.by === "human" ? "cancelled" : null;
 		case "queued_for_capacity":
@@ -202,16 +221,21 @@ export function escalationResolution(e: TaskEvent): EscalationResolution | null 
 			return e.by === "human" ? "human_replied" : "task_moved";
 		case "accepted":
 		case "cancelled":
-		case "cleaned_up":
+		case "merged":
+		case "worktree_retired":
 			return "task_moved";
 		default:
 			return null;
 	}
 }
 
+/** Where a worker runs: its own branch's worktree, or the human's main checkout read-only or editing (git read-only in both). */
+export type Lane = "branch" | "main" | "main_edit";
+
 export interface EnvelopeInput {
-	task: { id: string; title: string; playbook: string | null; continues: string | null };
-	where: { workspace: string; path: string; branch: string | null; base: string | null; readonly: boolean; protectedBranches: string[] };
+	/** `earlier`: tasks that ran on the same branch before this one. */
+	task: { id: string; title: string; playbook: string | null; earlier: string[] };
+	where: { workspace: string; path: string; branch: string | null; base: string | null; lane: Lane; protectedBranches: string[] };
 	env: { vars: Record<string, string>; services: string[]; pools: string[]; test: Record<string, string> };
 	pstack: boolean;
 }
@@ -219,12 +243,17 @@ export interface EnvelopeInput {
 /** The hub-written header of a worker's first prompt (followed by `---` and the brief): facts the dispatcher does not know. */
 export function renderEnvelope(i: EnvelopeInput): string {
 	const lines = [`[omp-home task ${i.task.id} · ${i.task.title}]`];
-	if (i.where.readonly) {
-		lines.push(`Where: ${i.where.workspace} · main checkout ${i.where.path} · read-only investigation: do not edit, commit or switch branches here.`);
+	if (i.where.lane === "main") {
+		lines.push(`Where: ${i.where.workspace} · main checkout ${i.where.path} · read-only investigation: do not edit files; git is read-only here.`);
+	} else if (i.where.lane === "main_edit") {
+		lines.push(
+			`Where: ${i.where.workspace} · main checkout ${i.where.path} · you may edit files; leave them uncommitted for the human. Git is read-only here: no commit, add, stash, switch, reset or restore.`,
+		);
 	} else {
 		lines.push(`Where: ${i.where.workspace} · ${i.where.path} · branch ${i.where.branch ?? "(detached)"}${i.where.base ? ` (base ${i.where.base})` : ""}`);
+		lines.push("Commit your work on this branch before reporting done; the human reviews and merges it, then the hub removes the worktree.");
 	}
-	if (i.task.continues) lines.push(`Continues: ${i.task.continues} in the same worktree; its commits and files are already here.`);
+	if (i.task.earlier.length) lines.push(`Earlier on this branch: ${i.task.earlier.join(", ")} (their commits are here).`);
 	const env = Object.entries(i.env.vars).map(([k, v]) => `${k}=${v}`);
 	const envParts = [
 		env.length ? env.join(" ") : "none",
@@ -244,8 +273,9 @@ export function renderEnvelope(i: EnvelopeInput): string {
 		lines.push("Workflow: read skill://pstack-omp and skill://home-worker first.");
 	}
 	const protectedList = i.where.protectedBranches.length ? i.where.protectedBranches.join(", ") : "the base branch";
+	const gitRule = i.where.lane === "branch" ? `no git push, no merge into protected branches (${protectedList}), no branch deletion` : "git is read-only in the main checkout";
 	lines.push(
-		`Rules: no git push, no merge into protected branches (${protectedList}), no branch deletion; these are blocked. No interactive questions: call home_report({status:"question"}) and end your turn with the question.`,
+		`Rules: ${gitRule}; these are blocked. No interactive questions: call home_report({status:"question"}) and end your turn with the question.`,
 		"Report: call home_report before ending each turn (done | blocked | question | progress).",
 	);
 	return lines.join("\n");

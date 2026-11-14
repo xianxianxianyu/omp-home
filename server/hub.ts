@@ -11,10 +11,9 @@ import { progressPhase } from "./core/task.ts";
 import { Db } from "./db.ts";
 import { Env } from "./env.ts";
 import { errorMessage, errorText, HubError } from "./errors.ts";
-import { removeWorktree, worktreeStatus, Worktrees } from "./git.ts";
 import { messages, render, type Message } from "./i18n.ts";
 import { Indexer } from "./indexer.ts";
-import { isOpen, Ledger, waitOf, type ApplyResult, type DecisionRow, type EscalationRow, type TaskRow } from "./ledger.ts";
+import { Ledger, waitOf, type ApplyResult, type DecisionRow, type EscalationRow, type TaskRow } from "./ledger.ts";
 import { Notifier } from "./notify.ts";
 import type { OmpManager } from "./omp.ts";
 import { Pool, type ExitInfo, type SessionRow } from "./pool.ts";
@@ -29,7 +28,8 @@ import { SettingsStore } from "./settings.ts";
 import { createTools } from "./tools.ts";
 import { answerEvent, responseFits } from "./transcript.ts";
 import type { UiChannel } from "./ui.ts";
-import { Workspaces } from "./workspaces.ts";
+import { Workspaces, type WorkspaceRow } from "./workspaces.ts";
+import { WorktreeLifecycle, Worktrees } from "./worktrees.ts";
 
 export interface HubOptions {
 	home: string;
@@ -41,6 +41,7 @@ export interface HubOptions {
 }
 
 const TICK_MS = 30_000;
+const SWEEP_MS = 5 * 60_000;
 
 /**
  * Composition root for one home: owns every module and is the one place where a
@@ -55,6 +56,7 @@ export class Hub {
 	readonly indexer: Indexer;
 	readonly workspaces: Workspaces;
 	readonly worktrees: Worktrees;
+	readonly lifecycle: WorktreeLifecycle;
 	readonly env: Env;
 	readonly recipeChecks: RecipeChecks;
 	readonly pool: Pool;
@@ -68,6 +70,7 @@ export class Hub {
 	readonly #log: (message: string) => void;
 	readonly #callTool: (session: SessionRow, frame: CallFrame) => Promise<CallResult>;
 	#tick: NodeJS.Timeout | undefined;
+	#sweepTimer: NodeJS.Timeout | undefined;
 	#stopping = false;
 
 	constructor(opts: HubOptions) {
@@ -114,6 +117,18 @@ export class Hub {
 				this.changed("state", "inbox");
 			},
 		});
+		this.lifecycle = new WorktreeLifecycle({
+			db: this.db,
+			worktrees: this.worktrees,
+			ledger: this.ledger,
+			pool: this.pool,
+			env: this.env,
+			workspaces: this.workspaces,
+			settings: this.settings,
+			applied: (taskId, r) => this.afterApply(taskId, r),
+			changed: (...topics) => this.changed(...topics),
+			log: this.#log,
+		});
 		this.#callTool = createTools(this);
 		this.bridge = new Bridge({
 			pool: this.pool,
@@ -127,7 +142,7 @@ export class Hub {
 			db: this.db,
 			ledger: this.ledger,
 			workspaces: this.workspaces,
-			worktrees: this.worktrees,
+			lifecycle: this.lifecycle,
 			env: this.env,
 			pool: this.pool,
 			settings: this.settings,
@@ -152,7 +167,6 @@ export class Hub {
 			const r = this.ledger.apply(task.id, { kind: "process_lost", reason: reasonMessage.en, reasonMessage }, "hub", `lost:${session.id}:${session.incarnation}`);
 			this.afterApply(task.id, r);
 		}
-		this.worktrees.reconcile();
 		this.db.run("UPDATE lease SET released_at = ? WHERE holder_kind = 'session' AND released_at IS NULL", Date.now());
 		this.env.releaseExpired();
 		await this.recipeChecks.reconcile();
@@ -164,6 +178,8 @@ export class Hub {
 			this.pool.ensureLive(session_id, { human: false });
 		}
 		this.provisioner.kick();
+		this.lifecycle.resume();
+		this.#sweepTimer = setInterval(() => this.lifecycle.kick(), SWEEP_MS);
 		this.notifier.evaluate();
 		this.#tick = setInterval(() => {
 			this.env.releaseExpired();
@@ -175,9 +191,10 @@ export class Hub {
 	async stop(): Promise<void> {
 		this.#stopping = true;
 		clearInterval(this.#tick);
+		clearInterval(this.#sweepTimer);
 		this.notifier.stop();
 		this.#progress.stop();
-		await Promise.race([this.provisioner.idle(), sleep(5000)]);
+		await Promise.race([Promise.all([this.provisioner.idle(), this.lifecycle.idle()]), sleep(5000)]);
 		await Promise.all([this.recipeChecks.stop(), this.pool.stopAll()]);
 		this.bridge.closeAll();
 		this.db.close();
@@ -318,6 +335,8 @@ export class Hub {
 		this.changed("tasks", `task:${taskId}`, "state", "inbox", "sessions");
 		const task = this.ledger.mustTask(taskId);
 		this.#progress.observe(taskId, this.progressOf(task));
+		// A task that just settled may let the hub retire its branch.
+		if (r.after.settled && !r.before.settled && task.worktree_id) this.lifecycle.kick(task.workspace_id);
 	}
 
 	/** A process state changed somewhere: open tasks whose worker phase moved refresh the in-flight list. */
@@ -348,11 +367,50 @@ export class Hub {
 
 	// ── cross-owner actions (tools and HTTP share these) ────────────────────
 
+	/** home_dispatch: check the checkout against git, then claim the branch and create the task in one transaction. */
+	async dispatchTask(input: {
+		title: string;
+		workspace: WorkspaceRow;
+		checkout: CheckoutSpec;
+		playbook: string | null;
+		brief: string;
+		related: string[];
+		dispatchKey: string;
+	}): Promise<{ task: TaskRow; created: boolean; where: string }> {
+		const existing = this.ledger.dispatched(input.dispatchKey);
+		if (existing) return { task: existing, created: false, where: "" };
+		const ws = input.workspace;
+		const target = await this.lifecycle.resolve(ws, input.checkout);
+		const { task, created } = this.db.tx(() => {
+			const again = this.ledger.dispatched(input.dispatchKey);
+			if (again) return { task: again, created: false };
+			const wt = target.lane === "branch" ? this.lifecycle.claim(ws, target) : null;
+			return this.ledger.createTask({
+				title: input.title,
+				workspaceId: ws.id,
+				checkout: target.spec,
+				worktreeId: wt?.id ?? null,
+				playbook: input.playbook,
+				brief: input.brief,
+				related: input.related,
+				dispatchKey: input.dispatchKey,
+				actor: "dispatcher",
+			});
+		});
+		if (created) {
+			this.indexer.brief(task);
+			this.provisioner.kick();
+			this.changed("tasks", `task:${task.id}`, "state", "workspaces");
+		}
+		return { task, created, where: target.where };
+	}
+
 	/** home_send: one outbox prompt to the task's worker, resuming it if cold. */
 	sendToTask(input: { taskId: string; text: string; mode: "next" | "now"; decision: { why: string; revert: string } | null; dedupe: string }): { text: string; decision: string | null } {
 		const task = this.ledger.mustTask(input.taskId);
 		if (task.status === "cancelled") {
-			throw new HubError("conflict", `${task.id} is cancelled; dispatch a new task with checkout {kind:"continue", task:"${task.id}"} to pick it up`);
+			const branch = this.branchOf(task.worktree_id);
+			throw new HubError("conflict", `${task.id} is cancelled; dispatch a new task${branch ? ` on branch ${branch}` : ""} to pick it up`);
 		}
 		const wait = waitOf(task);
 		if ((wait?.kind === "question" || wait?.kind === "blocked") && !input.decision) {
@@ -409,7 +467,7 @@ export class Hub {
 			return null;
 		}
 		const session = this.pool.must(task.session_id);
-		if (session.retired_at !== null) throw new HubError("conflict", messages.taskRetired(task.id, session.id));
+		if (!this.pool.admits(session)) throw new HubError("conflict", messages.taskRetired(task.id, session.id));
 		const other = this.ledger.openForSession(session.id);
 		if (other && other.id !== task.id) throw new HubError("conflict", messages.otherTask(session.id, other.id));
 		return session;
@@ -417,13 +475,16 @@ export class Hub {
 
 	// ── sessions: what the UI does to one omp session ────────────────────────
 
-	/** A UI prompt: starts a cold session (human admission), then counts as human input once omp accepts it. */
+	/**
+	 * A UI prompt: starts a cold session (human admission). It counts as human input before it is
+	 * sent, so the task is reopened (unsettled) before anything else can retire its worktree.
+	 */
 	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>): Promise<void> {
 		const session = this.#activeSession(id);
 		this.pool.ensureLive(id, { human: true });
+		this.#humanInput(session, text);
 		// streamingBehavior only applies while a run streams; when idle the prompt starts a turn.
 		await this.#command(id, "prompt", { message: text, streamingBehavior: mode === "steer" ? "steer" : "followUp" });
-		this.#humanInput(session, text);
 	}
 
 	async abort(id: string): Promise<void> {
@@ -462,16 +523,18 @@ export class Hub {
 		}
 	}
 
-	/** WS stream: start the session if cold (human admission), then `reset` and increments. Throws HubError when no slot is free. */
+	/**
+	 * WS stream: start the session if cold (human admission), then `reset` and increments. A retired
+	 * session is read-only: its transcript is shown, no process starts. Throws HubError when no slot is free.
+	 */
 	stream(id: string, send: (ev: TranscriptEvent) => void, language: Language = "en"): () => void {
-		const session = this.pool.must(id);
-		if (session.retired_at === null) this.pool.ensureLive(id, { human: true });
+		if (this.pool.admits(this.pool.must(id))) this.pool.ensureLive(id, { human: true });
 		return this.views.subscribe(id, send, language);
 	}
 
 	#activeSession(id: string): SessionRow {
 		const session = this.pool.must(id);
-		if (session.retired_at !== null) throw new HubError("conflict", messages.retired(id));
+		if (!this.pool.admits(session)) throw new HubError("conflict", messages.retired(id));
 		return session;
 	}
 
@@ -552,36 +615,6 @@ export class Hub {
 		return { escalation, created, started };
 	}
 
-	/** Human-only: tear down the environment, remove the worktree (branch kept), retire the session. */
-	async cleanupTask(taskId: string): Promise<void> {
-		const task = this.ledger.mustTask(taskId);
-		if (isOpen(task.status)) throw new HubError("conflict", messages.cleanupOpenTask(task.id, task.status));
-		if (task.worktree_id) {
-			const openOnWorktree = this.ledger.tasksForWorktree(task.worktree_id).filter(t => isOpen(t.status));
-			const continuing = this.db.all<{ id: string }>(
-				"SELECT t.id FROM task t JOIN task_link l ON l.task_id = t.id WHERE l.other_id = ? AND l.kind = 'continues' AND t.status NOT IN ('done','cancelled')",
-				task.id,
-			);
-			const blockers = [...openOnWorktree.map(t => t.id), ...continuing.map(t => t.id)];
-			if (blockers.length) throw new HubError("conflict", messages.worktreeInUse(blockers.join(", ")));
-		}
-		if (task.session_id) {
-			const open = this.ledger.openForSession(task.session_id);
-			if (open) throw new HubError("conflict", messages.sessionOpenTask(task.session_id, open.id));
-			await this.pool.retire(task.session_id);
-		}
-		if (task.worktree_id) {
-			const wt = this.worktrees.get(task.worktree_id)!;
-			if (wt.state !== "removed") {
-				await this.env.teardown(wt.id);
-				if (fs.existsSync(wt.path)) await removeWorktree(this.workspaces.must(wt.workspace_id).repo_path, wt.path);
-				this.worktrees.markRemoved(wt.id);
-			}
-		}
-		this.afterApply(task.id, this.ledger.apply(task.id, { kind: "cleaned_up" }, "human", `cleanup:${task.id}`));
-		this.changed("resources", "workspaces");
-	}
-
 	/** Human asks main to undo a decision: a prompt to main, and the wake budget resets. */
 	revertDecision(id: string, language: Language = "en"): DecisionDTO {
 		const d = this.ledger.requestRevert(id);
@@ -660,7 +693,7 @@ export class Hub {
 	async taskDetail(id: string, events = 200, language: Language = "en"): Promise<TaskDetail> {
 		const t = this.ledger.mustTask(id);
 		const wt = t.worktree_id ? (this.worktrees.get(t.worktree_id) ?? null) : null;
-		const git = wt && wt.state === "ready" && fs.existsSync(wt.path) ? await worktreeStatus(wt.path, wt.base).catch(() => null) : null;
+		const worktree = wt ? await this.lifecycle.branch(wt.id, language) : null;
 		const envRow = wt ? this.env.envRow(wt.id) : undefined;
 		return {
 			...this.ledger.summary(t, wt?.branch ?? null, language),
@@ -668,13 +701,13 @@ export class Hub {
 			brief: t.brief,
 			envelope: t.envelope,
 			checkout: JSON.parse(t.checkout) as CheckoutSpec,
-			worktreePath: wt?.path ?? null,
+			worktreePath: wt?.state === "live" && fs.existsSync(wt.path) ? wt.path : null,
 			related: this.ledger.related(t.id),
 			reports: this.ledger.reports(t.id),
 			events: this.ledger.events(t.id, events).map(e => this.ledger.eventDTO(e, language)),
 			decisions: this.ledger.decisions(t.id).map(d => this.ledger.decisionDTO(d, language)),
 			escalations: this.ledger.escalations({ taskId: t.id }).map(e => this.ledger.escalationDTO(e, language)),
-			git,
+			worktree,
 			env: envRow ? this.env.envDTO(envRow, language) : null,
 		};
 	}

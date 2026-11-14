@@ -207,13 +207,18 @@ export class Pool {
 		return liveWorkers(this.#entries());
 	}
 
+	/** The one admission gate: every start, prompt, reopen and queue drain asks it. A retired session never runs again. */
+	admits(row: SessionRow): boolean {
+		return row.retired_at === null;
+	}
+
 	/**
 	 * Make a session's process live. Main always spawns; workers go through admission.
 	 * The human may exceed the cap by one; beyond that they are told to evict.
 	 */
 	ensureLive(id: string, opts: { human: boolean }): "live" | "starting" | "queued" {
 		const row = this.must(id);
-		if (row.retired_at !== null) throw new HubError("conflict", messages.sessionRetired(id));
+		if (!this.admits(row)) throw new HubError("conflict", messages.sessionRetired(id));
 		const live = this.#live.get(id);
 		if (live) {
 			if (live.proc.s === "stopping") {
@@ -255,7 +260,7 @@ export class Pool {
 			const id = this.#queue[0]!;
 			const row = this.session(id);
 			const live = this.#live.get(id);
-			if (!row || row.retired_at !== null || (live && live.proc.s !== "stopping")) {
+			if (!row || !this.admits(row) || (live && live.proc.s !== "stopping")) {
 				this.#queue.shift();
 				continue;
 			}
@@ -319,7 +324,7 @@ export class Pool {
 		let thinking: string;
 		if (row.kind === "worker") {
 			const ws = this.#d.workspaces.must(row.workspace_id!);
-			worker = { env: this.#d.envVars(row.worktree_id), protectedBranches: [ws.default_base], repoHooks: await hooksDir(row.cwd) };
+			worker = { env: this.#d.envVars(row.worktree_id), protectedBranches: [ws.default_base], repoHooks: await hooksDir(row.cwd), mainCheckout: row.worktree_id === null };
 			model = ws.worker_model ?? settings.workerModel;
 			thinking = settings.workerThinking;
 		} else {
@@ -327,6 +332,8 @@ export class Pool {
 			thinking = settings.mainThinking;
 		}
 		if (this.#live.get(row.id) !== live) return;
+		// Retired while the launch awaited: the gate holds here too.
+		if (!this.admits(this.must(row.id))) return void this.stop(row.id, "retire");
 		fs.mkdirSync(row.session_dir, { recursive: true });
 		const baseEnv: Record<string, string> = {};
 		for (const [k, v] of Object.entries(process.env)) {
@@ -531,12 +538,17 @@ export class Pool {
 		await this.stop(id, "evict");
 	}
 
-	async retire(id: string): Promise<void> {
-		this.must(id);
+	/** Retired from now on: synchronous, so the caller's transaction closes every start path before the process stops. */
+	markRetired(id: string): void {
 		this.#queue = this.#queue.filter(q => q !== id);
-		await this.stop(id, "retire");
 		this.#d.db.run("UPDATE session SET retired_at = coalesce(retired_at, ?) WHERE id = ?", Date.now(), id);
 		this.#changed();
+	}
+
+	async retire(id: string): Promise<void> {
+		this.must(id);
+		this.markRetired(id);
+		await this.stop(id, "retire");
 	}
 
 	async stopAll(): Promise<void> {

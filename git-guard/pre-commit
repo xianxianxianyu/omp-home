@@ -1,4 +1,8 @@
 #!/bin/sh
+if [ "$OMP_HOME_MAIN_CHECKOUT" = 1 ]; then
+	printf '%s\n' 'omp-home: this is the human'"'"'s main checkout; git is read-only here. Leave your edits uncommitted and report done.' >&2
+	exit 1
+fi
 if [ -n "$OMP_HOME_REPO_HOOKS" ] && [ -x "$OMP_HOME_REPO_HOOKS/pre-commit" ]; then
 	exec "$OMP_HOME_REPO_HOOKS/pre-commit" "$@"
 fi

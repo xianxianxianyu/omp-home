@@ -22,22 +22,29 @@ export function audienceOf(role: "main" | "worker", agent: AgentRef): Audience {
 	return agent.name === "dispatcher" ? "dispatcher" : "main_sub";
 }
 
-const checkout = z.discriminatedUnion("kind", [
+/** The one list of branch types; new branch names are `<type>/<kebab-slug>`. */
+export const BRANCH_TYPES = ["feat", "fix", "refactor", "perf", "test", "docs", "chore"] as const;
+
+const checkout = z.discriminatedUnion("lane", [
 	z
 		.object({
-			kind: z.literal("worktree"),
-			branch: z.string().min(1).max(100).optional().describe("Branch name; default task/<slug of title>."),
-			base: z.string().min(1).optional().describe("Base ref; default the workspace's default base."),
+			lane: z.literal("branch"),
+			branch: z
+				.string()
+				.min(3)
+				.max(100)
+				.describe(
+					`New work: ${BRANCH_TYPES.join("|")}/<kebab-slug>, e.g. "fix/cart-discount". Same feature later: the same name (the hub reuses its worktree). Any existing branch name works too.`,
+				),
+			base: z.string().min(1).optional().describe("Fork point for a new branch; default the workspace base."),
 		})
-		.describe("New worktree and branch, new worker session."),
+		.describe("Code changes. One branch = one worktree, reused by later tasks; removed by the hub after the human merges it."),
 	z
 		.object({
-			kind: z.literal("continue"),
-			task: z.string().describe("Earlier task id (T-n) whose worktree to continue in."),
-			session: z.enum(["reuse", "fresh"]).describe("reuse only when its conversation, uncommitted state or running processes matter."),
+			lane: z.literal("main"),
+			edit: z.boolean().optional().describe("true: may edit files (docs, notes); never commits. One editing task per workspace at a time."),
 		})
-		.describe("Same worktree as an earlier task."),
-	z.object({ kind: z.literal("readonly") }).describe("Read-only investigation in the workspace's main checkout."),
+		.describe("Research (read-only) or doc edits in the main checkout. No branch, nothing to clean up."),
 ]);
 
 export const TOOL_SPECS = {
@@ -71,7 +78,7 @@ export const TOOL_SPECS = {
 	home_dispatch: {
 		audience: ["dispatcher"],
 		description:
-			"Create a task and send it to a worker. The hub prepares the worktree, environment and session and returns immediately. Call exactly once.",
+			"Create a task and send it to a worker. The hub prepares the checkout, environment and a fresh session and returns immediately. Call exactly once.",
 		params: z.object({
 			title: z.string().min(2).max(80),
 			workspace: z.string(),

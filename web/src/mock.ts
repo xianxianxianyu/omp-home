@@ -1,6 +1,6 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeCheckDTO, RecipeCheckStep, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
+import type { BranchDTO, BranchesDTO, ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeCheckDTO, RecipeCheckStep, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { createMockSessions } from "./mock-sessions.ts";
@@ -53,16 +53,33 @@ function inspectRepo(path: string): RepoInspection {
 }
 const escalation: EscalationDTO = { id: "E-3", taskId: "T-12", taskTitle: "Choose the account migration strategy", sessionId: "W-12", reason: "The account migration removes a legacy column. I need your approval before changing the data contract.", openedBy: "main", openedAt: now - 180000, seenAt: null, resolvedAt: null, resolution: null };
 const decisions: DecisionDTO[] = [{ id: "D-7", taskId: "T-11", at: now - 420000, summary: "Keep the search index local to each worktree", why: "Isolation makes parallel tests deterministic and avoids shared writes.", revert: "Point SEARCH_DB at the shared development index and restart the service.", reverts: null, revertRequestedAt: null, revertedBy: null }, { id: "D-6", taskId: "T-9", at: now - 3600000, summary: "Use the existing retry policy for transient reads", why: "The established boundary already distinguishes transient errors.", revert: "Revert commit a1b2c3d on task/search-timeouts.", reverts: null, revertRequestedAt: null, revertedBy: null }];
+const branchFixtures: Record<string, Partial<BranchDTO> & { branch: string }> = {
+	"T-11": { branch: "feat/incremental-search", phase: "active", hold: "busy", ahead: 3, behind: 1 },
+	"T-12": { branch: "feat/account-migration", phase: "active", hold: "busy" },
+	"T-13": { branch: "test/import-boundaries", phase: "active", hold: "busy" },
+	"T-9": { branch: "fix/search-timeouts", phase: "retired", retired: { reason: "merged", at: now - 180000, sha: "7f3a95b8c912e6d409a1bd24f57f0c2d383f1b42", branchDeleted: true } },
+	"T-15": { branch: "fix/cart-discount", hold: "unaccepted", ahead: 2, behind: 5, stale: true, upstreamGone: true },
+	"T-16": { branch: "feat/sleep-share", phase: "merged", hold: "dirty", ahead: 0 },
+	"T-17": { branch: "fix/oversell", phase: "merged", hold: "locked", kept: true, ahead: 0 },
+	"T-18": { branch: "chore/old-preview", phase: "parked", stale: true, upstreamGone: true },
+	"T-19": { branch: "perf/search-cache", phase: "retiring", ahead: 0 },
+};
 const tasks: TaskDetail[] = [
 	{ id: "T-14", title: "Document the workspace onboarding flow", workspace: "console", status: "pending", sessionId: null, wait: null },
 	{ id: "T-11", title: "Make search indexing incremental", workspace: "atlas", status: "working", sessionId: "W-11", wait: null },
 	{ id: "T-12", title: escalation.taskTitle, workspace: "console", status: "awaiting", sessionId: "W-12", wait: { kind: "approval", text: "Confirm the account migration strategy." } },
 	{ id: "T-9", title: "Fix search timeout handling", workspace: "atlas", status: "done", sessionId: "W-11", wait: null },
-	{ id: "T-8", title: "Replace the existing logging framework", workspace: "console", status: "cancelled", sessionId: null, wait: null },
+	{ id: "T-8", title: "Review the existing logging framework", workspace: "console", status: "cancelled", sessionId: null, wait: null },
 	{ id: "T-13", title: "校验导入数据的边界条件", workspace: "atlas", status: "awaiting", sessionId: null, wait: { kind: "provision_failed", text: "Preview database could not start: port 5432 is already in use. Review the environment before continuing." } },
+	{ id: "T-15", title: "Correct cart discount rounding", workspace: "atlas", status: "done", sessionId: null, wait: null },
+	{ id: "T-16", title: "Share sleep summaries", workspace: "atlas", status: "done", sessionId: null, wait: null },
+	{ id: "T-17", title: "Prevent overselling inventory", workspace: "atlas", status: "done", sessionId: null, wait: null },
+	{ id: "T-18", title: "Retire the old preview", workspace: "atlas", status: "done", sessionId: null, wait: null },
+	{ id: "T-19", title: "Cache search results", workspace: "atlas", status: "done", sessionId: null, wait: null },
 ].map((item, index): TaskDetail => {
-	const branch = item.status === "pending" ? null : `task/${item.id.toLowerCase()}-${item.workspace}`;
-	const path = branch ? `${home}/worktrees/${item.workspace}/${item.id}` : null;
+	const fixture = branchFixtures[item.id];
+	const branch = fixture?.branch ?? null;
+	const path = branch ? `${home}/worktrees/${item.workspace}/${branch.replaceAll("/", "-")}` : null;
 	const closed = item.status === "done" || item.status === "cancelled";
 	const progress: TaskDetail["progress"] = closed ? null : {
 		phase: item.id === "T-14" ? "queued" : item.id === "T-12" ? "approval" : item.id === "T-13" ? "cold" : "running",
@@ -70,20 +87,38 @@ const tasks: TaskDetail[] = [
 		lastEvent: item.id === "T-14" ? "Waiting for an available worker slot" : item.wait?.text ?? "Worker started the implementation",
 		since: now - (index + 1) * 60000,
 	};
+	const worktree: BranchDTO | null = fixture && path ? {
+		worktreeId: `WT-${index + 1}`, workspace: item.workspace, path, base: "main", phase: "idle", hold: null, holdDetail: null,
+		ahead: 1, behind: 0, upstreamGone: false, kept: false, stale: false,
+		tasks: [{ id: item.id, title: item.title, status: item.status as TaskDetail["status"], settled: closed && item.id !== "T-15" }],
+		lastActivityAt: closed ? now - 21 * 86400000 : now - 60000, retired: null, ...fixture,
+	} : null;
 	return {
 		...item, status: item.status as TaskDetail["status"], wait: item.wait as TaskDetail["wait"], branch, playbook: item.id === "T-14" ? "docs" : "feature",
 		createdAt: now - (index + 1) * 3600000, updatedAt: now - (index + 1) * 60000,
-		endedAt: item.status === "done" ? now - 180000 : item.status === "cancelled" ? now - 172800000 : null, progress,
+		endedAt: item.id === "T-9" ? now - 180000 : closed ? now - 172800000 : null, progress,
 		brief: `## Goal\n${item.title}.\n\n## Constraints\nKeep work isolated. Do not publish changes or modify production data.\n\n## Acceptance\nRun focused tests and report the observed results.`,
 		envelope: `Task: ${item.id}\nWorkspace: ${item.workspace}\nAudience: worker\nPolicy: work locally; report to main first.`,
-		checkout: { kind: "worktree" }, worktreePath: path, related: [],
+		checkout: branch ? { lane: "branch", branch } : { lane: "main", edit: item.id === "T-14" }, worktreePath: worktree?.phase === "retired" || worktree?.phase === "parked" ? null : path, related: [],
 		reports: item.status === "pending" ? [] : [{ at: now - 240000, status: item.status === "done" ? "done" : item.status === "awaiting" ? "question" : "progress", summary: item.status === "done" ? "Fixed the timeout boundary; focused tests pass." : "Reviewed the implementation and narrowed the change.", details: "No external services or production data were changed." }],
 		events: [{ id: index * 3 + 1, at: now - (index + 1) * 3600000, actor: "dispatcher", kind: "created", summary: "Task dispatched by main", data: {} }, ...(item.status === "pending" ? [] : [{ id: index * 3 + 2, at: now - 300000, actor: "worker" as const, kind: item.wait?.kind ?? item.status, summary: item.wait?.text ?? "Worker started the implementation", data: {} }])],
 		decisions: decisions.filter(decision => decision.taskId === item.id), escalations: item.id === escalation.taskId ? [escalation] : [],
-		git: path ? { dirty: item.status === "working", ahead: item.status === "done" ? 1 : 0, head: "a1b2c3d" } : null,
+		worktree,
 		env: path ? { worktreeId: `WT-${index + 1}`, worktreePath: path, workspace: item.workspace, state: item.id === "T-13" ? "failed" : "ready", error: item.id === "T-13" ? item.wait?.text ?? null : null, vars: { NODE_ENV: "test", DATABASE_URL: `postgres://local:demo-secret@127.0.0.1:5432/${item.workspace}_test`, PORT: String(4100 + index) }, updatedAt: now - 300000 } : null,
 	};
 });
+const branches: BranchDTO[] = tasks.flatMap(task => task.worktree ? [task.worktree] : []);
+for (const [index, reason] of (["unused", "gone", "discarded"] as const).entries()) branches.push({
+	worktreeId: `WT-history-${index}`, workspace: "atlas", branch: ["chore/unused-preview", "fix/remote-experiment", "feat/abandoned-search"][index],
+	path: `${home}/worktrees/atlas/history-${index}`, base: "main", phase: "retired", hold: null, holdDetail: null,
+	ahead: null, behind: null, upstreamGone: reason === "gone", kept: false, stale: false, tasks: [], lastActivityAt: now - (index + 1) * 86400000,
+	retired: { reason, at: now - (index + 1) * 86400000, sha: "a1b2c3d4e5f67890abcdef1234567890abcdef1234", branchDeleted: true },
+});
+for (const task of tasks) if (task.worktree?.retired) {
+	const retired = task.worktree.retired;
+	if (task.env) task.env.state = "torn_down";
+	task.events.push({ id: 1000, at: retired.at, actor: "hub", kind: "worktree_retired", summary: getT().branches.mergedCleaned, data: { ...retired, branch: task.branch } });
+}
 if (new URLSearchParams(location.search).get("scene") === "empty") {
 	for (const task of tasks) { task.status = "done"; task.wait = null; task.progress = null; task.endedAt = now - 172800000; }
 	escalation.resolvedAt = now; escalation.resolution = "task_moved";
@@ -177,7 +212,7 @@ window.setInterval(() => {
 			const [, route, id, action] = parts;
 			if (route === "state") return response(state());
 			if (route === "setup") {
-				if (id === "preview") { const homePath = url.searchParams.get("home") ?? home; return response({ homePath, exists: true, isGitRepo: true, changes: [{ path: "AGENTS.md", action: "backup", reason: "Preserve your current instructions before migration." }, { path: "AGENTS.md", action: "replace", reason: "Add the main chat workflow and workspace registry." }, { path: "repos/", action: "create", reason: "Store workspace notes and environment recipes." }], pstackCandidates: [`${root}/pstack`] } satisfies SetupPreview); }
+				if (id === "preview") { const homePath = url.searchParams.get("home") ?? home; return response({ homePath, exists: true, isGitRepo: true, changes: setupDone && new URLSearchParams(location.search).get("scene") !== "home-update" ? [] : [{ path: "AGENTS.md", action: "backup", reason: "Preserve your current instructions before migration." }, { path: "AGENTS.md", action: "replace", reason: "Add the main chat workflow and workspace registry." }, { path: "repos/", action: "create", reason: "Store workspace notes and environment recipes." }], pstackCandidates: [`${root}/pstack`] } satisfies SetupPreview); }
 				settings.homePath = text(body, "homePath", home); settings.pstackRoot = body.pstackRoot === null ? null : text(body, "pstackRoot"); setupDone = true; invalidate(["state", "settings"]); return response(state());
 			}
 			if (route === "models") { if (url.searchParams.get("refresh") === "1") catalog.fetchedAt = Date.now(); return response(catalog); }
@@ -193,6 +228,30 @@ window.setInterval(() => {
 			if (route === "main") { main.state = "idle"; main.paused = false; main.wakesUsed = 0; main.pendingNotices = 0; if (id === "new") { const old = sessions.find(session => session.id === main.sessionId); if (old) { old.retired = true; old.state = "cold"; } main.sessionId = `M-${sessions.length + 1}`; sessions.unshift({ ...sessions[0], id: main.sessionId, state: "idle", retired: false, createdAt: Date.now() }); } invalidate(["state", "sessions", "inbox"]); return response(state()); }
 			if (route === "inbox") return response({ main, escalations: escalation.resolvedAt === null ? [escalation] : [] });
 			if (route === "escalations") { if (action === "seen") escalation.seenAt = Date.now(); else { escalation.resolvedAt = Date.now(); escalation.resolution = "dismissed"; } invalidate(["inbox", "state", "task:T-12"]); return response(escalation); }
+			if (route === "worktrees" && method === "POST") {
+				const branch = branches.find(item => item.worktreeId === id);
+				if (!branch) return response({ error: getT().branches.empty }, 404);
+				const t = getT().branches;
+				if (branch.phase === "retiring" || branch.phase === "retired") return response({ error: t.phases[branch.phase] }, 409);
+				if (action === "keep") {
+					if (branch.phase === "parked") return response({ error: t.phases.parked }, 409);
+					branch.kept = body.keep === true;
+					if (branch.kept && branch.hold === null) branch.hold = "locked";
+					else if (!branch.kept && branch.hold === "locked") branch.hold = null;
+				} else if (action === "remove") {
+					if (branch.phase === "active" || branch.hold === "busy" || branch.kept) return response({ error: branch.kept ? t.unlockFirst : t.busy }, 409);
+					const deleteBranch = body.deleteBranch === true;
+					if (!deleteBranch && branch.phase === "parked") return response(branch);
+					branch.phase = deleteBranch ? "retired" : "parked"; branch.hold = null; branch.holdDetail = null;
+					if (deleteBranch) branch.retired = { reason: "discarded", at: Date.now(), sha: "f719d8ab3c4d5678e90123456789abcdef01234567", branchDeleted: true };
+					for (const task of tasks.filter(task => task.worktree?.worktreeId === id)) {
+						task.worktreePath = null; if (task.env) task.env.state = "torn_down";
+						task.events.push({ id: Date.now(), at: Date.now(), actor: "human", kind: "worktree_retired", summary: deleteBranch ? t.discarded(branch.branch) : t.removed(branch.branch), data: { reason: "discarded", branch: branch.branch, sha: branch.retired?.sha ?? null, branchDeleted: deleteBranch } });
+					}
+				} else return response({ error: `Unknown worktree action: ${action}` }, 404);
+				invalidate(["workspaces", "tasks", "resources", ...tasks.filter(task => task.worktree?.worktreeId === id).map(task => `task:${task.id}` as Topic)]);
+				return response(branch);
+			}
 			if (route === "tasks") {
 				if (!id) {
 					const status = url.searchParams.get("status");
@@ -200,10 +259,15 @@ window.setInterval(() => {
 				}
 				const task = tasks.find(task => task.id === id); if (!task) return response({ error: "Task not found" }, 404);
 				if (method === "POST") {
+					if (action !== "cancel" && action !== "message") return response({ error: `Unknown task action: ${action}` }, 404);
 					if (action === "cancel") { task.status = "cancelled"; task.wait = null; task.progress = null; task.endedAt = Date.now(); if (task.id === escalation.taskId) { escalation.resolvedAt = Date.now(); escalation.resolution = "task_moved"; } }
 					if (action === "message") { task.status = "working"; task.wait = null; task.endedAt = null; task.progress = { phase: "running", intent: "Following human guidance", lastEvent: text(body, "text"), since: Date.now() }; if (task.id === escalation.taskId) { escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied"; } }
-					if (action === "cleanup") { task.worktreePath = null; if (task.env) task.env.state = "torn_down"; }
-					task.updatedAt = Date.now(); task.events.push({ id: Date.now(), at: Date.now(), actor: "human", kind: action ?? "message", summary: text(body, "text") || text(body, "reason") || "Environment torn down; worktree removed; branch retained.", data: body });
+					if (task.worktree) {
+						task.worktree.phase = action === "cancel" ? "idle" : "active";
+						task.worktree.hold = action === "cancel" ? null : "busy";
+						task.worktree.tasks = [{ id: task.id, title: task.title, status: task.status, settled: action === "cancel" }];
+					}
+					task.updatedAt = Date.now(); task.events.push({ id: Date.now(), at: Date.now(), actor: "human", kind: action, summary: text(body, "text") || text(body, "reason"), data: body });
 					invalidate(["tasks", `task:${id}`, "resources", "state", "inbox"]);
 				}
 				return response(task);
@@ -251,6 +315,7 @@ window.setInterval(() => {
 					workspaces.push(workspace); invalidate(["workspaces"]); return response(workspace);
 				}
 				const workspace = workspaces.find(item => item.id === id); if (!workspace) return response({ error: "Workspace not found" }, 404);
+				if (action === "branches") return response({ workspace: id, base: workspace.defaultBase, live: branches.filter(branch => branch.workspace === id && branch.phase !== "retired"), retired: branches.filter(branch => branch.workspace === id && branch.phase === "retired"), checkedAt: Date.now() } satisfies BranchesDTO);
 				if (action === "recipe") {
 					if (parts[4] === "check") {
 						const check = recipeChecks.get(id);

@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import { after, test } from "node:test";
-import type { ResourcesDTO, SessionDTO, StateDTO, TaskDetail, TaskSummary, UiEvent } from "../shared/api.ts";
+import type { BranchDTO, ResourcesDTO, SessionDTO, StateDTO, TaskDetail, TaskSummary, UiEvent } from "../shared/api.ts";
 import WebSocket from "ws";
 import { killHubs, sandbox, startHub, Stream, until } from "./hub-harness.ts";
 
 /**
  * Hub flows beyond the happy path, with the fake omp: services, account leases and
- * home_env in a read-only checkout; queueing at the live cap; cancel (abort);
- * continue with session reuse; cleanup; provisioning failure and retry via home_send;
- * decision revert; main restart and new chat.
+ * home_env in the main checkout; queueing at the live cap; cancel (abort); a new task on
+ * the same branch (same worktree, fresh session); Remove worktree; provisioning failure
+ * and retry via home_send; decision revert; main restart and new chat.
  */
 
 after(killHubs);
@@ -31,7 +32,7 @@ const recipe = (setup: string) =>
 		"",
 	].join("\n");
 
-test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, main lifecycle", { timeout: 180_000 }, async () => {
+test("hub flows: env, leases, queue, cancel, same branch again, remove worktree, retry, revert, main lifecycle", { timeout: 180_000 }, async () => {
 	const box = sandbox();
 	const hub = await startHub(box.configDir, { OMP_E2E_PASSWORD: "s3cret" });
 	const task = async (id: string) => (await hub.api<TaskDetail>("GET", `/api/tasks/${id}`)).body;
@@ -48,15 +49,15 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	assert.equal((await hub.api("PUT", "/api/settings", { maxLiveWorkers: 0 })).status, 422);
 	const main = await new Stream(hub, "M-1", box.home).open();
 
-	// T-1: read-only checkout; shared service started; home_env and home_lease from the worker.
-	main.agent(send("Read only look", { kind: "readonly" }, "[fake:env]"));
+	// T-1: the main checkout, read-only; shared service started; home_env and home_lease from the worker.
+	main.agent(send("Read only look", { lane: "main" }, "[fake:env]"));
 	const t1 = await until("T-1 done", async () => {
 		const t = await task("T-1");
 		return t.status === "done" && t;
 	});
 	assert.equal(t1.worktreePath, null);
 	const details = t1.reports[0]!.details!;
-	assert.match(details, /ENV Read-only checkout: /);
+	assert.match(details, /ENV Main checkout: .* \(git is read-only here\)/);
 	assert.match(details, /Services: echo-svc up/);
 	assert.match(details, /LEASE Leased alice from testers .*\n {2}user: alice@example\.test\n {2}password: s3cret/);
 	const res = await resources();
@@ -65,12 +66,17 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	const servicePid = res.services[0]!.pid!;
 
 	// T-2 needs a slot while W-1 is live at cap 1: queued until W-1 is evicted.
-	main.agent(send("Hang in worktree", { kind: "worktree", branch: "feat/hang" }, "[fake:hang]"));
+	main.agent(send("Hang in worktree", { lane: "branch", branch: "feat/hang" }, "[fake:hang]"));
 	await until("T-2 queued", async () => (await task("T-2")).events.some(e => e.kind === "queued_for_capacity"));
 	assert.equal((await task("T-2")).status, "pending");
 	assert.equal((await hub.api("POST", "/api/sessions/W-1/evict")).status, 200);
 	await until("T-2 running", async () => (await task("T-2")).events.some(e => e.kind === "run_started"));
 	assert.equal((await sessions()).find(s => s.id === "W-1")!.state, "cold");
+	// Work the branch keeps: without commits a cancelled task's branch is unused and the hub removes it.
+	const hangTree = (await task("T-2")).worktreePath!;
+	fs.writeFileSync(`${hangTree}/hang.txt`, "partial work\n");
+	execFileSync("git", ["-c", "user.name=w", "-c", "user.email=w@example.test", "add", "hang.txt"], { cwd: hangTree });
+	execFileSync("git", ["-c", "user.name=w", "-c", "user.email=w@example.test", "commit", "-qm", "partial work"], { cwd: hangTree });
 
 	// Human cancel aborts the run; the task stays cancelled after the aborted run ends.
 	const cancelled = await hub.api<TaskDetail>("POST", "/api/tasks/T-2/cancel", { reason: "wrong approach" });
@@ -78,31 +84,36 @@ test("hub flows: env, leases, queue, cancel, continue, cleanup, retry, revert, m
 	await until("aborted run end", async () => (await task("T-2")).events.some(e => e.kind === "run_ended" && e.summary.includes("aborted")));
 	assert.equal((await task("T-2")).status, "cancelled");
 
-	// T-3 continues T-2's worktree in the same session.
-	main.agent(send("Continue it", { kind: "continue", task: "T-2", session: "reuse" }));
+	// T-3: the same branch again reuses T-2's worktree with a fresh session; T-2's session is retired.
+	main.agent(send("Pick it up", { lane: "branch", branch: "feat/hang" }));
 	const t3 = await until("T-3 done", async () => {
 		const t = await task("T-3");
 		return t.status === "done" && t;
 	});
 	const t2 = await task("T-2");
-	assert.equal(t3.sessionId, t2.sessionId);
+	assert.notEqual(t3.sessionId, t2.sessionId);
 	assert.equal(t3.worktreePath, t2.worktreePath);
 	assert.equal(t3.branch, "feat/hang");
-	assert.ok(t3.related.includes("T-2"));
-	assert.match(t3.envelope!, /Continues: T-2/);
+	assert.match(t3.envelope!, /Earlier on this branch: T-2 \(their commits are here\)/);
+	assert.ok((await sessions()).find(s => s.id === t2.sessionId)!.retired);
+	assert.deepEqual(t3.worktree!.tasks.map(t => t.id), ["T-3", "T-2"]);
 
-	// Cleanup: session retired, env torn down, worktree removed, branch kept.
-	const cleaned = await hub.api<TaskDetail>("POST", "/api/tasks/T-2/cleanup");
-	assert.equal(cleaned.status, 200, JSON.stringify(cleaned.body));
+	// Remove worktree: session retired, env torn down, worktree removed, branch kept (parked).
+	assert.equal((await hub.api("POST", "/api/tasks/T-2/cleanup")).status, 404);
+	const removed = await hub.api<BranchDTO>("POST", `/api/worktrees/${t3.worktree!.worktreeId}/remove`, { deleteBranch: false });
+	assert.equal(removed.status, 200, JSON.stringify(removed.body));
+	assert.equal(removed.body.phase, "parked");
 	assert.ok(!fs.existsSync(t2.worktreePath!));
 	assert.equal(box.git("branch", "--list", "feat/hang"), "feat/hang");
-	assert.ok((await sessions()).find(s => s.id === t2.sessionId)!.retired);
+	assert.ok((await sessions()).find(s => s.id === t3.sessionId)!.retired);
 	assert.ok(!(await resources()).leases.some(l => l.holderKind === "worktree"));
-	assert.equal((await hub.api("POST", "/api/tasks/T-3/cleanup")).status, 200, "cleanup of an already removed worktree is a no-op");
+	assert.equal((await task("T-3")).worktreePath, null);
+	const again = await hub.api<BranchDTO>("POST", `/api/worktrees/${t3.worktree!.worktreeId}/remove`, { deleteBranch: false });
+	assert.deepEqual([again.status, again.body.phase], [200, "parked"], "removing a parked worktree again is a no-op");
 
 	// T-4: setup fails → provision_failed; fix the recipe and retry through home_send.
 	assert.equal((await hub.api("PUT", "/api/workspaces/deckhand/recipe", { text: recipe("echo broken >&2; exit 3") })).status, 200);
-	main.agent(send("Needs setup", { kind: "worktree" }));
+	main.agent(send("Needs setup", { lane: "branch", branch: "fix/needs-setup" }));
 	const failed = await until("T-4 provision_failed", async () => {
 		const t = await task("T-4");
 		return t.wait?.kind === "provision_failed" && t;

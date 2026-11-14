@@ -1,0 +1,26 @@
+.branches-explanation { margin: 0; font-size: .923077rem; color: var(--muted); }
+.workspace-branches { margin-top: 14px; border-top: 1px solid var(--line); }
+.workspace-branches > summary { padding: 12px 0 2px; font-weight: 600; }
+.branch-list { padding-top: 4px; }
+.branch-block { min-width: 0; padding: 13px 0; }
+.branch-list > .branch-block + .branch-block, .branch-history .branch-block + .branch-block { border-top: 1px solid var(--line); }
+.branch-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.branch-heading > code { overflow-wrap: anywhere; background: none; padding: 0; font-size: .923077rem; }
+.branch-phase { flex: 0 0 auto; }
+.branch-hold { margin: 6px 0 0; color: var(--warn); font-size: .846154rem; line-height: 1.5; }
+.branch-facts { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 12px; margin-top: 6px; color: var(--muted); font-size: .846154rem; }
+.branch-facts code { overflow-wrap: anywhere; font-size: .769231rem; }
+.branch-hint { color: var(--warn); }
+.branch-tasks { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.branch-task { display: inline-flex; gap: 6px; align-items: center; max-width: 100%; min-width: 0; padding: 3px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); color: var(--muted); font-size: .769231rem; }
+.branch-task:hover { color: var(--fg); border-color: var(--line-2); }
+.branch-task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.branch-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.keep-toggle[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.keep-indicator { width: 12px; text-align: center; }
+.branch-history { border-top: 1px solid var(--line); padding-top: 10px; }
+.branch-history > summary { color: var(--muted); font-size: .923077rem; }
+.branch-history > summary > span { margin-left: 6px; }
+.task-branch { flex: 0 1 auto; max-height: 32%; min-height: 0; overflow: auto; padding: 0 14px; border-bottom: 1px solid var(--line); }
+.task-main-checkout { margin: 0; padding: 10px 14px; color: var(--muted); font-size: .846154rem; border-bottom: 1px solid var(--line); }
+.finished-branch-note { display: block; color: var(--ok); font-size: .769231rem; margin-top: 3px; }

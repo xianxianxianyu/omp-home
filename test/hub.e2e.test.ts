@@ -20,7 +20,7 @@ import { killHubs, repoDir, runHub, sandbox, startHub, Stream, until } from "./h
 after(killHubs);
 
 const BRIEF = "Goal: exercise the hub end to end with the fake omp. Background: none. Constraints: none. Acceptance: report done with PORT. Report: what changed.";
-const dispatch = (title: string, marker = "") => `/dispatch ${JSON.stringify({ title, workspace: "deckhand", brief: `${BRIEF} ${marker}`, checkout: { kind: "worktree" } })}`;
+const dispatch = (title: string, branch: string, marker = "") => `/dispatch ${JSON.stringify({ title, workspace: "deckhand", brief: `${BRIEF} ${marker}`, checkout: { lane: "branch", branch } })}`;
 
 test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	const { tmp, configDir, home, gitRepo } = sandbox();
@@ -118,23 +118,24 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 
 	// Main itself may not dispatch.
 	mark = main.out.length;
-	main.agent(`/call home_dispatch ${JSON.stringify({ title: "nope", workspace: "deckhand", brief: BRIEF, checkout: { kind: "readonly" } })}`);
+	main.agent(`/call home_dispatch ${JSON.stringify({ title: "nope", workspace: "deckhand", brief: BRIEF, checkout: { lane: "main" } })}`);
 	await main.expect(/RESULT err forbidden home_dispatch is only callable by the dispatcher/, mark);
 
 	// T-1: worktree, env, session, brief, report → done → wake 1.
 	mark = main.out.length;
-	main.agent(dispatch("First task"));
-	await main.expect(/RESULT ok T-1 pending · deckhand · new worktree/, mark);
+	main.agent(dispatch("First task", "feat/first-task"));
+	await main.expect(/RESULT ok T-1 pending · deckhand · new branch feat\/first-task from main@[0-9a-f]{7}/, mark);
 	const t1 = await until("T-1 done", async () => {
 		const t = await task("T-1");
 		return t.status === "done" && t;
 	});
-	assert.equal(t1.branch, "task/first-task-1");
-	assert.equal(t1.worktreePath, path.join(tmp, "deckhand.worktrees", "task-first-task-1"));
+	assert.equal(t1.branch, "feat/first-task");
+	assert.equal(t1.worktreePath, path.join(tmp, "deckhand.worktrees", "feat-first-task"));
+	assert.deepEqual([t1.worktree?.branch, t1.worktree?.phase, t1.worktree?.ahead], ["feat/first-task", "idle", 0]);
 	assert.ok(fs.existsSync(path.join(t1.worktreePath!, ".env-ready")), "recipe setup ran in the worktree");
 	const port = Number(t1.env!.vars.PORT);
 	assert.ok(port >= 41000 && port <= 41999);
-	assert.match(t1.reports[0]!.details!, new RegExp(`PORT=${port} BRANCH=task/first-task-1 hooks=${repoDir}/git-guard`));
+	assert.match(t1.reports[0]!.details!, new RegExp(`PORT=${port} BRANCH=feat/first-task hooks=${repoDir}/git-guard`));
 	assert.match(t1.envelope!, /^\[omp-home task T-1 · First task\]/);
 	assert.match(t1.envelope!, /Tests: unit `npm test -- --port '\d+'`/);
 	assert.deepEqual(
@@ -147,7 +148,7 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	assert.match(first.text, /Auto-wakes left: 2/);
 
 	// T-2 asks a question → wake 2; answering without a decision is refused.
-	main.agent(dispatch("Second task", "[fake:question]"));
+	main.agent(dispatch("Second task", "feat/second-task", "[fake:question]"));
 	await until("T-2 question", async () => (await task("T-2")).wait?.kind === "question");
 	await until("wake 2", async () => (await state()).main.wakesUsed === 2);
 	mark = main.out.length;
@@ -162,7 +163,7 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	await until("wake 3", async () => (await state()).main.wakesUsed === 3);
 
 	// T-3: the budget is spent, so its notice goes in as context and main shows paused.
-	main.agent(dispatch("Third task"));
+	main.agent(dispatch("Third task", "feat/third-task"));
 	await until("T-3 done", async () => (await task("T-3")).status === "done");
 	const late = await until("context notice for T-3", async () => (await notices()).find(n => n.text.includes("T-3 Third task")), 25_000);
 	assert.match(late.text, /did not start a turn/);
@@ -185,7 +186,7 @@ test("hub end to end with a fake omp", { timeout: 180_000 }, async () => {
 	// with what the worker is doing; escalation focuses its session.
 	assert.equal((await hub.api("PUT", "/api/workspaces/deckhand/recipe", { text: recipe.replace("setup: [", 'setup: ["sleep 1", ') })).status, 200);
 	const inFlight = async () => (await hub.api<TaskSummary[]>("GET", "/api/tasks?status=open")).body.find(t => t.id === "T-4");
-	main.agent(dispatch("Hanging task", "[fake:hang]"));
+	main.agent(dispatch("Hanging task", "feat/hanging-task", "[fake:hang]"));
 	const provisioning = await until("T-4 in flight", async () => (await inFlight())?.progress);
 	assert.equal(provisioning.phase, "provisioning");
 	assert.equal(provisioning.intent, null);

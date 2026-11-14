@@ -15,7 +15,9 @@
  *   GET  /api/tasks           ?status&workspace&q → TaskSummary[]  (status=open: pending|working|awaiting; status=closed: done|cancelled)
  *   GET  /api/tasks/:id                     → TaskDetail
  *   POST /api/tasks/:id/cancel  {reason}    → TaskDetail
- *   POST /api/tasks/:id/cleanup             → TaskDetail         (human only: env teardown, worktree removal, branch kept)
+ *   GET  /api/workspaces/:id/branches       → BranchesDTO        (hub-managed branches: live first, then the last 20 retired)
+ *   POST /api/worktrees/:id/remove {deleteBranch} → BranchDTO    (human: remove the worktree; deleteBranch also discards the branch, forced)
+ *   POST /api/worktrees/:id/keep {keep}     → BranchDTO          (human pin: `git worktree lock` / unlock; kept worktrees are never retired)
  *   POST /api/tasks/:id/message {text}      → TaskDetail         (human message to the worker, counts as human input)
  *   GET  /api/chat            ?before&after&limit → ChatRecordDTO[]  (before/after: exclusive chat_record ids; limit default 50, max 200;
  *                                                   ascending by id; no before/after → newest; before+after both → error 400)
@@ -127,7 +129,8 @@ export interface TaskDetail extends TaskSummary {
 	events: TaskEventDTO[];
 	decisions: DecisionDTO[];
 	escalations: EscalationDTO[];
-	git: { dirty: boolean; ahead: number; head: string } | null;
+	/** The branch this task works on (lane "branch"); null for main-checkout tasks. */
+	worktree: BranchDTO | null;
 	env: EnvDTO | null;
 }
 
@@ -251,6 +254,46 @@ export interface RecipeCheckStep {
 	ms: number | null;
 	/** Last ~4 KB of output. */
 	outputTail: string;
+}
+
+/**
+ * Phases are derived from git and the ledger on every sweep, never stored:
+ * active (a task on it is in flight) · idle (present, not integrated) · parked (no worktree on disk, branch kept) ·
+ * merged (integrated into the base, waiting for a hold to clear) · retiring · retired.
+ */
+export type BranchPhase = "active" | "idle" | "parked" | "merged" | "retiring" | "retired";
+/** Why a merged or unused branch is not retired yet. */
+export type BranchHold = "busy" | "unaccepted" | "dirty" | "locked" | "switched" | "error";
+
+export interface BranchDTO {
+	worktreeId: string;
+	workspace: string;
+	branch: string;
+	path: string;
+	base: string;
+	phase: BranchPhase;
+	hold: BranchHold | null;
+	/** Human detail for the hold or the last retire error, e.g. "2 uncommitted files". */
+	holdDetail: string | null;
+	/** Against the freshest base (local or its upstream); null when unknown. */
+	ahead: number | null;
+	behind: number | null;
+	upstreamGone: boolean;
+	kept: boolean;
+	/** Idle (not active, not merged) for more than 14 days; display only. */
+	stale: boolean;
+	/** Latest first, at most 5. */
+	tasks: { id: string; title: string; status: TaskStatus; settled: boolean }[];
+	lastActivityAt: number;
+	retired: { reason: "merged" | "unused" | "gone" | "discarded"; at: number; sha: string | null; branchDeleted: boolean } | null;
+}
+
+export interface BranchesDTO {
+	workspace: string;
+	base: string;
+	live: BranchDTO[];
+	retired: BranchDTO[];
+	checkedAt: number | null;
 }
 
 export interface RecipeDTO {

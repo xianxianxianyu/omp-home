@@ -1,11 +1,8 @@
 import { execFile } from "node:child_process";
 import fsSync from "node:fs";
-import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { RepoInspection } from "../shared/api.ts";
-import type { Db } from "./db.ts";
-import { envMessages } from "./i18n-env.ts";
 import { render, type Message } from "./i18n.ts";
 
 const run = promisify(execFile);
@@ -19,9 +16,17 @@ export class GitError extends Error {
 	}
 }
 
-async function git(cwd: string, args: string[], timeout?: number): Promise<string> {
+export interface GitOptions {
+	timeout?: number;
+	env?: Record<string, string>;
+}
+
+const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
+
+/** Run git and return trimmed stdout; a non-zero exit throws GitError with git's stderr. The one git runner. */
+export async function git(cwd: string, args: string[], opts: GitOptions = {}): Promise<string> {
 	try {
-		const { stdout } = await run("git", args, { cwd, timeout, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+		const { stdout } = await run("git", args, { cwd, timeout: opts.timeout, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, ...GIT_ENV, ...opts.env } });
 		return stdout.trim();
 	} catch (err) {
 		const e = err as { stderr?: string; message: string };
@@ -29,9 +34,21 @@ async function git(cwd: string, args: string[], timeout?: number): Promise<strin
 	}
 }
 
+/** Like `git`, but an exit code git uses for an answer (not a failure) is returned instead of thrown. */
+async function gitStatus(cwd: string, args: string[], answers: readonly number[]): Promise<{ code: number; stdout: string }> {
+	try {
+		const { stdout } = await run("git", args, { cwd, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, ...GIT_ENV } });
+		return { code: 0, stdout: stdout.trim() };
+	} catch (err) {
+		const e = err as { code?: unknown; stdout?: string; stderr?: string; message: string };
+		if (typeof e.code === "number" && answers.includes(e.code)) return { code: e.code, stdout: (e.stdout ?? "").trim() };
+		throw new GitError(`git ${args.join(" ")}: ${(e.stderr || e.message).trim()}`);
+	}
+}
+
 /** Absolute top-level directory of the repository containing `dir`. Throws when `dir` is not in a git repo. */
 export async function repoRoot(dir: string): Promise<string> {
-	return git(dir, ["rev-parse", "--show-toplevel"], 5_000);
+	return git(dir, ["rev-parse", "--show-toplevel"], { timeout: 5_000 });
 }
 
 /** The branch new worktrees fork from: the remote HEAD when known, else the current branch. */
@@ -47,7 +64,7 @@ export async function inspectGit(dir: string): Promise<RepoGitInfo> {
 	const root = await repoRoot(dir).then(p => fsSync.realpathSync(p), () => null);
 	const empty: RepoGitInfo = { root, currentBranch: null, defaultBase: null, branches: [], worktrees: [], remoteUrl: null, dirty: false };
 	if (!root) return empty;
-	const query = (args: string[]) => git(root, args, 5_000).catch(() => "");
+	const query = (args: string[]) => git(root, args, { timeout: 5_000 }).catch(() => "");
 	const [current, remoteHead, refs, worktrees, remote, status] = await Promise.all([
 		query(["symbolic-ref", "--quiet", "--short", "HEAD"]),
 		query(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]),
@@ -85,57 +102,130 @@ export async function inspectGit(dir: string): Promise<RepoGitInfo> {
 	};
 }
 
-export interface WorktreeInfo {
-	path: string;
-	branch: string | null;
+/** A path as git lists it: symlinks resolved when the path exists. */
+export function canonicalPath(p: string): string {
+	try {
+		return fsSync.realpathSync(p);
+	} catch {
+		return path.resolve(p);
+	}
 }
 
-export async function listWorktrees(root: string): Promise<WorktreeInfo[]> {
-	const out = await git(root, ["worktree", "list", "--porcelain"]);
-	const result: WorktreeInfo[] = [];
-	for (const block of out.split("\n\n")) {
-		const wt = /^worktree (.+)$/m.exec(block)?.[1];
-		if (!wt) continue;
-		const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1] ?? null;
-		result.push({ path: wt, branch });
+export interface Checkout {
+	branch: string | null;
+	locked: boolean;
+	/** The repository's main working tree (first in `git worktree list`). */
+	main: boolean;
+}
+
+/** Every working tree git knows, keyed by canonical path. */
+export async function checkouts(root: string): Promise<Map<string, Checkout>> {
+	const out = await git(root, ["worktree", "list", "--porcelain", "-z"]);
+	const result = new Map<string, Checkout>();
+	for (const block of out.split("\0\0")) {
+		const fields = block.split("\0");
+		const dir = fields.find(f => f.startsWith("worktree "))?.slice(9);
+		if (!dir) continue;
+		result.set(canonicalPath(dir), {
+			branch: fields.find(f => f.startsWith("branch refs/heads/"))?.slice(18) ?? null,
+			locked: fields.some(f => f === "locked" || f.startsWith("locked ")),
+			main: result.size === 0,
+		});
 	}
 	return result;
 }
 
-/**
- * Ensure a worktree for `branch` exists at `dir`. Idempotent: an existing worktree
- * on the same branch is reused; a branch that already exists is checked out
- * instead of recreated.
- */
-export async function ensureWorktree(root: string, dir: string, branch: string, base: string): Promise<void> {
-	const target = await fs.realpath(dir).catch(() => path.resolve(dir));
-	const existing = (await listWorktrees(root)).find(w => path.resolve(w.path) === target);
-	if (existing) {
-		if (existing.branch !== branch) throw new GitError(envMessages.worktreeBranchMismatch(dir, existing.branch, branch));
-		return;
-	}
-	await fs.mkdir(path.dirname(dir), { recursive: true });
-	const branchExists = await git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true, () => false);
-	await git(root, branchExists ? ["worktree", "add", dir, branch] : ["worktree", "add", "-b", branch, dir, base]);
+export interface RepoSurvey {
+	/** Local branches: tip and whether the upstream was deleted (`[gone]` after a prune). */
+	tips: Map<string, { sha: string; upstreamGone: boolean }>;
+	checkouts: Map<string, Checkout>;
+	/** Integration targets that exist: the base branch and its upstream. */
+	targets: { ref: string; sha: string }[];
+	/** Local branches whose tip is an ancestor of a target, with the first such target's ref. */
+	ancestors: Map<string, string>;
 }
 
-export async function removeWorktree(root: string, dir: string): Promise<void> {
-	await git(root, ["worktree", "remove", "--force", dir]);
-}
-
-export interface WorktreeStatus {
-	dirty: boolean;
-	ahead: number;
-	head: string;
-}
-
-export async function worktreeStatus(dir: string, base: string): Promise<WorktreeStatus> {
-	const [porcelain, head, ahead] = await Promise.all([
-		git(dir, ["status", "--porcelain"]),
-		git(dir, ["rev-parse", "--short", "HEAD"]),
-		git(dir, ["rev-list", "--count", `${base}..HEAD`]).catch(() => "0"),
+/** One look at a repository: three git calls plus one per target, independent of the number of branches. */
+export async function survey(root: string, base: string): Promise<RepoSurvey> {
+	const [refs, trees] = await Promise.all([
+		git(root, ["for-each-ref", "--format=%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track)", "refs/heads", "refs/remotes"]),
+		checkouts(root),
 	]);
-	return { dirty: porcelain.length > 0, ahead: Number(ahead) || 0, head };
+	const tips = new Map<string, { sha: string; upstreamGone: boolean }>();
+	const remotes = new Map<string, string>();
+	let upstream: string | null = null;
+	for (const line of refs.split("\n")) {
+		const [ref, sha, up, track] = line.split("\t");
+		if (!ref || !sha) continue;
+		if (ref.startsWith("refs/heads/")) {
+			const name = ref.slice(11);
+			tips.set(name, { sha, upstreamGone: track === "[gone]" });
+			if (name === base && up) upstream = up;
+		} else remotes.set(ref, sha);
+	}
+	const targets: { ref: string; sha: string }[] = [];
+	const local = tips.get(base);
+	if (local) targets.push({ ref: base, sha: local.sha });
+	const remote = upstream ?? (local ? null : `refs/remotes/origin/${base}`);
+	const remoteSha = remote ? remotes.get(remote) : undefined;
+	if (remote && remoteSha && remoteSha !== local?.sha) targets.push({ ref: remote.replace(/^refs\/remotes\//, ""), sha: remoteSha });
+	const ancestors = new Map<string, string>();
+	for (const t of targets) {
+		const merged = await git(root, ["for-each-ref", `--merged=${t.sha}`, "--format=%(refname)", "refs/heads"]);
+		for (const ref of merged.split("\n")) if (ref && !ancestors.has(ref.slice(11))) ancestors.set(ref.slice(11), t.ref);
+	}
+	return { tips, checkouts: trees, targets, ancestors };
+}
+
+/** Fixed identity and dates make the synthetic squash commit the same object on every probe. */
+const PROBE_COMMIT_ENV = {
+	GIT_AUTHOR_NAME: "omp-home",
+	GIT_AUTHOR_EMAIL: "omp-home@localhost",
+	GIT_AUTHOR_DATE: "1970-01-01T00:00:00Z",
+	GIT_COMMITTER_NAME: "omp-home",
+	GIT_COMMITTER_EMAIL: "omp-home@localhost",
+	GIT_COMMITTER_DATE: "1970-01-01T00:00:00Z",
+};
+
+/** Which content check found `tip` in the target: merging changes nothing, or matching patch ids per commit or squashed. */
+export type ContentMatch = "tree" | "commits" | "squash" | null;
+
+/**
+ * Whether `tip`'s content is already in `target` when ancestry says no (squash, rebase-merge,
+ * the same change made by hand). Merging must change nothing; only when that merge conflicts
+ * (the base edited the same lines later) fall back to patch ids, per commit and squashed.
+ */
+export async function integratedByContent(root: string, tip: string, target: string): Promise<ContentMatch> {
+	const merged = await gitStatus(root, ["merge-tree", "--write-tree", "--no-messages", target, tip], [1]);
+	if (merged.code === 0) return merged.stdout.split("\n")[0] === (await git(root, ["rev-parse", `${target}^{tree}`])) ? "tree" : null;
+	const perCommit = await git(root, ["cherry", target, tip]);
+	if (perCommit && perCommit.split("\n").every(line => line.startsWith("-"))) return "commits";
+	const forkPoint = await gitStatus(root, ["merge-base", target, tip], [1]);
+	if (forkPoint.code !== 0) return null;
+	const squashed = await git(root, ["commit-tree", `${tip}^{tree}`, "-p", forkPoint.stdout, "-m", "omp-home squash probe"], { env: PROBE_COMMIT_ENV });
+	return (await git(root, ["cherry", target, squashed])).startsWith("-") ? "squash" : null;
+}
+
+/** How many files have tracked changes or are untracked (ignored files do not count: git removes worktrees with them). */
+export async function changedFiles(dir: string): Promise<number> {
+	return (await git(dir, ["status", "--porcelain"])).split("\n").filter(Boolean).length;
+}
+
+export async function aheadBehind(root: string, base: string, tip: string): Promise<{ ahead: number; behind: number }> {
+	const [behind, ahead] = (await git(root, ["rev-list", "--left-right", "--count", `${base}...${tip}`])).split(/\s+/).map(Number);
+	return { ahead: ahead ?? 0, behind: behind ?? 0 };
+}
+
+/** Where new work should fork: the base branch, or its upstream when the local branch is strictly behind it. Any other ref resolves as given. */
+export async function freshestBase(root: string, base: string): Promise<{ ref: string; sha: string }> {
+	const local = await gitStatus(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${base}^{commit}`], [1]);
+	if (local.code !== 0) return { ref: base, sha: await git(root, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]) };
+	const upstream = await gitStatus(root, ["rev-parse", "--verify", "--quiet", "--symbolic-full-name", `${base}@{upstream}`], [1, 128]);
+	if (upstream.code !== 0 || !upstream.stdout) return { ref: base, sha: local.stdout };
+	const upSha = await git(root, ["rev-parse", "--verify", `${upstream.stdout}^{commit}`]);
+	if (upSha === local.stdout) return { ref: base, sha: local.stdout };
+	const behind = await gitStatus(root, ["merge-base", "--is-ancestor", local.stdout, upSha], [1]);
+	return behind.code === 0 ? { ref: upstream.stdout.replace(/^refs\/remotes\//, ""), sha: upSha } : { ref: base, sha: local.stdout };
 }
 
 /** Absolute hooks directory git would use in `cwd` (respects core.hooksPath); computed before the worker override. */
@@ -153,66 +243,4 @@ export async function isValidBranchName(root: string, branch: string): Promise<b
 /** `<root ?? dirname(repo)>/<repo basename>.worktrees/<branch with / replaced by ->`. */
 export function worktreePath(repo: string, branch: string, worktreeRoot: string | null): string {
 	return path.join(worktreeRoot ?? path.dirname(repo), `${path.basename(repo)}.worktrees`, branch.replaceAll("/", "-"));
-}
-
-export interface WorktreeRow {
-	id: string;
-	workspace_id: string;
-	path: string;
-	branch: string;
-	base: string;
-	state: "ready" | "missing" | "removed";
-	created_at: number;
-	removed_at: number | null;
-}
-
-/** Sole writer of the `worktree` table (rows mirror `git worktree` state). */
-export class Worktrees {
-	readonly #db: Db;
-
-	constructor(db: Db) {
-		this.#db = db;
-	}
-
-	get(id: string): WorktreeRow | undefined {
-		return this.#db.get<WorktreeRow>("SELECT * FROM worktree WHERE id = ?", id);
-	}
-
-	live(workspaceId: string, branch: string): WorktreeRow | undefined {
-		return this.#db.get<WorktreeRow>("SELECT * FROM worktree WHERE workspace_id = ? AND branch = ? AND state <> 'removed'", workspaceId, branch);
-	}
-
-	/** Record a worktree that exists on disk; an existing live row for the branch is reused. */
-	record(input: { workspaceId: string; path: string; branch: string; base: string }): WorktreeRow {
-		return this.#db.tx(() => {
-			const existing = this.live(input.workspaceId, input.branch);
-			if (existing) {
-				if (existing.state !== "ready") this.#db.run("UPDATE worktree SET state = 'ready' WHERE id = ?", existing.id);
-				return this.get(existing.id)!;
-			}
-			const { id } = this.#db.nextId("WT");
-			this.#db.run(
-				"INSERT INTO worktree (id, workspace_id, path, branch, base, state, created_at) VALUES (?, ?, ?, ?, ?, 'ready', ?)",
-				id,
-				input.workspaceId,
-				input.path,
-				input.branch,
-				input.base,
-				Date.now(),
-			);
-			return this.get(id)!;
-		});
-	}
-
-	markRemoved(id: string): void {
-		this.#db.run("UPDATE worktree SET state = 'removed', removed_at = coalesce(removed_at, ?) WHERE id = ?", Date.now(), id);
-	}
-
-	/** Startup: rows whose directory vanished become `missing`; reappeared ones `ready`. */
-	reconcile(): void {
-		for (const wt of this.#db.all<WorktreeRow>("SELECT * FROM worktree WHERE state <> 'removed'")) {
-			const present = fsSync.existsSync(wt.path);
-			if (present !== (wt.state === "ready")) this.#db.run("UPDATE worktree SET state = ? WHERE id = ?", present ? "ready" : "missing", wt.id);
-		}
-	}
 }

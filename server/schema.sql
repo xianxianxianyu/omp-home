@@ -1,4 +1,4 @@
--- omp-home schema v1. Each table has one writer module (see docs/ARCHITECTURE.md).
+-- omp-home schema v3. Each table has one writer module (see docs/ARCHITECTURE.md). Older databases reach it through server/migrations.ts.
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 -- schema_version · settings (JSON) · human_input_at (ms) · counters next:<kind>
@@ -13,18 +13,25 @@ CREATE TABLE workspace (                                    -- writer: workspace
   archived_at INTEGER
 ) STRICT;
 
-CREATE TABLE worktree (                                     -- writer: git.ts (via provisioner)
+CREATE TABLE worktree (                                     -- writer: worktrees.ts (the only module that mutates repositories)
   id TEXT PRIMARY KEY,                                      -- WT-n
   workspace_id TEXT NOT NULL REFERENCES workspace(id),
-  path TEXT NOT NULL UNIQUE,
   branch TEXT NOT NULL,
-  base TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('ready','missing','removed')),
+  path TEXT NOT NULL,                                       -- where it is (or will be) checked out
+  fork_ref TEXT NOT NULL,                                   -- informational; the integration target is workspace.default_base
+  fork_sha TEXT,                                            -- branch tip at claim; NULL only for rows migrated from v2
+  state TEXT NOT NULL CHECK (state IN ('live','retiring','retired')),
+  retire_reason TEXT CHECK (retire_reason IN ('merged','unused','gone','discarded')),
+  retired_sha TEXT,                                         -- CAS value for the branch delete (NULL: the hub deletes no branch)
+  retire_error TEXT,
   created_at INTEGER NOT NULL,
-  removed_at INTEGER,
+  retired_at INTEGER,
+  CHECK ((state = 'live') = (retire_reason IS NULL)),
+  CHECK ((state = 'retired') = (retired_at IS NOT NULL)),
   UNIQUE (id, workspace_id)
 ) STRICT;
-CREATE UNIQUE INDEX worktree_branch_live ON worktree(workspace_id, branch) WHERE state <> 'removed';
+CREATE UNIQUE INDEX worktree_branch_live ON worktree(workspace_id, branch) WHERE state <> 'retired';
+CREATE UNIQUE INDEX worktree_path_live ON worktree(path) WHERE state <> 'retired';
 
 CREATE TABLE worktree_env (                                 -- writer: env.ts
   worktree_id TEXT PRIMARY KEY REFERENCES worktree(id),
@@ -39,7 +46,7 @@ CREATE TABLE session (                                      -- writer: pool.ts
   id TEXT PRIMARY KEY,                                      -- M-n | W-n
   kind TEXT NOT NULL CHECK (kind IN ('main','worker')),
   workspace_id TEXT REFERENCES workspace(id),
-  worktree_id TEXT REFERENCES worktree(id),                 -- NULL: main chat, or a read-only worker in the main checkout
+  worktree_id TEXT REFERENCES worktree(id),                 -- NULL: main chat, or a worker in the main checkout (lane main)
   cwd TEXT NOT NULL,
   session_dir TEXT NOT NULL UNIQUE,
   omp_session_id TEXT,
@@ -63,11 +70,11 @@ CREATE TABLE task (                                         -- writer: ledger.ts
   seq INTEGER NOT NULL UNIQUE,
   title TEXT NOT NULL,
   workspace_id TEXT NOT NULL REFERENCES workspace(id),
-  checkout TEXT NOT NULL,                                   -- JSON CheckoutSpec
+  checkout TEXT NOT NULL,                                   -- JSON CheckoutSpec (lane branch | main)
   playbook TEXT,
   brief TEXT NOT NULL,
   envelope TEXT,
-  worktree_id TEXT REFERENCES worktree(id),
+  worktree_id TEXT REFERENCES worktree(id),                 -- set at dispatch for lane branch
   session_id TEXT REFERENCES session(id),
   status TEXT NOT NULL CHECK (status IN ('pending','working','awaiting','done','cancelled')),
   wait TEXT,                                                -- JSON Wait iff awaiting
@@ -77,6 +84,7 @@ CREATE TABLE task (                                         -- writer: ledger.ts
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   ended_at INTEGER,
+  settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0,1)), -- accepted, cancelled or merged, and not reopened since
   CHECK ((status = 'awaiting') = (wait IS NOT NULL)),
   CHECK ((status IN ('done','cancelled')) = (ended_at IS NOT NULL))
 ) STRICT;
@@ -84,11 +92,13 @@ CREATE UNIQUE INDEX task_one_open_per_session ON task(session_id) WHERE session_
 CREATE INDEX task_by_session ON task(session_id, seq);
 CREATE INDEX task_by_status ON task(status, updated_at);
 CREATE INDEX task_by_workspace ON task(workspace_id, updated_at);
+CREATE INDEX task_by_worktree ON task(worktree_id, seq);
+-- One unsettled task editing a workspace's main checkout at a time.
+CREATE UNIQUE INDEX task_one_main_editor ON task(workspace_id) WHERE settled = 0 AND json_extract(checkout, '$.edit') = 1;
 
-CREATE TABLE task_link (
+CREATE TABLE task_link (                                    -- related tasks; earlier work on a branch is the tasks on its worktree
   task_id TEXT NOT NULL REFERENCES task(id),
   other_id TEXT NOT NULL REFERENCES task(id),
-  kind TEXT NOT NULL CHECK (kind IN ('related','continues')),
   PRIMARY KEY (task_id, other_id)
 ) STRICT;
 
@@ -181,6 +191,22 @@ CREATE TABLE lease (                                        -- writer: env.ts
 ) STRICT;
 CREATE UNIQUE INDEX lease_resource_active ON lease(kind, key) WHERE released_at IS NULL;
 CREATE UNIQUE INDEX lease_holder_active ON lease(holder_kind, holder_id, kind, label) WHERE released_at IS NULL;
+
+CREATE TABLE recipe_check (                                 -- writer: recipe-check.ts
+  workspace_id TEXT PRIMARY KEY REFERENCES workspace(id),
+  id TEXT NOT NULL UNIQUE,
+  recipe_hash TEXT NOT NULL,
+  recipe TEXT NOT NULL,
+  base TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  path TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running','passed','failed','cancelled')),
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  steps TEXT NOT NULL,
+  processes TEXT NOT NULL DEFAULT '{}',
+  cleaned INTEGER NOT NULL DEFAULT 0 CHECK (cleaned IN (0,1))
+) STRICT;
 
 CREATE TABLE chat_record (                                  -- writer: indexer.ts; lossless main-chat escrow
   id INTEGER PRIMARY KEY,

@@ -14,6 +14,7 @@ export const BRIDGE_ENV = {
 	token: "OMP_HOME_TOKEN",
 	session: "OMP_HOME_SESSION", // SessionId
 	protectedBranches: "OMP_HOME_PROTECTED", // comma-separated branch names workers may not merge into
+	mainCheckout: "OMP_HOME_MAIN_CHECKOUT", // "1": a worker in the human's main checkout, where git is read-only
 } as const;
 
 export type StopReason = "completed" | "aborted" | "error";

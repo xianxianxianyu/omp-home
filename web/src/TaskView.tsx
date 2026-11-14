@@ -5,6 +5,7 @@ import { useI18n, useT } from "./i18n/index.tsx";
 import { SessionView } from "./SessionView.tsx";
 import { Button, Confirm, CopyButton, Empty, ErrorState, Field, Loading, Modal, RelativeTime, Section, Status } from "./ui.tsx";
 import { DecisionList } from "./panels/Decisions.tsx";
+import { BranchBlock } from "./Branches.tsx";
 import "./task-view.css";
 
 function CancelTask({ task, onClose }: { task: TaskDetail; onClose: () => void }) {
@@ -49,10 +50,9 @@ function TaskActions({ task }: { task: TaskDetail }) {
 	const t = useT().session.task;
 	const { mutate, toast } = useHub();
 	const [open, setOpen] = useState(false);
-	const [action, setAction] = useState<"cancel" | "cleanup" | "evict" | null>(null);
+	const [action, setAction] = useState<"cancel" | "evict" | null>(null);
 	const root = useRef<HTMLDivElement>(null);
 	const closed = task.status === "done" || task.status === "cancelled";
-	const canCleanup = closed && task.checkout.kind !== "readonly" && Boolean(task.worktreePath || (task.env && task.env.state !== "torn_down"));
 	const sessionId = task.sessionId;
 	useEffect(() => {
 		if (!open) return;
@@ -62,7 +62,7 @@ function TaskActions({ task }: { task: TaskDetail }) {
 		document.addEventListener("mousedown", close);
 		return () => document.removeEventListener("mousedown", close);
 	}, [open]);
-	const choose = (next: "cancel" | "cleanup" | "evict") => { setOpen(false); setAction(next); };
+	const choose = (next: "cancel" | "evict") => { setOpen(false); setAction(next); };
 	return (
 		<div className="more-menu task-actions" ref={root} onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
 			<button className="icon-button more-trigger" aria-label={t.actions} aria-expanded={open} onClick={() => setOpen(value => !value)}>⋯</button>
@@ -74,21 +74,9 @@ function TaskActions({ task }: { task: TaskDetail }) {
 					catch (cause) { toast(cause instanceof Error ? cause.message : t => t.session.task.clipboardError, "error"); }
 				}}>{t.copyPath}</button>
 				<button className="more-item danger" disabled={closed} onClick={() => choose("cancel")}>{t.cancelMenu}</button>
-				<button className="more-item danger" disabled={!canCleanup} title={!closed ? t.cleanupBeforeClosed : !canCleanup ? t.nothingToCleanup : undefined} onClick={() => choose("cleanup")}>{t.cleanupMenu}</button>
 				<button className="more-item danger" disabled={!sessionId} onClick={() => choose("evict")}>{t.stopWorkerMenu}</button>
 			</div>}
 			{action === "cancel" && !closed && <CancelTask task={task} onClose={() => setAction(null)} />}
-			{action === "cleanup" && canCleanup && <Confirm
-				title={t.cleanupTitle(task.id)}
-				description={t.cleanupDescription(task.worktreePath, task.branch)}
-				confirmLabel={t.cleanupConfirm}
-				danger
-				onConfirm={async () => {
-					await mutate<TaskDetail>(`/api/tasks/${encodeURIComponent(task.id)}/cleanup`, undefined, "POST");
-					toast(t => t.session.task.cleanedUp(task.id));
-				}}
-				onClose={() => setAction(null)}
-			/>}
 			{action === "evict" && sessionId && <Confirm
 				title={t.stopWorkerTitle(sessionId)}
 				description={t.stopWorkerDescription}
@@ -154,7 +142,6 @@ function TaskTimeline({ events }: { events: TaskEventDTO[] }) {
 
 function TaskContent({ task }: { task: TaskDetail }) {
 	const { task: t, actors } = useT().session;
-	const { format } = useI18n();
 	const { popView, openTask, openSession, mutate } = useHub();
 	const closed = task.status === "done" || task.status === "cancelled";
 	const checkout = task.checkout;
@@ -170,6 +157,7 @@ function TaskContent({ task }: { task: TaskDetail }) {
 			<Status value={task.status} />
 			<TaskActions key={task.id} task={task} />
 		</header>
+		{task.worktree ? <div className="task-branch"><BranchBlock branch={task.worktree} showTasks={false} /></div> : checkout.lane === "main" && <p className="task-main-checkout">{checkout.edit ? t.mainEditing : t.mainReadonly}</p>}
 		{(task.wait || task.env?.error) && <div className={`task-wait${failed ? " error" : ""}`} role={failed ? "alert" : "status"}>
 			{task.wait && <><Status value={task.wait.kind} /><p className="prewrap">{task.wait.text}</p></>}
 			{task.env?.error && task.env.error !== task.wait?.text && <p className="prewrap">{task.env.error}</p>}
@@ -181,10 +169,7 @@ function TaskContent({ task }: { task: TaskDetail }) {
 				<Section title={t.context}>
 					<div className="kv">
 						<span className="k">{t.playbook}</span><span className="prewrap">{task.playbook ?? t.notSpecified}</span>
-						<span className="k">{t.checkout}</span><div>{checkout.kind === "readonly" ? t.readonlyCheckout : checkout.kind === "worktree" ? (
-							checkout.base ? <>{t.newWorktreeFrom} <code>{checkout.base}</code></> : t.defaultWorktree
-						) : <>{t.continueTask} <button className="link-button" onClick={() => openTask(checkout.task)}>{checkout.task}</button> · {checkout.session === "reuse" ? t.reuseSession : t.freshSession}</>}</div>
-						{task.git && <><span className="k">Git</span><div className="row wrap"><code>{task.git.head}</code><span className={`pill ${task.git.dirty ? "warn" : "ok"}`}>{task.git.dirty ? t.dirty : t.clean}</span><span className="muted">{t.ahead(task.git.ahead, format.number(task.git.ahead))}</span></div></>}
+						<span className="k">{t.checkout}</span><div>{checkout.lane === "main" ? checkout.edit ? t.mainEditing : t.mainReadonly : <code>{checkout.branch}</code>}</div>
 						<span className="k">{t.created}</span><span><RelativeTime at={task.createdAt} /></span>
 						<span className="k">{t.updated}</span><span><RelativeTime at={task.updatedAt} /></span>
 						{task.endedAt !== null && <><span className="k">{t.ended}</span><span><RelativeTime at={task.endedAt} /></span></>}

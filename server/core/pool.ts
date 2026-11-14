@@ -64,7 +64,7 @@ export interface LaunchInput {
 	paths: { plugin: string; overlay: string; pstackPackage: string | null; gitGuard: string };
 	bridge: { url: string; token: string };
 	baseEnv: Record<string, string>;
-	worker: { env: Record<string, string>; protectedBranches: string[]; repoHooks: string } | null;
+	worker: { env: Record<string, string>; protectedBranches: string[]; repoHooks: string; mainCheckout: boolean } | null;
 }
 
 export interface LaunchSpec {
@@ -92,6 +92,7 @@ export function launchSpec(i: LaunchInput): LaunchSpec {
 	if (i.worker) {
 		Object.assign(env, {
 			[BRIDGE_ENV.protectedBranches]: i.worker.protectedBranches.join(","),
+			...(i.worker.mainCheckout ? { [BRIDGE_ENV.mainCheckout]: "1" } : {}),
 			OMP_HOME_WORKER: "1",
 			OMP_HOME_REPO_HOOKS: i.worker.repoHooks,
 			GIT_CONFIG_COUNT: "1",

@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { BRIDGE_ENV, BRIDGE_PROTOCOL, DELIVERED_ENTRY, NOTICE_MESSAGE, type BridgeToHub, type HubToBridge } from "../shared/bridge-wire.ts";
+import { mainCheckoutRefusal } from "../shared/main-checkout.ts";
 import { audienceOf, HIDDEN_BUILTINS, TOOL_SPECS, toolsFor, type Audience, type ToolName } from "../shared/tools.ts";
 
 const incoming = z.union([
@@ -34,8 +35,12 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 // Guardrails, not containment: arbitrary code can construct or disguise these commands.
-async function forbidden(command: string, cwd: string, pi: ExtensionAPI, protectedBranches: readonly string[]): Promise<string | undefined> {
+async function forbidden(command: string, cwd: string, pi: ExtensionAPI, protectedBranches: readonly string[], mainCheckout: boolean): Promise<string | undefined> {
 	const words = command.replace(/\\\r?\n/g, " ").replace(/["'`,\[\]]/g, " ");
+	if (mainCheckout) {
+		const refused = mainCheckoutRefusal(command);
+		if (refused) return refused;
+	}
 	const git = /\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+|--(?:git-dir|work-tree)=\S+\s+)*(push|branch|merge|rebase|reset|tag|update-ref)\b([^;&|\n]*)/g;
 	for (const match of words.matchAll(git)) {
 		const [, operation, args] = match;
@@ -58,6 +63,7 @@ export default function bridge(pi: ExtensionAPI) {
 	const role = z.enum(["main", "worker"]).parse(process.env[BRIDGE_ENV.role]);
 	const audiences: readonly Audience[] = role === "main" ? ["main", "dispatcher", "main_sub"] : ["worker", "worker_sub"];
 	const protectedBranches = (process.env[BRIDGE_ENV.protectedBranches] ?? "").split(",").map(branch => branch.trim()).filter(Boolean);
+	const mainCheckout = process.env[BRIDGE_ENV.mainCheckout] === "1";
 	let owner: ExtensionContext | undefined;
 	let socket: WebSocket | undefined;
 	let reconnect: NodeJS.Timeout | undefined;
@@ -228,7 +234,7 @@ export default function bridge(pi: ExtensionAPI) {
 		const input = record(event.input);
 		const command = event.toolName === "bash" ? input.command : input.code;
 		if (typeof command !== "string") return;
-		const reason = await forbidden(command, typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd, pi, protectedBranches);
+		const reason = await forbidden(command, typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd, pi, protectedBranches, mainCheckout);
 		if (!reason) return;
 		const explanation = `${reason} Call home_report({status:"question", summary:..., details:...}) instead, then end the turn. Subagents must return the question to their parent worker.`;
 		try { transport?.send({ t: "blocked", tool: event.toolName, command, reason: explanation }); }

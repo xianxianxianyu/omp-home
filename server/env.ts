@@ -9,11 +9,11 @@ import type { HomePaths } from "./config.ts";
 import { expand, slugOf, type EnvRecipe, type ServiceSpec, type Vars } from "./core/recipe.ts";
 import type { Db } from "./db.ts";
 import { errorText, HubError } from "./errors.ts";
-import type { WorktreeRow, Worktrees } from "./git.ts";
 import { envMessages } from "./i18n-env.ts";
 import { render, type Message } from "./i18n.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { WorkspaceRow, Workspaces } from "./workspaces.ts";
+import type { WorktreeRow, Worktrees } from "./worktrees.ts";
 
 const execFileP = promisify(execFile);
 
@@ -175,7 +175,7 @@ export class Env {
 
 	async #ensure(worktreeId: string, force: boolean): Promise<EnvRow> {
 		const wt = this.#worktrees.get(worktreeId);
-		if (!wt || wt.state !== "ready") throw new EnvError(envMessages.worktreeMissing(worktreeId));
+		if (!wt || wt.state !== "live" || !fs.existsSync(wt.path)) throw new EnvError(envMessages.worktreeMissing(worktreeId));
 		const ws = this.#workspaces.must(wt.workspace_id);
 		const loaded = this.#workspaces.loadRecipe(ws.id);
 		if (loaded.status === "missing") {
@@ -561,7 +561,7 @@ export class Env {
 		const loaded = this.#workspaces.loadRecipe(ws.id);
 		const lines: string[] = [];
 		if (wt) lines.push(`Worktree: ${wt.path} · branch ${wt.branch} (${wt.id})`);
-		else lines.push(`Read-only checkout: ${ws.repo_path}`);
+		else lines.push(`Main checkout: ${ws.repo_path} (git is read-only here)`);
 		if (loaded.status === "missing") {
 			lines.push(`No environment recipe: ${this.#workspaces.recipePath(ws.id)} does not exist. Ask the home agent if this task needs one.`);
 			return lines.join("\n");

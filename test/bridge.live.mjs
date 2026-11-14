@@ -271,10 +271,10 @@ try {
 		console.log("APPROVAL RESOLVED PAYLOAD", JSON.stringify(rawResolved.event));
 	});
 	await check("dispatcher subagent calls nested checkout union through shared socket", async () => {
-		deliver("M-1", `Dispatch this acceptance task, do not implement it: user words verbatim are "Validate the existing fixture task bridge with a fresh worker in the same worktree; no code changes." Home directory ${work}, workspace fixture, related T-1. Required checkout is {"kind":"continue","task":"T-1","session":"fresh"}, playbook feature. Spawn exactly one async task item with agent dispatcher, these routing decisions, and the user words. The dispatcher must read ${work}/repos/fixture.md and fixture.env.yaml, write a brief and call home_dispatch exactly once. Reply briefly without waiting.`);
+		deliver("M-1", `Dispatch this acceptance task, do not implement it: user words verbatim are "Validate the fixture task bridge on the existing branch feat/bridge-check; no code changes." Home directory ${work}, workspace fixture, related T-1. Required checkout is {"lane":"branch","branch":"feat/bridge-check"}, playbook feature. Spawn exactly one async task item with agent dispatcher, these routing decisions, and the user words. The dispatcher must read ${work}/repos/fixture.md and fixture.env.yaml, write a brief and call home_dispatch exactly once. Reply briefly without waiting.`);
 		const call = await waitFor(event => event.session === "M-1" && event.t === "call" && event.tool === "home_dispatch");
 		assert.equal(call.agent.kind, "sub"); assert.equal(call.agent.name, "dispatcher");
-		assert.deepEqual(call.params.checkout, { kind: "continue", task: "T-1", session: "fresh" });
+		assert.deepEqual(call.params.checkout, { lane: "branch", branch: "feat/bridge-check" });
 		const tools = await waitFor(event => event.session === "M-1" && event.t === "tools" && event.agent.name === "dispatcher");
 		assert.ok(tools.active.includes("home_dispatch")); assert.ok(!tools.active.includes("home_report")); assert.ok(!tools.active.includes("home_send"));
 	});

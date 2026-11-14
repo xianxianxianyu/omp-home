@@ -25,13 +25,13 @@ function setup() {
 	}
 	const ledger = new Ledger(db);
 	const create = (key: string) =>
-		ledger.createTask({ title: "Fix it", workspaceId: "deck", checkout: { kind: "worktree" }, playbook: null, brief: "brief", related: [], dispatchKey: key, actor: "dispatcher" }).task;
+		ledger.createTask({ title: "Fix it", workspaceId: "deck", checkout: { lane: "branch", branch: "fix/it" }, worktreeId: null, playbook: null, brief: "brief", related: [], dispatchKey: key, actor: "dispatcher" }).task;
 	return { db, ledger, create };
 }
 
 test("createTask is idempotent per dispatcher spawn", () => {
 	const { ledger } = setup();
-	const input = { title: "A", workspaceId: "deck", checkout: { kind: "readonly" as const }, playbook: null, brief: "b", related: [], dispatchKey: "omp/agent-1", actor: "dispatcher" as const };
+	const input = { title: "A", workspaceId: "deck", checkout: { lane: "main" as const }, worktreeId: null, playbook: null, brief: "b", related: [], dispatchKey: "omp/agent-1", actor: "dispatcher" as const };
 	const first = ledger.createTask(input);
 	const again = ledger.createTask(input);
 	assert.equal(first.created, true);
@@ -43,7 +43,7 @@ test("createTask is idempotent per dispatcher spawn", () => {
 test("dispatch → delivery ack → run → report → done, with one pending notice", () => {
 	const { ledger, create } = setup();
 	const t = create("k1");
-	ledger.apply(t.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub", `provisioned:${t.id}`);
+	ledger.apply(t.id, { kind: "provisioned", session: "W-1" }, "hub", `provisioned:${t.id}`);
 	const brief = ledger.enqueue({ sessionId: "W-1", taskId: t.id, kind: "prompt", deliver: "next", text: "brief", dedupeKey: `brief:${t.id}` });
 	assert.equal(ledger.enqueue({ sessionId: "W-1", taskId: t.id, kind: "prompt", deliver: "next", text: "brief", dedupeKey: `brief:${t.id}` }).id, brief.id);
 	ledger.ack(brief.id, "W-1");
@@ -67,15 +67,15 @@ test("one open task per session is enforced by the schema", () => {
 	const { ledger, create } = setup();
 	const a = create("a");
 	const b = create("b");
-	ledger.apply(a.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub");
-	assert.throws(() => ledger.apply(b.id, { kind: "provisioned", session: "W-1", reusedSession: true }, "hub"), /UNIQUE/);
+	ledger.apply(a.id, { kind: "provisioned", session: "W-1" }, "hub");
+	assert.throws(() => ledger.apply(b.id, { kind: "provisioned", session: "W-1" }, "hub"), /UNIQUE/);
 	assert.equal(ledger.mustTask(b.id).session_id, null);
 });
 
 test("the wake budget is derived from wakes sent since the human last spoke; context batches with urgent notices pause main", () => {
 	const { ledger, create, db } = setup();
 	const t = create("k");
-	ledger.apply(t.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub");
+	ledger.apply(t.id, { kind: "provisioned", session: "W-1" }, "hub");
 	const urgent = () => {
 		ledger.apply(t.id, { kind: "provision_failed", step: "env", message: `x${Math.random()}` }, "hub");
 		ledger.apply(t.id, { kind: "provision_retry", text: "" }, "hub");
@@ -103,7 +103,7 @@ test("the wake budget is derived from wakes sent since the human last spoke; con
 test("an approval request opens a hub escalation; the human resolving it closes it with an info notice", () => {
 	const { ledger, create } = setup();
 	const t = create("k");
-	ledger.apply(t.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub");
+	ledger.apply(t.id, { kind: "provisioned", session: "W-1" }, "hub");
 	ledger.apply(t.id, { kind: "delivered", outbox: 1, what: "brief" }, "hub");
 	ledger.apply(t.id, { kind: "run_started", seq: 1 }, "worker");
 	const r = ledger.apply(t.id, { kind: "approval_requested", tool: "bash", summary: "dropdb x" }, "worker");
@@ -120,7 +120,7 @@ test("an approval request opens a hub escalation; the human resolving it closes 
 test("main's escalation is idempotent per task and closes when the human types in the worker", () => {
 	const { ledger, create } = setup();
 	const t = create("k");
-	ledger.apply(t.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub");
+	ledger.apply(t.id, { kind: "provisioned", session: "W-1" }, "hub");
 	const first = ledger.escalate(t.id, "W-1", "irreversible: drop S3 prefix", "main");
 	const second = ledger.escalate(t.id, "W-1", "again", "main");
 	assert.equal(first.created, true);
@@ -145,7 +145,7 @@ test("decisions are deduplicated by tool call and record reverts", () => {
 test("search finds Chinese text with short and long terms, and chat pages are exclusive and ascending", () => {
 	const { db, ledger, create } = setup();
 	const indexer = new Indexer(db);
-	const t = ledger.createTask({ title: "修复登录超时", workspaceId: "deck", checkout: { kind: "readonly" }, playbook: null, brief: "token 刷新竞态导致登录超时", related: [], dispatchKey: "z", actor: "dispatcher" }).task;
+	const t = ledger.createTask({ title: "修复登录超时", workspaceId: "deck", checkout: { lane: "main" }, worktreeId: null, playbook: null, brief: "token 刷新竞态导致登录超时", related: [], dispatchKey: "z", actor: "dispatcher" }).task;
 	indexer.brief(t);
 	indexer.brief(create("other"));
 	for (let i = 1; i <= 5; i++) indexer.capture("M-1", { key: `k${i}`, role: i % 2 ? "user" : "assistant", text: `消息 ${i} 登录`, raw: "{}", at: i });
@@ -166,7 +166,7 @@ test("open and closed task lists, endedAt, and the latest event for the in-fligh
 	db.run("INSERT INTO workspace (id, name, repo_path, default_base, created_at) VALUES ('deck', 'deck', '/r/deck', 'main', 0)");
 	const ledger = new Ledger(db, () => clock);
 	const create = (key: string) =>
-		ledger.createTask({ title: key, workspaceId: "deck", checkout: { kind: "readonly" }, playbook: null, brief: "b", related: [], dispatchKey: key, actor: "dispatcher" }).task;
+		ledger.createTask({ title: key, workspaceId: "deck", checkout: { lane: "main" }, worktreeId: null, playbook: null, brief: "b", related: [], dispatchKey: key, actor: "dispatcher" }).task;
 	const a = create("a");
 	const b = create("b");
 	const c = create("c");
@@ -199,12 +199,11 @@ test("open and closed task lists, endedAt, and the latest event for the in-fligh
 
 test("every timeline event renders in English and Chinese without translating payload text", () => {
 	const cases: { event: TaskEvent; en: string; zh: string }[] = [
-		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { kind: "worktree" }, playbook: "Raw playbook", related: [] }, en: "created in deck (worktree, playbook Raw playbook)", zh: "已在 deck 创建（工作树，执行方案 Raw playbook）" },
-		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { kind: "readonly" }, playbook: null, related: [] }, en: "created in deck (readonly)", zh: "已在 deck 创建（只读）" },
-		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { kind: "continue", task: "T-1", session: "reuse" }, playbook: null, related: [] }, en: "created in deck (continue)", zh: "已在 deck 创建（沿用工作树）" },
+		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { lane: "branch", branch: "feat/raw" }, playbook: "Raw playbook", related: [], worktree: "WT-1" }, en: "created in deck (branch feat/raw, playbook Raw playbook)", zh: "已在 deck 创建（分支 feat/raw，执行方案 Raw playbook）" },
+		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { lane: "main" }, playbook: null, related: [], worktree: null }, en: "created in deck (main checkout, read-only)", zh: "已在 deck 创建（主检出目录，只读）" },
+		{ event: { kind: "created", title: "Raw title", workspace: "deck", checkout: { lane: "main", edit: true }, playbook: null, related: [], worktree: null }, en: "created in deck (main checkout, editing)", zh: "已在 deck 创建（主检出目录，可编辑）" },
 		{ event: { kind: "checked_out", worktree: "WT-1", branch: "feat/raw", path: "/tmp/Raw" }, en: "worktree WT-1 on feat/raw at /tmp/Raw", zh: "工作树 WT-1，分支 feat/raw，路径 /tmp/Raw" },
-		{ event: { kind: "provisioned", session: "W-1", reusedSession: false }, en: "new session W-1", zh: "新建会话 W-1" },
-		{ event: { kind: "provisioned", session: "W-1", reusedSession: true }, en: "reusing session W-1", zh: "沿用会话 W-1" },
+		{ event: { kind: "provisioned", session: "W-1" }, en: "worker session W-1", zh: "执行者会话 W-1" },
 		{ event: { kind: "provision_failed", step: "env", message: "Raw stderr" }, en: "provisioning failed at env: Raw stderr", zh: "准备环境失败：Raw stderr" },
 		{ event: { kind: "provision_retry", text: "Raw guidance" }, en: "provisioning retried", zh: "已重试准备环境" },
 		{ event: { kind: "queued_for_capacity", live: 2, cap: 3 }, en: "waiting for a worker slot (2/3 live)", zh: "等待空闲执行者（已启动 2/3）" },
@@ -226,7 +225,9 @@ test("every timeline event renders in English and Chinese without translating pa
 		{ event: { kind: "decided", decision: "D-1", summary: "Raw summary" }, en: "D-1: Raw summary", zh: "D-1：Raw summary" },
 		{ event: { kind: "accepted", reason: "Raw reason", decision: null }, en: "accepted as done: Raw reason", zh: "已确认完成：Raw reason" },
 		{ event: { kind: "cancelled", by: "human", reason: "Raw reason" }, en: "cancelled by human: Raw reason", zh: "你已取消：Raw reason" },
-		{ event: { kind: "cleaned_up" }, en: "environment torn down and worktree removed", zh: "环境已清理，工作树已移除" },
+		{ event: { kind: "merged", branch: "feat/raw", into: "origin/main", sha: "7f3a9c1e0b" }, en: "feat/raw merged into origin/main by the human (7f3a9c1e): accepted", zh: "你已将 feat/raw 合并到 origin/main（7f3a9c1e），视为验收" },
+		{ event: { kind: "worktree_retired", reason: "merged", branch: "feat/raw", sha: "7f3a9c1e0b", branchDeleted: true }, en: "worktree removed (merged); branch feat/raw deleted at 7f3a9c1e", zh: "工作树已移除（已合并）；分支 feat/raw 已删除，删除前位于 7f3a9c1e" },
+		{ event: { kind: "worktree_retired", reason: "gone", branch: "feat/raw", sha: null, branchDeleted: false }, en: "worktree removed (gone); branch feat/raw was already deleted", zh: "工作树已移除（分支已删除）；分支 feat/raw 此前已被删除" },
 	];
 	for (const { event, en, zh } of cases) {
 		const stored = JSON.stringify(event);
@@ -292,7 +293,7 @@ test("legacy raw worker waits are not mistaken for generated fallback text", () 
 test("auto-escalation reasons localize from their original source, including legacy rows", () => {
 	const { db, ledger, create } = setup();
 	const t = create("localized-escalation");
-	ledger.apply(t.id, { kind: "provisioned", session: "W-1", reusedSession: false }, "hub");
+	ledger.apply(t.id, { kind: "provisioned", session: "W-1" }, "hub");
 	const result = ledger.apply(t.id, { kind: "approval_requested", tool: "bash", summary: "dropdb Raw_DB" }, "worker");
 	const escalation = result.opened[0]!;
 	const event = ledger.events(t.id).at(-1)!;
@@ -382,4 +383,41 @@ test("legacy generated waits recover translations from events rather than matchi
 		assert.deepEqual(ledger.summary(row, null, "zh").wait, { kind, text: zh });
 		assert.equal(ledger.mustTask(t.id).wait, row.wait);
 	}
+});
+
+test("settled is projected per event, the latest task on a worktree is found, and one main-checkout editor at a time", () => {
+	const { db, ledger } = setup();
+	db.run("INSERT INTO worktree (id, workspace_id, branch, path, fork_ref, fork_sha, state, created_at) VALUES ('WT-1', 'deck', 'feat/x', '/r/x', 'main', 'abc', 'live', 1)");
+	const onBranch = (key: string) =>
+		ledger.createTask({ title: key, workspaceId: "deck", checkout: { lane: "branch", branch: "feat/x" }, worktreeId: "WT-1", playbook: null, brief: "b", related: [], dispatchKey: key, actor: "dispatcher" }).task;
+	const first = onBranch("a");
+	assert.equal(first.worktree_id, "WT-1", "the created event carries the worktree");
+	assert.equal(ledger.eventsOf(first.id, "created")[0]!.event.worktree, "WT-1");
+	ledger.apply(first.id, { kind: "accepted", reason: "ok", decision: null }, "main");
+	assert.equal(ledger.mustTask(first.id).settled, 1);
+	const second = onBranch("b");
+	assert.equal(ledger.latestOn("WT-1")!.id, second.id);
+	const merged = ledger.apply(second.id, { kind: "merged", branch: "feat/x", into: "main", sha: "def" }, "hub", "merged:WT-1:def");
+	assert.deepEqual([ledger.mustTask(second.id).status, ledger.mustTask(second.id).settled, merged.notices], ["done", 1, ["merged"]]);
+	const [item] = ledger.batchItems(ledger.pendingNotices());
+	assert.equal(item!.hubNote, "feat/x merged into main by the human; the hub removes its worktree and branch. No action needed.");
+	assert.equal(item!.workerText, null);
+
+	const editor = (key: string) =>
+		ledger.createTask({ title: key, workspaceId: "deck", checkout: { lane: "main", edit: true }, worktreeId: null, playbook: null, brief: "b", related: [], dispatchKey: key, actor: "dispatcher" }).task;
+	const e1 = editor("e1");
+	const conflict = (() => {
+		try {
+			editor("e2");
+		} catch (err) {
+			return err;
+		}
+	})();
+	assert.ok(conflict instanceof HubError && conflict.code === "conflict");
+	assert.match(conflict.message, new RegExp(`^${e1.id} is editing deck's main checkout \\(pending\\)`));
+	assert.equal(conflict.localized("zh"), `${e1.id} 正在编辑 deck 的主检出目录，同一时间只能有一个编辑任务；等 ${e1.id} 验收后再试`);
+	ledger.apply(e1.id, { kind: "accepted", reason: "ok", decision: null }, "main");
+	const e3 = editor("e3");
+	assert.throws(() => ledger.apply(e1.id, { kind: "message_sent", by: "human", text: "more", mode: "next", decision: null }, "human"), (err: unknown) => err instanceof HubError && err.code === "conflict" && err.message.startsWith(`${e3.id} is editing`));
+	assert.equal(ledger.mustTask(e1.id).settled, 1, "a refused reopen leaves the task as it was");
 });

@@ -35,6 +35,8 @@ export interface BatchItem {
 	task: { id: string; title: string; workspace: string; session: string | null; status: TaskStatus; wait: Wait | null };
 	kinds: NoticeKind[];
 	workerText: string | null;
+	/** What the hub did on its own (a merge it noticed), in its words. */
+	hubNote: string | null;
 }
 
 const WORKER_TEXT_LIMIT = 600;
@@ -52,7 +54,7 @@ export function renderBatch(items: BatchItem[], delivery: { mode: "wake" | "cont
 		const where = [t.workspace, t.session].filter(Boolean).join(", ");
 		const state = t.wait ? `awaiting: ${t.wait.kind}` : t.status;
 		const extra = item.kinds.filter(k => k !== state && !(t.wait && k === t.wait.kind));
-		const hubText = t.wait && !item.workerText ? ` — ${t.wait.text}` : "";
+		const hubText = t.wait && !item.workerText ? ` — ${t.wait.text}` : item.hubNote ? ` — ${item.hubNote}` : "";
 		lines.push(`${t.id} ${t.title} (${where}) — ${state}${hubText}${extra.length ? ` · events: ${extra.join(", ")}` : ""}`);
 		if (item.workerText) lines.push(quoteWorker(t.id, item.workerText));
 	}

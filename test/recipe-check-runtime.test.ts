@@ -1,16 +1,15 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { stringify } from "yaml";
 import { homePaths } from "../server/config.ts";
 import { Db } from "../server/db.ts";
 import { Env, runShell } from "../server/env.ts";
-import { Worktrees } from "../server/git.ts";
 import { RecipeChecks } from "../server/recipe-check.ts";
 import { SettingsStore } from "../server/settings.ts";
 import { Workspaces } from "../server/workspaces.ts";
+import { Worktrees } from "../server/worktrees.ts";
 import { sandbox, until } from "./hub-harness.ts";
 
 test("recipe trial uses real service, port, database and exported test environment paths without worker rows", { timeout: 20_000 }, async t => {
@@ -47,7 +46,8 @@ test("recipe trial uses real service, port, database and exported test environme
 	assert.equal(logs.length, 1);
 	const log = fs.readFileSync(path.join(paths.run, "recipe-checks", logs[0]!), "utf8");
 	assert.match(log, /real environment verified/);
-	assert.match(log, /git .*worktree remove --force/);
+	assert.deepEqual(result.steps.filter(step => step.name === "worktree").map(step => [step.kind, step.state]), [["checkout", "passed"], ["teardown", "passed"]]);
+	assert.equal(box.git("worktree", "list", "--porcelain").split("\n").filter(line => line.startsWith("worktree ")).length, 1, "the trial checkout is gone");
 });
 
 test("shell timeouts kill stubborn process groups and preserve a nonzero exit code", { timeout: 10_000 }, async t => {
@@ -69,22 +69,4 @@ test("shell cancellation terminates the running process rather than merely detac
 	assert.match(result.output, /cancelled/);
 	const pid = Number(result.output.split("\n")[0]);
 	assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-});
-
-test("an existing v1 database gains persisted recipe checks without losing workspace data", t => {
-	const box = sandbox();
-	t.after(() => fs.rmSync(box.tmp, { recursive: true, force: true }));
-	const file = path.join(box.tmp, "old.db");
-	const old = new DatabaseSync(file);
-	old.exec(fs.readFileSync(path.join(import.meta.dirname, "..", "server", "schema.sql"), "utf8"));
-	old.exec("INSERT INTO meta VALUES ('schema_version', '1')");
-	old.prepare("INSERT INTO workspace (id, name, repo_path, default_base, created_at) VALUES ('old', 'Old', ?, 'main', 0)").run(box.gitRepo);
-	old.close();
-	for (let n = 0; n < 2; n++) {
-		const db = new Db(file);
-		assert.equal(db.meta("schema_version"), "2");
-		assert.equal(db.get<{ name: string }>("SELECT name FROM workspace WHERE id='old'")!.name, "Old");
-		assert.equal(db.get<{ n: number }>("SELECT count(*) AS n FROM recipe_check")!.n, 0);
-		db.close();
-	}
 });

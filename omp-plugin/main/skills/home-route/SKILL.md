@@ -9,7 +9,7 @@ description: "处理 Home 主聊天里的每条用户请求。直接回答，或
 
 1. 不需要仓库工作的聊天，直接回答。
 2. 要工作，先 `home_status({})`，再 `home_search({query: "相关关键词", scope: "all"})`。找相关任务和聊天，必要时用 `home_task` 或 `home_chat` 读小段上下文。仓库必须已登记；没有的让用户在 UI 登记，不猜路径。
-3. 定 workspace 和 checkout。新改动用 `{kind:"worktree"}`，分支/基准只在必要时指定。后续独立任务沿用旧 worktree 用 `{kind:"continue",task:"T-n",session:"fresh"}`；仅当对话、未提交改动或运行中进程确实需要保留时用 `session:"reuse"`。只读调查用 `{kind:"readonly"}`，明确禁止写文件。
+3. 定 workspace 和 checkout：按 `home_dispatch` 的 checkout schema 和 `skill://repo-worktree` 选车道和分支名。
 4. 读 `skill://poteto-mode` 的 Playbooks 列表，选择 `home_status` 返回的实际文件 stem。只读问题用 `investigation`，缺陷 `bug-fix`，新行为 `feature`，结构调整 `refactoring`，有测量的性能问题 `perf-issue`，用实验定方向 `prototype`。不要让只读问题变成改代码。其他工作按列表匹配；没有匹配的给 dispatcher 说明原因，不编造 playbook。
 5. 用一次异步 `task`，`tasks` 里只有一个 `{agent:"dispatcher", task:..., solutionSpace:...}`。携带用户原话（逐字，不改写）、Home 目录、workspace、checkout、playbook、相关任务 ID、已知约束。不给 dispatcher 实现任务，只让它读上下文、写 brief、调用一次 `home_dispatch`。不要自己写 brief 或调用 `home_dispatch`。
 6. 立即用一两句告诉用户派给哪个仓库做什么。不要 `wait`，不要轮询 dispatcher。结果会自动送回；派发失败就说明具体问题并修正，不把未派出的任务说成已开始。

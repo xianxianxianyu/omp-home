@@ -6,7 +6,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import type { Language, StateDTO } from "../shared/api.ts";
-import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId } from "../shared/ids.ts";
+import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId, parseWorktreeId } from "../shared/ids.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError, localizeFieldErrors } from "./errors.ts";
 import { pickFolder } from "./folder-picker.ts";
@@ -69,6 +69,8 @@ const pickFolderSchema = z.strictObject({
 	title: z.string().max(200).optional(),
 	defaultPath: z.string().refine(p => path.isAbsolute(p), localizedCheck(validationMessages.absolutePath())).optional(),
 });
+const removeSchema = z.strictObject({ deleteBranch: z.boolean() });
+const keepSchema = z.strictObject({ keep: z.boolean() });
 const taskStatusFilter = z.enum(["pending", "working", "awaiting", "done", "cancelled", "open", "closed"]);
 const promptSchema = z.strictObject({ text: z.string().min(1).max(20_000), mode: z.enum(["auto", "steer", "followUp"]).optional() });
 const respondSchema = z.strictObject({
@@ -398,11 +400,6 @@ export class HubServer {
 			hub().cancelTask(id, "human", reason ?? messages.cancelledDefault().en, uiKey(), reason === undefined ? messages.cancelledDefault() : undefined);
 			return hub().taskDetail(id, 200, language);
 		});
-		r("POST", "/api/tasks/:id/cleanup", async ({ params, language }) => {
-			const id = parseTaskId(params[0]);
-			await hub().cleanupTask(id);
-			return hub().taskDetail(id, 200, language);
-		});
 		r("POST", "/api/tasks/:id/message", async ({ params, body, language }) => {
 			const id = parseTaskId(params[0]);
 			await hub().messageTask(id, parse(textSchema, body).text, uiKey());
@@ -536,6 +533,9 @@ export class HubServer {
 			h.changed("workspaces", "state");
 			return h.workspaces.dto(w);
 		});
+		r("GET", "/api/workspaces/:id/branches", ({ params, language }) => hub().lifecycle.branches(parseWorkspaceId(params[0]), language));
+		r("POST", "/api/worktrees/:id/remove", ({ params, body, language }) => hub().lifecycle.remove(parseWorktreeId(params[0]), parse(removeSchema, body).deleteBranch, language));
+		r("POST", "/api/worktrees/:id/keep", ({ params, body, language }) => hub().lifecycle.keep(parseWorktreeId(params[0]), parse(keepSchema, body).keep, language));
 		r("GET", "/api/workspaces/:id/recipe", ({ params, language }) => hub().workspaces.readRecipe(parseWorkspaceId(params[0]), language));
 		r("PUT", "/api/workspaces/:id/recipe", ({ params, body, language }) => {
 			const h = hub();

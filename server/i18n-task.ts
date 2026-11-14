@@ -2,9 +2,10 @@ import type { WaitKind } from "../shared/api.ts";
 import type { StopReason } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { EscalationResolution, ProvisionStep, ReportStatus } from "./core/task.ts";
+import type { RetireReason } from "./core/worktree.ts";
 import { defineMessages, type Message, render } from "./i18n.ts";
 
-const checkoutKinds: Record<CheckoutSpec["kind"], string> = { worktree: "工作树", continue: "沿用工作树", readonly: "只读" };
+const retireReasons: Record<RetireReason, string> = { merged: "已合并", unused: "未使用", gone: "分支已删除", discarded: "已丢弃" };
 const provisionSteps: Record<ProvisionStep, string> = { checkout: "检出代码", env: "准备环境", session: "启动会话" };
 const stopReasons: Record<StopReason, string> = { completed: "已完成", aborted: "已中止", error: "出错" };
 const reportStatuses: Record<ReportStatus, string> = { done: "已完成", blocked: "受阻", question: "有疑问", progress: "进展" };
@@ -26,9 +27,12 @@ const en = {
 	noTask: (id: string) => `no task ${id}`,
 	noDecision: (id: string) => `no decision ${id}`,
 	noEscalation: (id: string) => `no escalation ${id}`,
-	created: (workspace: string, checkout: CheckoutSpec["kind"], playbook: string | null) => `created in ${workspace} (${checkout}${playbook ? `, playbook ${playbook}` : ""})`,
+	mainEditorBusy: (task: string, workspace: string, status: string) =>
+		`${task} is editing ${workspace}'s main checkout (${status}): home_send ${task} to add this, or wait until it is accepted`,
+	created: (workspace: string, checkout: CheckoutSpec, playbook: string | null) =>
+		`created in ${workspace} (${checkout.lane === "branch" ? `branch ${checkout.branch}` : checkout.edit ? "main checkout, editing" : "main checkout, read-only"}${playbook ? `, playbook ${playbook}` : ""})`,
 	checkedOut: (worktree: string, branch: string, path: string) => `worktree ${worktree} on ${branch} at ${path}`,
-	provisioned: (session: string, reused: boolean) => `${reused ? "reusing" : "new"} session ${session}`,
+	provisioned: (session: string) => `worker session ${session}`,
 	provisionFailed: (step: ProvisionStep, detail: string | Message) => `provisioning failed at ${step}: ${render(detail)}`,
 	provisionRetry: () => "provisioning retried",
 	queued: (live: number, cap: number) => `waiting for a worker slot (${live}/${cap} live)`,
@@ -47,7 +51,9 @@ const en = {
 	decided: (id: string, summary: string | Message) => `${id}: ${render(summary)}`,
 	accepted: (reason: string) => `accepted as done: ${reason}`,
 	cancelled: (by: "main" | "human", reason: string | Message) => `cancelled by ${by}: ${render(reason)}`,
-	cleanedUp: () => "environment torn down and worktree removed",
+	merged: (branch: string, into: string, sha: string) => `${branch} merged into ${into} by the human (${sha.slice(0, 8)}): accepted`,
+	worktreeRetired: (reason: RetireReason, branch: string, sha: string | null, branchDeleted: boolean) =>
+		`worktree removed (${reason}); branch ${branch} ${branchDeleted ? `deleted${sha ? ` at ${sha.slice(0, 8)}` : ""}` : reason === "gone" ? "was already deleted" : "kept"}`,
 	waitAborted: () => "The run was aborted.",
 	waitFailed: () => "The run failed.",
 	waitNoFinal: () => "(no final text)",
@@ -61,9 +67,11 @@ export const taskMessages = defineMessages(en, {
 	noTask: id => `找不到任务 ${id}`,
 	noDecision: id => `找不到决定 ${id}`,
 	noEscalation: id => `找不到请示 ${id}`,
-	created: (workspace, checkout, playbook) => `已在 ${workspace} 创建（${checkoutKinds[checkout]}${playbook ? `，执行方案 ${playbook}` : ""}）`,
+	mainEditorBusy: (task, workspace) => `${task} 正在编辑 ${workspace} 的主检出目录，同一时间只能有一个编辑任务；等 ${task} 验收后再试`,
+	created: (workspace, checkout, playbook) =>
+		`已在 ${workspace} 创建（${checkout.lane === "branch" ? `分支 ${checkout.branch}` : checkout.edit ? "主检出目录，可编辑" : "主检出目录，只读"}${playbook ? `，执行方案 ${playbook}` : ""}）`,
 	checkedOut: (worktree, branch, path) => `工作树 ${worktree}，分支 ${branch}，路径 ${path}`,
-	provisioned: (session, reused) => `${reused ? "沿用" : "新建"}会话 ${session}`,
+	provisioned: session => `执行者会话 ${session}`,
 	provisionFailed: (step, detail) => `${provisionSteps[step]}失败：${render(detail, "zh")}`,
 	provisionRetry: () => "已重试准备环境",
 	queued: (live, cap) => `等待空闲执行者（已启动 ${live}/${cap}）`,
@@ -82,7 +90,9 @@ export const taskMessages = defineMessages(en, {
 	decided: (id, summary) => `${id}：${render(summary, "zh")}`,
 	accepted: reason => `已确认完成：${reason}`,
 	cancelled: (by, reason) => `${actors[by]}已取消：${render(reason, "zh")}`,
-	cleanedUp: () => "环境已清理，工作树已移除",
+	merged: (branch, into, sha) => `你已将 ${branch} 合并到 ${into}（${sha.slice(0, 8)}），视为验收`,
+	worktreeRetired: (reason, branch, sha, branchDeleted) =>
+		`工作树已移除（${retireReasons[reason]}）；分支 ${branch} ${branchDeleted ? `已删除${sha ? `，删除前位于 ${sha.slice(0, 8)}` : ""}` : reason === "gone" ? "此前已被删除" : "已保留"}`,
 	waitAborted: () => "运行已中止。",
 	waitFailed: () => "运行失败。",
 	waitNoFinal: () => "（无最终回复）",

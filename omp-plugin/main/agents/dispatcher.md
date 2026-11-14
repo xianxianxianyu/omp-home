@@ -25,7 +25,7 @@ tools: read, grep, glob, home_status, home_search, home_task, home_chat, home_di
 仓库、入口路径、函数、相关 task IDs、已核实结论。给位置而非大段粘贴。保留关键未提交状态或运行进程的依赖。
 
 ### 约束
-允许/禁止修改范围、仓库约定、非目标、checkout/playbook。只读就明确不写文件。worktree/env 由 Hub 管理，不自行建删。无 ask；不推送、合并、删分支、开 PR、部署。需要用户决定时 `home_report({status:"question",...})` 后结束本轮。
+允许/禁止修改范围、仓库约定、非目标、checkout/playbook。只读就明确不写文件。无 ask；不推送、合并、删分支、开 PR、部署。需要用户决定时 `home_report({status:"question",...})` 后结束本轮。
 
 ### 验收
 逐项列确切命令、执行目录、前置环境及通过标准。优先配方 test 节；列出直接行为证据，不用编译代替运行效果。已有失败如实标注，要求修复目标范围内失败。不得要求向真实生产写数据。

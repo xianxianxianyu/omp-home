@@ -40,6 +40,7 @@ export interface TaskRow {
 	created_at: number;
 	updated_at: number;
 	ended_at: number | null;
+	settled: number;
 }
 
 export interface EventRow {
@@ -110,10 +111,16 @@ export interface ApplyResult {
 
 export const isOpen = (status: TaskStatus) => status !== "done" && status !== "cancelled";
 
+/** "awaiting question", or the plain status. */
+export function statusText(t: TaskRow): string {
+	const wait = waitOf(t);
+	return wait ? `awaiting ${wait.kind}` : t.status;
+}
+
 export function stateOf(row: TaskRow): TaskState {
 	const wait = row.wait ? (JSON.parse(row.wait) as Wait) : null;
 	const status: Status = row.status === "awaiting" && wait ? { s: "awaiting", wait } : ({ s: row.status } as Status);
-	return { status, runOpen: row.run_open === 1, runReport: row.run_report ? (JSON.parse(row.run_report) as Report) : null };
+	return { status, runOpen: row.run_open === 1, runReport: row.run_report ? (JSON.parse(row.run_report) as Report) : null, settled: row.settled === 1 };
 }
 
 export function waitOf(row: TaskRow): Wait | null {
@@ -146,10 +153,12 @@ export class Ledger {
 		return row;
 	}
 
+	/** A new task; lane branch tasks name the worktree claimed in the same transaction. */
 	createTask(input: {
 		title: string;
 		workspaceId: string;
 		checkout: CheckoutSpec;
+		worktreeId: string | null;
 		playbook: string | null;
 		brief: string;
 		related: string[];
@@ -157,33 +166,59 @@ export class Ledger {
 		actor: Actor;
 	}): { task: TaskRow; created: boolean } {
 		return this.#db.tx(() => {
-			const existing = this.#db.get<TaskRow>("SELECT * FROM task WHERE dispatch_key = ?", input.dispatchKey);
+			const existing = this.dispatched(input.dispatchKey);
 			if (existing) return { task: existing, created: false };
 			const { id, seq } = this.#db.nextId("T");
 			const now = this.#now();
-			this.#db.run(
-				`INSERT INTO task (id, seq, title, workspace_id, checkout, playbook, brief, status, dispatch_key, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-				id,
-				seq,
-				input.title,
-				input.workspaceId,
-				JSON.stringify(input.checkout),
-				input.playbook,
-				input.brief,
-				input.dispatchKey,
-				now,
-				now,
+			this.#guardEditor(input.workspaceId, () =>
+				this.#db.run(
+					`INSERT INTO task (id, seq, title, workspace_id, checkout, playbook, brief, worktree_id, status, dispatch_key, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+					id,
+					seq,
+					input.title,
+					input.workspaceId,
+					JSON.stringify(input.checkout),
+					input.playbook,
+					input.brief,
+					input.worktreeId,
+					input.dispatchKey,
+					now,
+					now,
+				),
 			);
 			for (const other of input.related) {
-				this.#db.run("INSERT OR IGNORE INTO task_link (task_id, other_id, kind) VALUES (?, ?, 'related')", id, other);
+				this.#db.run("INSERT OR IGNORE INTO task_link (task_id, other_id) VALUES (?, ?)", id, other);
 			}
-			if (input.checkout.kind === "continue") {
-				this.#db.run("INSERT OR REPLACE INTO task_link (task_id, other_id, kind) VALUES (?, ?, 'continues')", id, input.checkout.task);
-			}
-			this.#append(id, { kind: "created", title: input.title, workspace: input.workspaceId, checkout: input.checkout, playbook: input.playbook, related: input.related }, input.actor, null);
+			this.#append(
+				id,
+				{ kind: "created", title: input.title, workspace: input.workspaceId, checkout: input.checkout, playbook: input.playbook, related: input.related, worktree: input.worktreeId },
+				input.actor,
+				null,
+			);
 			return { task: this.mustTask(id), created: true };
 		});
+	}
+
+	/** The task a dispatcher spawn already created: one dispatch per spawn. */
+	dispatched(dispatchKey: string): TaskRow | undefined {
+		return this.#db.get<TaskRow>("SELECT * FROM task WHERE dispatch_key = ?", dispatchKey);
+	}
+
+	/** The unsettled task editing a workspace's main checkout, if any. */
+	mainEditor(workspaceId: string): TaskRow | undefined {
+		return this.#db.get<TaskRow>("SELECT * FROM task WHERE workspace_id = ? AND settled = 0 AND json_extract(checkout, '$.edit') = 1", workspaceId);
+	}
+
+	/** The partial unique index `task_one_main_editor` speaks SQLite; callers get a conflict naming the editor. */
+	#guardEditor<T>(workspaceId: string, write: () => T): T {
+		try {
+			return write();
+		} catch (err) {
+			if (!(err instanceof Error) || !err.message.includes("UNIQUE constraint failed: task.workspace_id")) throw err;
+			const editor = this.mainEditor(workspaceId);
+			throw new HubError("conflict", taskMessages.mainEditorBusy(editor?.id ?? "?", workspaceId, editor ? statusText(editor) : "open"));
+		}
 	}
 
 	apply(taskId: string, event: TaskEvent, actor: Actor, dedupeKey: string | null = null): ApplyResult {
@@ -211,19 +246,21 @@ export class Ledger {
 			dedupeKey,
 		).id;
 		const terminal = after.status.s === "done" || after.status.s === "cancelled";
-		this.#db.run(
-			`UPDATE task SET status = ?, wait = ?, run_open = ?, run_report = ?, updated_at = ?, ended_at = ?,
-			   worktree_id = coalesce(?, worktree_id), session_id = coalesce(?, session_id)
-			 WHERE id = ?`,
-			after.status.s,
-			after.status.s === "awaiting" ? JSON.stringify(after.status.wait) : null,
-			after.runOpen ? 1 : 0,
-			after.runReport ? JSON.stringify(after.runReport) : null,
-			now,
-			terminal ? (row.ended_at ?? now) : null,
-			event.kind === "checked_out" ? event.worktree : null,
-			event.kind === "provisioned" ? event.session : null,
-			taskId,
+		this.#guardEditor(row.workspace_id, () =>
+			this.#db.run(
+				`UPDATE task SET status = ?, wait = ?, run_open = ?, run_report = ?, settled = ?, updated_at = ?, ended_at = ?,
+				   session_id = coalesce(?, session_id)
+				 WHERE id = ?`,
+				after.status.s,
+				after.status.s === "awaiting" ? JSON.stringify(after.status.wait) : null,
+				after.runOpen ? 1 : 0,
+				after.runReport ? JSON.stringify(after.runReport) : null,
+				after.settled ? 1 : 0,
+				now,
+				terminal ? (row.ended_at ?? now) : null,
+				event.kind === "provisioned" ? event.session : null,
+				taskId,
+			),
 		);
 		const result: ApplyResult = { applied: true, before, after, notices: [], opened: [] };
 		const notice = noticeFor(before, after, event);
@@ -308,8 +345,14 @@ export class Ledger {
 			.map(e => ({ id: e.id, at: e.at, event: JSON.parse(e.data) as Extract<TaskEvent, { kind: K }> }));
 	}
 
+	/** Every task on a worktree's branch, oldest first. */
 	tasksForWorktree(worktreeId: string): TaskRow[] {
 		return this.#db.all<TaskRow>("SELECT * FROM task WHERE worktree_id = ? ORDER BY seq", worktreeId);
+	}
+
+	/** The latest task on a worktree: the only one that can have a session, and the one whose state gates retirement. */
+	latestOn(worktreeId: string): TaskRow | undefined {
+		return this.#db.get<TaskRow>("SELECT * FROM task WHERE worktree_id = ? ORDER BY seq DESC LIMIT 1", worktreeId);
 	}
 
 	related(taskId: string): string[] {
@@ -604,10 +647,11 @@ export class Ledger {
 		return [...byTask].map(([taskId, kinds]) => {
 			const t = this.mustTask(taskId);
 			const wait = waitOf(t);
+			const merged = kinds.includes("merged") ? this.eventsOf(taskId, "merged").at(-1)?.event : undefined;
 			let workerText: string | null = null;
 			// Hub-written waits (interrupted, provision_failed) are rendered inline; the rest quote worker text.
 			if (wait && wait.kind !== "interrupted" && wait.kind !== "provision_failed") workerText = wait.text;
-			else if (t.status === "done" || kinds.includes("progress")) {
+			else if (!merged && (t.status === "done" || kinds.includes("progress"))) {
 				const report = this.reports(taskId).at(-1);
 				if (report) workerText = report.details ? `${report.summary}\n${report.details}` : report.summary;
 			}
@@ -615,6 +659,7 @@ export class Ledger {
 				task: { id: t.id, title: t.title, workspace: t.workspace_id, session: t.session_id, status: t.status, wait },
 				kinds: [...new Set(kinds)],
 				workerText,
+				hubNote: merged ? `${merged.branch} merged into ${merged.into} by the human; the hub removes its worktree and branch. No action needed.` : null,
 			};
 		});
 	}
@@ -669,13 +714,13 @@ export function describeEvent(e: TaskEvent, language: Language = "en"): string {
 	let message: Message;
 	switch (e.kind) {
 		case "created":
-			message = taskMessages.created(e.workspace, e.checkout.kind, e.playbook);
+			message = taskMessages.created(e.workspace, e.checkout, e.playbook);
 			break;
 		case "checked_out":
 			message = taskMessages.checkedOut(e.worktree, e.branch, e.path);
 			break;
 		case "provisioned":
-			message = taskMessages.provisioned(e.session, e.reusedSession);
+			message = taskMessages.provisioned(e.session);
 			break;
 		case "provision_failed":
 			message = taskMessages.provisionFailed(e.step, e.messageText ?? e.message);
@@ -731,8 +776,11 @@ export function describeEvent(e: TaskEvent, language: Language = "en"): string {
 		case "cancelled":
 			message = taskMessages.cancelled(e.by, e.reasonMessage ?? e.reason);
 			break;
-		case "cleaned_up":
-			message = taskMessages.cleanedUp();
+		case "merged":
+			message = taskMessages.merged(e.branch, e.into, e.sha);
+			break;
+		case "worktree_retired":
+			message = taskMessages.worktreeRetired(e.reason, e.branch, e.sha, e.branchDeleted);
 			break;
 	}
 	return render(message, language);

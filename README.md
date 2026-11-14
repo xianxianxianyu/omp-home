@@ -32,8 +32,8 @@ Running agents on several repositories at once means juggling terminals, re-expl
 
 | Feature | What it does |
 | --- | --- |
-| 🧭 **Intent routing** | Related tasks and past messages are looked up before every dispatch. The main chat chooses the workspace, a new or reused worktree, and the pstack playbook (bug fix, feature, investigation, …). |
-| 🌳 **Worktree per task** | Every task gets `<repo>.worktrees/<branch>` and a worker session from a capped pool. Idle workers are stopped and resumed later from their transcript. |
+| 🧭 **Intent routing** | Related tasks and past messages are looked up before every dispatch. The main chat chooses the workspace, the branch (or the main checkout for research and doc edits), and the pstack playbook (bug fix, feature, investigation, …). |
+| 🌳 **Worktree per branch** | Code changes get `<repo>.worktrees/<branch>` and a fresh worker session from a capped pool; later tasks on the same branch reuse the worktree. Once you merge, the hub removes the worktree and the branch. Idle workers are stopped and resumed later from their transcript. |
 | 🧪 **Reusable test environments** | A per-repo recipe starts shared services once, leases per-worktree ports, clones a per-worktree database from a template, and leases test accounts. |
 | 📨 **Reports go to the main chat first** | Worker outcomes are batched into the main chat. It wakes itself at most 3 times in a row, then waits for you. |
 | 🧾 **Decisions you can audit and revert** | Every decision taken on your behalf records why and how to undo it. |
@@ -163,13 +163,13 @@ docs/         architecture and pipeline diagrams
 <details>
 <summary><b>Is this a sandbox?</b></summary>
 
-No. Worker guardrails (no `ask`, no push, merge or branch deletion) stop mistakes, not a determined process. Workers have the same filesystem and network access as you. Irreversible hub actions such as cleanup or workspace removal are human-only.
+No. Worker guardrails (no `ask`, no push, merge or branch deletion) stop mistakes, not a determined process. Workers have the same filesystem and network access as you. Irreversible hub actions such as discarding an unmerged branch or removing a workspace are human-only; the hub itself deletes only branches git shows are merged or unused.
 </details>
 
 <details>
 <summary><b>Does it commit or merge for me?</b></summary>
 
-No. Finished work stays uncommitted in the task's worktree. Committing, opening PRs and merging are yours to do.
+No. Workers commit on their task's branch; pushing, opening PRs and merging are yours to do. After you merge, the hub removes the worktree and the local branch. Doc edits in the main checkout stay uncommitted for you.
 </details>
 
 <details>

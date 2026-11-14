@@ -3,13 +3,14 @@ import { renderEnvelope, type ProvisionStep } from "./core/task.ts";
 import type { Db } from "./db.ts";
 import { EnvError, type Env } from "./env.ts";
 import { errorText, HubError } from "./errors.ts";
-import { ensureWorktree, GitError, isValidBranchName, worktreePath, type WorktreeRow, type Worktrees } from "./git.ts";
+import { GitError } from "./git.ts";
 import { envMessages } from "./i18n-env.ts";
 import { render, type Message } from "./i18n.ts";
 import type { Ledger, TaskRow } from "./ledger.ts";
 import type { Pool, SessionRow } from "./pool.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { WorkspaceRow, Workspaces } from "./workspaces.ts";
+import type { WorktreeLifecycle, WorktreeRow } from "./worktrees.ts";
 
 class ProvisionError extends Error {
 	readonly step: ProvisionStep;
@@ -26,24 +27,13 @@ export interface ProvisionerDeps {
 	db: Db;
 	ledger: Ledger;
 	workspaces: Workspaces;
-	worktrees: Worktrees;
+	lifecycle: WorktreeLifecycle;
 	env: Env;
 	pool: Pool;
 	settings: SettingsStore;
 	flush(sessionId: string): void;
 	changed(taskId: string): void;
 	log(message: string): void;
-}
-
-/** Default branch: `task/<slug of title>-<seq>`; titles without ASCII words become `task/t<seq>`. */
-export function defaultBranch(title: string, seq: number): string {
-	const slug = title
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "")
-		.slice(0, 40)
-		.replace(/-+$/, "");
-	return slug ? `task/${slug}-${seq}` : `task/t${seq}`;
 }
 
 /**
@@ -102,21 +92,23 @@ export class Provisioner {
 	async #steps(task: TaskRow): Promise<void> {
 		const ws = this.#d.workspaces.must(task.workspace_id);
 		const checkout = JSON.parse(task.checkout) as CheckoutSpec;
-		const continued = checkout.kind === "continue" ? this.#d.ledger.mustTask(checkout.task) : null;
-
-		const worktree = await this.#checkout(task, ws, checkout, continued);
-		if (worktree) {
+		let worktree: WorktreeRow | null = null;
+		if (task.worktree_id) {
+			try {
+				worktree = await this.#d.lifecycle.checkout(task.worktree_id);
+			} catch (err) {
+				throw new ProvisionError("checkout", err instanceof GitError || err instanceof HubError ? (err.localizedText ?? err.message) : errorText(err));
+			}
 			this.#d.ledger.apply(task.id, { kind: "checked_out", worktree: worktree.id, path: worktree.path, branch: worktree.branch }, "hub", `checkout:${task.id}`);
 			this.#d.changed(task.id);
 			await this.#d.env.ensure(worktree.id);
-		}
-		else {
+		} else {
 			const recipe = this.#d.workspaces.loadRecipe(ws.id);
 			if (recipe.status === "ok") await this.#d.env.ensureServices(ws, recipe.recipe);
 		}
 		// Cancelled while the checkout or environment was being prepared: stop before a session exists.
 		if (this.#d.ledger.mustTask(task.id).status !== "pending") return;
-		const session = await this.#session(this.#d.ledger.mustTask(task.id), ws, checkout, worktree, continued);
+		const session = await this.#session(this.#d.ledger.mustTask(task.id), ws, worktree);
 		if (this.#d.ledger.mustTask(task.id).status !== "pending") return;
 		if (this.#d.pool.ensureLive(session.id, { human: false }) === "queued") {
 			this.#d.ledger.apply(
@@ -128,13 +120,18 @@ export class Provisioner {
 		}
 		if (!this.#d.ledger.outboxByKey(`brief:${task.id}`)) {
 			const envelope = renderEnvelope({
-				task: { id: task.id, title: task.title, playbook: task.playbook, continues: continued?.id ?? null },
+				task: {
+					id: task.id,
+					title: task.title,
+					playbook: task.playbook,
+					earlier: worktree ? this.#d.ledger.tasksForWorktree(worktree.id).filter(t => t.seq < task.seq).map(t => t.id) : [],
+				},
 				where: {
 					workspace: ws.id,
 					path: worktree?.path ?? ws.repo_path,
 					branch: worktree?.branch ?? null,
-					base: worktree?.base ?? null,
-					readonly: checkout.kind === "readonly",
+					base: worktree?.fork_ref ?? null,
+					lane: worktree ? "branch" : checkout.lane === "main" && checkout.edit ? "main_edit" : "main",
 					protectedBranches: [ws.default_base],
 				},
 				env: { vars: this.#d.env.varsOf(worktree?.id ?? null), ...this.#d.env.recipeSummary(ws.id), test: this.#d.env.testCommands(ws, worktree) },
@@ -153,56 +150,18 @@ export class Provisioner {
 		this.#d.flush(session.id);
 	}
 
-	async #checkout(task: TaskRow, ws: WorkspaceRow, checkout: CheckoutSpec, continued: TaskRow | null): Promise<WorktreeRow | null> {
-		if (checkout.kind === "readonly") return null;
-		if (checkout.kind === "continue") {
-			if (!continued!.worktree_id) return null;
-			const wt = this.#d.worktrees.get(continued!.worktree_id)!;
-			if (wt.state !== "ready") throw new ProvisionError("checkout", envMessages.continuedWorktreeState(continued!.id, wt.path, wt.state));
-			return wt;
-		}
-		if (task.worktree_id) {
-			const wt = this.#d.worktrees.get(task.worktree_id)!;
-			if (wt.state !== "ready") throw new ProvisionError("checkout", envMessages.worktreeState(wt.path, wt.state));
-			return wt;
-		}
-		const branch = checkout.branch ?? defaultBranch(task.title, task.seq);
-		if (!(await isValidBranchName(ws.repo_path, branch))) throw new ProvisionError("checkout", envMessages.invalidBranch(branch));
-		const base = checkout.base ?? ws.default_base;
-		const existing = this.#d.worktrees.live(ws.id, branch);
-		if (existing) {
-			const owner = this.#d.ledger.tasksForWorktree(existing.id).find(t => t.id !== task.id);
-			if (owner) throw new ProvisionError("checkout", envMessages.branchInUse(branch, existing.path, owner.id));
-		}
-		const dir = existing?.path ?? worktreePath(ws.repo_path, branch, this.#d.settings.get().worktreeRoot);
-		try {
-			await ensureWorktree(ws.repo_path, dir, branch, base);
-		} catch (err) {
-			throw new ProvisionError("checkout", err instanceof GitError ? err.localizedText ?? err.message : errorText(err));
-		}
-		return this.#d.worktrees.record({ workspaceId: ws.id, path: dir, branch, base });
-	}
-
-	async #session(task: TaskRow, ws: WorkspaceRow, checkout: CheckoutSpec, worktree: WorktreeRow | null, continued: TaskRow | null): Promise<SessionRow> {
+	/** Every task gets a fresh session; an older one on the same worktree (its task closed) is retired first. */
+	async #session(task: TaskRow, ws: WorkspaceRow, worktree: WorktreeRow | null): Promise<SessionRow> {
 		if (task.session_id) return this.#d.pool.must(task.session_id);
-		let reuse: SessionRow | null = null;
-		if (checkout.kind === "continue" && checkout.session === "reuse" && continued?.session_id) {
-			const s = this.#d.pool.must(continued.session_id);
-			if (s.retired_at === null) reuse = s;
-		}
-		let adopt: SessionRow | null = null;
-		if (!reuse && worktree) {
-			const current = this.#d.pool.liveForWorktree(worktree.id);
-			if (current) {
-				const open = this.#d.ledger.openForSession(current.id);
-				if (open && open.id !== task.id) throw new ProvisionError("session", envMessages.sessionHasOpenTask(current.id, open.id));
-				if (checkout.kind === "continue") await this.#d.pool.retire(current.id);
-				else adopt = current;
-			}
+		const current = worktree ? this.#d.pool.liveForWorktree(worktree.id) : undefined;
+		if (current) {
+			const open = this.#d.ledger.openForSession(current.id);
+			if (open && open.id !== task.id) throw new ProvisionError("session", envMessages.sessionHasOpenTask(current.id, open.id));
+			await this.#d.pool.retire(current.id);
 		}
 		return this.#d.db.tx(() => {
-			const session = reuse ?? adopt ?? this.#d.pool.create({ kind: "worker", workspaceId: ws.id, worktreeId: worktree?.id ?? null, cwd: worktree?.path ?? ws.repo_path });
-			this.#d.ledger.apply(task.id, { kind: "provisioned", session: session.id, reusedSession: !!reuse }, "hub", `provisioned:${task.id}`);
+			const session = this.#d.pool.create({ kind: "worker", workspaceId: ws.id, worktreeId: worktree?.id ?? null, cwd: worktree?.path ?? ws.repo_path });
+			this.#d.ledger.apply(task.id, { kind: "provisioned", session: session.id }, "hub", `provisioned:${task.id}`);
 			return session;
 		});
 	}

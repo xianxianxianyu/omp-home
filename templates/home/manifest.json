@@ -1,6 +1,6 @@
 [
   { "path": "AGENTS.md", "source": "agents-workflow.md", "action": "section", "heading": "## 怎么干活", "reason": "改为 omp-home 主聊天路由、worker worktree 和可撤销决策；保留其余仓库清单。" },
-  { "path": ".agents/skills/repo-worktree", "source": "skills/repo-worktree", "action": "replace", "reason": "worktree 统一交给 Hub 管理，移除旧 mw_worktree 和手工脚本。" },
+  { "path": ".agents/skills/repo-worktree", "source": "skills/repo-worktree", "action": "replace", "reason": "按车道选 checkout：代码改动走 Hub 管理的分支和 worktree，合并后自动回收；移除旧 mw_worktree 和手工脚本。" },
   { "path": ".agents/skills/task-brief", "source": "skills/task-brief", "action": "replace", "reason": "brief 由 dispatcher 只读补齐后一次派发，主聊天不再写 brief。" },
   { "path": ".agents/skills/test-env", "source": "skills/test-env", "action": "replace", "reason": "测试环境改为 repos/<workspace>.env.yaml，Hub 管理服务、端口、数据库和账号租约。" },
   { "path": "repos/_example.env.yaml", "source": "repos/_example.env.yaml", "action": "create", "reason": "提供完整的环境配方示例，不覆盖已有文件。" }

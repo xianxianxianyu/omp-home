@@ -127,7 +127,7 @@ test("launch spec: resume, optional model and pstack, worker git guard env", () 
 		paths: { plugin: "/app/omp-plugin/worker", overlay: "/h/.omp-home/run/worker.yml", pstackPackage: "/h/.omp-home/run/pstack", gitGuard: "/app/git-guard" },
 		bridge: { url: "ws://127.0.0.1:4777/bridge", token: "tok" },
 		baseEnv: { PATH: "/bin", OMP_HOME_ROLE: "spoofed" },
-		worker: { env: { PORT: "41000", OMP_HOME_TOKEN: "spoofed" }, protectedBranches: ["main"], repoHooks: "/repo/.git/hooks" },
+		worker: { env: { PORT: "41000", OMP_HOME_TOKEN: "spoofed" }, protectedBranches: ["main"], repoHooks: "/repo/.git/hooks", mainCheckout: false },
 	});
 	assert.deepEqual(spec.args, [
 		"--mode", "rpc-ui", "--cwd", "/wt", "--session-dir", "/h/.omp-home/sessions/W-3", "--config", "/h/.omp-home/run/worker.yml",
@@ -140,6 +140,16 @@ test("launch spec: resume, optional model and pstack, worker git guard env", () 
 	assert.equal(spec.env.OMP_HOME_PROTECTED, "main");
 	assert.equal(spec.env.GIT_CONFIG_VALUE_0, "/app/git-guard");
 	assert.equal(spec.env.OMP_HOME_REPO_HOOKS, "/repo/.git/hooks");
+	assert.equal(spec.env.OMP_HOME_MAIN_CHECKOUT, undefined, "a branch worktree may commit");
+	const inMain = launchSpec({
+		bin: "omp",
+		session: { id: "W-4", kind: "worker", cwd: "/repo", sessionDir: "/h/.omp-home/sessions/W-4", resumeFile: null, model: null, thinking: "max" },
+		paths: { plugin: "/app/omp-plugin/worker", overlay: "/h/.omp-home/run/worker.yml", pstackPackage: null, gitGuard: "/app/git-guard" },
+		bridge: { url: "ws://x/bridge", token: "t" },
+		baseEnv: { OMP_HOME_MAIN_CHECKOUT: "0" },
+		worker: { env: {}, protectedBranches: ["main"], repoHooks: "/repo/.git/hooks", mainCheckout: true },
+	});
+	assert.equal(inMain.env.OMP_HOME_MAIN_CHECKOUT, "1", "the main checkout's git is read-only for its worker");
 	const main = launchSpec({
 		bin: "omp",
 		session: { id: "M-1", kind: "main", cwd: "/h", sessionDir: "/h/.omp-home/chat/M-1", resumeFile: null, model: "opus", thinking: "max" },

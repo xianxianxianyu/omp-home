@@ -3,9 +3,9 @@ import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import { errorText, HubError } from "./errors.ts";
 import { messages } from "./i18n.ts";
+import { MIGRATIONS, SCHEMA_VERSION } from "./migrations.ts";
 import { resolveResources } from "./resources.ts";
 
-const SCHEMA_VERSION = "2";
 const SCHEMA_FILE = resolveResources().schema;
 
 export type IdKind = "T" | "W" | "M" | "WT" | "D" | "E";
@@ -25,40 +25,38 @@ export class Db {
 		this.raw = new DatabaseSync(file);
 		this.raw.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
 		checkTrigram(this.raw);
-		this.#migrate();
+		this.#migrate(file);
 	}
 
-	#migrate(): void {
+	/** A new database gets schema.sql at the latest version; an older one is backed up, then migrated step by step. */
+	#migrate(file: string): void {
 		const hasMeta = this.raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
 		if (!hasMeta) {
 			this.tx(() => {
 				this.raw.exec(fs.readFileSync(SCHEMA_FILE, "utf8"));
-				this.setMeta("schema_version", "1");
-			});
-		}
-		let version = this.meta("schema_version");
-		if (version === "1") {
-			this.tx(() => {
-				this.raw.exec(`CREATE TABLE recipe_check (
-					workspace_id TEXT PRIMARY KEY REFERENCES workspace(id),
-					id TEXT NOT NULL UNIQUE,
-					recipe_hash TEXT NOT NULL,
-					recipe TEXT NOT NULL,
-					base TEXT NOT NULL,
-					sha TEXT NOT NULL,
-					path TEXT NOT NULL,
-					state TEXT NOT NULL CHECK (state IN ('running','passed','failed','cancelled')),
-					started_at INTEGER NOT NULL,
-					ended_at INTEGER,
-					steps TEXT NOT NULL,
-					processes TEXT NOT NULL DEFAULT '{}',
-					cleaned INTEGER NOT NULL DEFAULT 0 CHECK (cleaned IN (0,1))
-				) STRICT`);
 				this.setMeta("schema_version", SCHEMA_VERSION);
 			});
-			version = SCHEMA_VERSION;
+			return;
 		}
-		if (version !== SCHEMA_VERSION) throw new HubError("conflict", messages.databaseVersion(version, SCHEMA_VERSION));
+		const version = this.meta("schema_version");
+		if (version === SCHEMA_VERSION) return;
+		const first = MIGRATIONS.findIndex(m => m.from === version);
+		if (first === -1) throw new HubError("conflict", messages.databaseVersion(version, SCHEMA_VERSION));
+		if (file !== ":memory:") this.raw.exec(`VACUUM INTO '${`${file}.v${version}-${Date.now()}.bak`.replaceAll("'", "''")}'`);
+		// Table rebuilds need foreign keys off; the check afterwards proves no reference broke.
+		this.raw.exec("PRAGMA foreign_keys = OFF");
+		try {
+			for (const m of MIGRATIONS.slice(first)) {
+				this.tx(() => {
+					m.up(this);
+					const broken = this.raw.prepare("PRAGMA foreign_key_check").all();
+					if (broken.length) throw new Error(`migration from schema ${m.from} broke foreign keys: ${JSON.stringify(broken.slice(0, 5))}`);
+					this.setMeta("schema_version", String(Number(m.from) + 1));
+				});
+			}
+		} finally {
+			this.raw.exec("PRAGMA foreign_keys = ON");
+		}
 	}
 
 	#prepare(sql: string): StatementSync {

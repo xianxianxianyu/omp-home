@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ACCENTS, DENSITIES, LANGUAGE_SETTINGS, TEXT_SIZES, THEMES, THINKING_LEVELS } from "../../shared/api.ts";
+import { TOOL_SPECS } from "../../shared/tools.ts";
 import { commands, historyPage } from "./transcript-schema.ts";
 
 const nullableText = z.string().nullable();
@@ -17,7 +18,16 @@ const escalation = z.object({ id: z.string(), taskId: z.string(), taskTitle: z.s
 const environment = z.object({ worktreeId: z.string(), worktreePath: z.string(), workspace: z.string(), state: z.enum(["preparing", "ready", "failed", "torn_down"]), error: nullableText, vars: z.record(z.string(), z.string()), updatedAt: z.number() });
 const service = z.object({ id: z.string(), workspace: z.string(), name: z.string(), kind: z.enum(["external", "run"]), state: z.enum(["down", "starting", "up", "failed"]), pid: z.number().nullable(), checkedAt: z.number().nullable(), error: nullableText, logTail: z.string() });
 const lease = z.object({ id: z.number(), kind: z.enum(["port", "db", "account"]), key: z.string(), label: z.string(), holderKind: z.enum(["worktree", "session", "service"]), holderId: z.string(), acquiredAt: z.number(), expiresAt: z.number().nullable() });
-const detail = task.extend({ brief: z.string(), envelope: nullableText, checkout: z.discriminatedUnion("kind", [z.object({ kind: z.literal("worktree"), base: z.string().optional(), branch: z.string().optional() }), z.object({ kind: z.literal("continue"), task: z.string(), session: z.enum(["reuse", "fresh"]) }), z.object({ kind: z.literal("readonly") })]), worktreePath: nullableText, related: z.array(z.string()), reports: z.array(z.object({ at: z.number(), status: z.enum(["done", "blocked", "question", "progress"]), summary: z.string(), details: nullableText })), events: z.array(z.object({ id: z.number(), at: z.number(), actor: z.enum(["main", "dispatcher", "worker", "human", "hub"]), kind: z.string(), summary: z.string(), data: z.record(z.string(), z.unknown()) })), decisions: z.array(decision), escalations: z.array(escalation), git: z.object({ dirty: z.boolean(), ahead: z.number(), head: z.string() }).nullable(), env: environment.nullable() });
+const branch = z.object({
+	worktreeId: z.string(), workspace: z.string(), branch: z.string(), path: z.string(), base: z.string(),
+	phase: z.enum(["active", "idle", "parked", "merged", "retiring", "retired"]),
+	hold: z.enum(["busy", "unaccepted", "dirty", "locked", "switched", "error"]).nullable(), holdDetail: nullableText,
+	ahead: z.number().nullable(), behind: z.number().nullable(), upstreamGone: z.boolean(), kept: z.boolean(), stale: z.boolean(),
+	tasks: z.array(z.object({ id: z.string(), title: z.string(), status, settled: z.boolean() })), lastActivityAt: z.number(),
+	retired: z.object({ reason: z.enum(["merged", "unused", "gone", "discarded"]), at: z.number(), sha: nullableText, branchDeleted: z.boolean() }).nullable(),
+});
+const branches = z.object({ workspace: z.string(), base: z.string(), live: z.array(branch), retired: z.array(branch), checkedAt: z.number().nullable() });
+const detail = task.extend({ brief: z.string(), envelope: nullableText, checkout: TOOL_SPECS.home_dispatch.params.shape.checkout, worktreePath: nullableText, related: z.array(z.string()), reports: z.array(z.object({ at: z.number(), status: z.enum(["done", "blocked", "question", "progress"]), summary: z.string(), details: nullableText })), events: z.array(z.object({ id: z.number(), at: z.number(), actor: z.enum(["main", "dispatcher", "worker", "human", "hub"]), kind: z.string(), summary: z.string(), data: z.record(z.string(), z.unknown()) })), decisions: z.array(decision), escalations: z.array(escalation), worktree: branch.nullable(), env: environment.nullable() });
 export const appearance = z.object({ theme: z.enum(THEMES), accent: z.enum(ACCENTS), textSize: z.enum(TEXT_SIZES), density: z.enum(DENSITIES) });
 const settings = z.object({ homePath: z.string(), ompPath: nullableText, pstackRoot: nullableText, mainModel: nullableText, mainThinking: z.enum(THINKING_LEVELS), workerModel: nullableText, workerThinking: z.enum(THINKING_LEVELS), dispatcherModel: nullableText, maxLiveWorkers: z.number(), idleEvictMinutes: z.number(), maxAutoWakes: z.number(), portRange: z.tuple([z.number(), z.number()]), worktreeRoot: nullableText, appearance, language: z.enum(LANGUAGE_SETTINGS) });
 const modelCatalog = z.object({ models: z.array(z.object({ selector: z.string(), provider: z.string(), id: z.string(), name: z.string(), contextWindow: z.number().nullable(), maxTokens: z.number().nullable(), reasoning: z.boolean(), thinking: z.array(z.enum(THINKING_LEVELS)), input: z.array(z.string()), cost: z.object({ input: z.number(), output: z.number() }).nullable() })), defaultModel: nullableText, fetchedAt: z.number(), error: nullableText });
@@ -63,6 +73,8 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p === "/api/pick-folder") schema = z.object({ path: nullableText });
 	else if (p === "/api/workspaces/suggestions") schema = z.array(repoSuggestion);
 	else if (p === "/api/workspaces/inspect") schema = repoInspection;
+	else if (/^\/api\/workspaces\/[^/]+\/branches$/.test(p)) schema = branches;
+	else if (/^\/api\/worktrees\/[^/]+\/(remove|keep)$/.test(p)) schema = branch;
 	else if (/\/recipe\/check(?:\/cancel)?$/.test(p)) schema = recipeCheck.nullable();
 	else if (p.endsWith("/recipe")) schema = recipe;
 	else if (p === "/api/workspaces") schema = Array.isArray(data) ? z.array(workspace) : workspace;

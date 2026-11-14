@@ -21,7 +21,7 @@ const delivered: TaskEvent = { kind: "delivered", outbox: 1, what: "brief" };
 
 test("a report filed during the run is applied when the run ends, with one notice", () => {
 	const { state, notices } = replay([delivered, run(1), report("done"), end(1)]);
-	assert.deepEqual(state, { status: { s: "done" }, runOpen: false, runReport: null });
+	assert.deepEqual(state, { status: { s: "done" }, runOpen: false, runReport: null, settled: false });
 	assert.deepEqual(notices, [null, null, null, "done"]);
 });
 
@@ -73,6 +73,35 @@ test("accepting a task mid-run is not undone by the run ending", () => {
 	assert.equal(state.status.s, "done");
 });
 
+test("settled is event-ordered: closing settles, any later run, message or human input unsettles", () => {
+	const accepted: TaskEvent = { kind: "accepted", reason: "good", decision: "D-1" };
+	const reported = replay([delivered, run(1), report("done"), end(1)]);
+	assert.equal(reported.state.settled, false, "a worker's done report is not acceptance");
+	const closed = replay([accepted], reported.state).state;
+	assert.equal(closed.settled, true);
+	assert.equal(replay([{ kind: "decided", decision: "D-2", summary: "x" }, { kind: "escalation_closed", escalation: "E-1", resolution: "task_moved" }], closed).state.settled, true, "events that do not reopen keep it settled");
+	assert.equal(foldTask(closed, report("done")).settled, true, "a late done report on a closed task keeps it settled");
+	for (const reopen of [run(2), { kind: "human_input", text: "more" }, { kind: "message_sent", by: "main", text: "fix", mode: "next", decision: null }] as TaskEvent[]) {
+		assert.equal(foldTask(closed, reopen).settled, false, reopen.kind);
+	}
+	assert.equal(replay([accepted, run(2), report("done"), end(2)], reported.state).state.settled, false, "reported done again after a reopen waits for acceptance again");
+	assert.equal(replay([{ kind: "cancelled", by: "main", reason: "no" }]).state.settled, true);
+	assert.equal(replay([{ kind: "provision_failed", step: "checkout", message: "x" }]).state.settled, false);
+});
+
+test("a merge by the human closes the task as done and settled with an info notice; a cancelled task stays cancelled", () => {
+	const merged: TaskEvent = { kind: "merged", branch: "feat/x", into: "origin/main", sha: "abc" };
+	const done = replay([delivered, run(1), report("done"), end(1), merged]);
+	assert.deepEqual([done.state.status.s, done.state.settled, done.notices.at(-1)], ["done", true, "merged"]);
+	assert.deepEqual(NOTICE_POLICY.merged, { priority: "info", autoEscalate: false });
+	const waiting = replay([delivered, run(1), report("question"), end(1), merged]);
+	assert.deepEqual([waiting.state.status.s, waiting.state.settled, waiting.notices.at(-1)], ["done", true, "merged"]);
+	const cancelled = replay([{ kind: "cancelled", by: "main", reason: "no" }, merged]);
+	assert.deepEqual([cancelled.state.status.s, cancelled.state.settled], ["cancelled", true]);
+	assert.equal(escalationResolution(merged), "task_moved");
+	assert.equal(escalationResolution({ kind: "worktree_retired", reason: "merged", branch: "feat/x", sha: "abc", branchDeleted: true }), "task_moved");
+});
+
 test("process loss interrupts working and approval states only", () => {
 	const lost: TaskEvent = { kind: "process_lost", reason: "hub restarted" };
 	const working = replay([delivered, run(1), lost]);
@@ -119,29 +148,33 @@ test("escalations resolve as human_replied on human action and task_moved otherw
 	assert.equal(escalationResolution(run(1)), null);
 });
 
-test("the envelope names the worktree, env, playbook skills and the rules", () => {
+test("the envelope names the lane, env, playbook skills and the rules", () => {
 	const text = renderEnvelope({
-		task: { id: "T-45", title: "Fix login timeout", playbook: "bug-fix", continues: "T-31" },
-		where: { workspace: "deckhand", path: "/r/deckhand.worktrees/task-x", branch: "task/x", base: "main", readonly: false, protectedBranches: ["main"] },
+		task: { id: "T-45", title: "Fix login timeout", playbook: "bug-fix", earlier: ["T-31", "T-40"] },
+		where: { workspace: "deckhand", path: "/r/deckhand.worktrees/fix-login", branch: "fix/login", base: "main", lane: "branch", protectedBranches: ["main"] },
 		env: { vars: { PORT: "41023" }, services: ["postgres"], pools: ["staging-users"], test: { e2e: "pnpm test:e2e" } },
 		pstack: true,
 	});
 	assert.match(text, /^\[omp-home task T-45 · Fix login timeout\]/);
-	assert.match(text, /branch task\/x \(base main\)/);
+	assert.match(text, /branch fix\/login \(base main\)/);
+	assert.match(text, /Commit your work on this branch/);
 	assert.match(text, /PORT=41023/);
 	assert.match(text, /home_lease\(\{pool:"staging-users"\}\)/);
 	assert.match(text, /skill:\/\/pstack-omp, then skill:\/\/poteto-mode and skill:\/\/poteto-mode\/playbooks\/bug-fix\.md/);
 	assert.match(text, /no git push/);
 	assert.match(text, /home_report\(\{status:"question"\}\)/);
-	assert.match(text, /Continues: T-31/);
-	const readonly = renderEnvelope({
-		task: { id: "T-1", title: "Look", playbook: null, continues: null },
-		where: { workspace: "w", path: "/r/w", branch: null, base: null, readonly: true, protectedBranches: ["main"] },
-		env: { vars: {}, services: [], pools: [], test: {} },
-		pstack: false,
-	});
-	assert.match(readonly, /read-only investigation/);
-	assert.doesNotMatch(readonly, /poteto-mode/);
+	assert.match(text, /Earlier on this branch: T-31, T-40 \(their commits are here\)/);
+	const main = (lane: "main" | "main_edit") =>
+		renderEnvelope({
+			task: { id: "T-1", title: "Look", playbook: null, earlier: [] },
+			where: { workspace: "w", path: "/r/w", branch: null, base: null, lane, protectedBranches: ["main"] },
+			env: { vars: {}, services: [], pools: [], test: {} },
+			pstack: false,
+		});
+	assert.match(main("main"), /main checkout \/r\/w · read-only investigation/);
+	assert.doesNotMatch(main("main"), /poteto-mode|Earlier on this branch|Commit your work/);
+	assert.match(main("main_edit"), /you may edit files; leave them uncommitted for the human\. Git is read-only here/);
+	assert.match(main("main_edit"), /Rules: git is read-only in the main checkout/);
 });
 
 test("in-flight phase: provisioning without a session, queued for a slot, else the worker's process state; none once closed", () => {

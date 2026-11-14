@@ -29,16 +29,10 @@ const en = {
 	leaseMissing: (id: number) => `no lease ${id}`,
 	shellTimeout: (seconds: number) => `[omp-home] timed out after ${seconds}s`,
 	shellCancelled: () => "[omp-home] cancelled",
-	continuedWorktreeState: (task: string, dir: string, state: "ready" | "missing" | "removed") => `${task}'s worktree ${dir} is ${state}`,
-	worktreeState: (dir: string, state: "ready" | "missing" | "removed") => `worktree ${dir} is ${state}`,
-	invalidBranch: (branch: string) => `"${branch}" is not a valid branch name`,
-	branchInUse: (branch: string, dir: string, task: string) => `branch ${branch} already has worktree ${dir} (task ${task}); dispatch with checkout {kind:"continue", task:"${task}"} instead`,
 	sessionHasOpenTask: (session: string, task: string) => `${session} in this worktree still has open task ${task}; close it first`,
-	worktreeBranchMismatch: (dir: string, actual: string | null, expected: string) => `${dir} is a worktree on ${actual ?? "detached HEAD"}, not ${expected}`,
 };
 
 const holderKinds = { worktree: "工作树", service: "服务", session: "会话" };
-const worktreeStates = { ready: "就绪", missing: "缺失", removed: "已移除" };
 
 export const envMessages = defineMessages(en, {
 	worktreeMissing: id => `磁盘上找不到工作树 ${id}`,
@@ -67,10 +61,5 @@ export const envMessages = defineMessages(en, {
 	leaseMissing: id => `没有租约 ${id}`,
 	shellTimeout: seconds => `[omp-home] ${seconds} 秒后超时`,
 	shellCancelled: () => "[omp-home] 已取消",
-	continuedWorktreeState: (task, dir, state) => `${task} 的工作树 ${dir} 状态为${worktreeStates[state]}`,
-	worktreeState: (dir, state) => `工作树 ${dir} 状态为${worktreeStates[state]}`,
-	invalidBranch: branch => `「${branch}」不是有效的分支名`,
-	branchInUse: (branch, dir, task) => `分支 ${branch} 已有工作树 ${dir}（任务 ${task}）；改用 checkout {kind:"continue", task:"${task}"} 派发任务`,
 	sessionHasOpenTask: (session, task) => `此工作树中的会话 ${session} 仍有未关闭的任务 ${task}；先关闭该任务`,
-	worktreeBranchMismatch: (dir, actual, expected) => `${dir} 是${actual === null ? "处于分离 HEAD 状态" : `位于分支 ${actual}`}的工作树，并非位于分支 ${expected}`,
 });

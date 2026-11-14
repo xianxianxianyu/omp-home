@@ -1,13 +1,15 @@
 import { setTimeout as sleep } from "node:timers/promises";
+import type { BranchDTO } from "../shared/api.ts";
 import { IdError, parseDecisionId, parseTaskId } from "../shared/ids.ts";
 import { audienceOf, TOOL_SPECS, type Audience, type AgentRef, type ToolName, type ToolParams } from "../shared/tools.ts";
 import type { CallFrame, CallResult } from "./bridge.ts";
 import { EnvError } from "./env.ts";
 import { errorText, HubError } from "./errors.ts";
 import type { Hub } from "./hub.ts";
-import { waitOf, type TaskRow } from "./ledger.ts";
+import { statusText } from "./ledger.ts";
 import type { SessionRow } from "./pool.ts";
 import { playbooks } from "./pstack.ts";
+import { LOOK_FRESH_MS } from "./worktrees.ts";
 
 export interface CallContext {
 	session: SessionRow;
@@ -40,23 +42,31 @@ function quoteWorker(task: string, text: string): string {
 
 const fmtTime = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
 
-function statusText(t: TaskRow): string {
-	const wait = waitOf(t);
-	return wait ? `awaiting ${wait.kind}` : t.status;
+/** One line per branch for home_status / home_task: phase, why it is held, distance from the base, its latest task. */
+function branchLine(b: BranchDTO): string {
+	const hold = b.hold ? ` (held: ${b.hold}${b.holdDetail ? `, ${b.holdDetail}` : ""})` : "";
+	const distance = b.ahead !== null && b.behind !== null ? ` · ${b.ahead} ahead/${b.behind} behind ${b.base}` : "";
+	const flags = `${b.kept ? " · kept" : ""}${b.upstreamGone ? " · remote deleted" : ""}${b.stale ? " · stale" : ""}`;
+	const latest = b.tasks[0];
+	return `${b.branch} · ${b.phase}${hold}${distance}${flags}${latest ? ` · ${latest.id} ${latest.status}${latest.settled ? " ✓" : ""}` : ""}`;
 }
 
 /** Handlers for every tool in shared/tools.ts; audience and params are checked before a handler runs. */
 export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) => Promise<CallResult> {
 	const h: { [K in ToolName]: Handler<K> } = {
-		home_status() {
+		async home_status() {
 			const workspaces = hub.workspaces.list().map(w => hub.workspaces.dto(w));
+			const branches = new Map(await Promise.all(workspaces.map(async w => [w.id, (await hub.lifecycle.branches(w.id, "en", LOOK_FRESH_MS)).live] as const)));
 			const open = hub.ledger.listTasks({ status: "open" });
 			const main = hub.notifier.main();
 			const books = playbooks(hub.settings.get().pstackRoot);
 			const lines = [
 				"Workspaces:",
 				...(workspaces.length
-					? workspaces.map(w => `- ${w.id}: ${w.repoPath} · base ${w.defaultBase} · sessions ${w.liveSessions} live / ${w.totalSessions} · ${w.openTasks} open task(s) · recipe ${w.recipeStatus} · ${hub.recipeChecks.describe(w.id)}`)
+					? workspaces.flatMap(w => [
+							`- ${w.id}: ${w.repoPath} · base ${w.defaultBase} · sessions ${w.liveSessions} live / ${w.totalSessions} · ${w.openTasks} open task(s) · recipe ${w.recipeStatus} · ${hub.recipeChecks.describe(w.id)}`,
+							...(branches.get(w.id) ?? []).map(b => `  - branch ${branchLine(b)}`),
+						])
 					: ["- none registered (the human adds them in the Workspaces view)"]),
 				`Pool: ${hub.pool.liveWorkerCount()}/${hub.settings.get().maxLiveWorkers} live workers`,
 				"Open tasks:",
@@ -83,9 +93,10 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 			const d = await hub.taskDetail(taskId(p.id), p.events ?? 20);
 			const lines = [
 				`${d.id} ${d.title} · ${d.workspace} · ${d.wait ? `awaiting ${d.wait.kind}` : d.status}${d.playbook ? ` · playbook ${d.playbook}` : ""}`,
-				`Checkout: ${JSON.stringify(d.checkout)}${d.worktreePath ? ` · ${d.worktreePath}` : ""}${d.branch ? ` · branch ${d.branch}` : ""}`,
-				`Session: ${d.sessionId ?? "none yet"}${d.git ? ` · git ${d.git.head}${d.git.dirty ? " dirty" : ""} · ${d.git.ahead} commit(s) ahead of base` : ""}`,
+				`Checkout: ${JSON.stringify(d.checkout)}${d.worktreePath ? ` · ${d.worktreePath}` : ""}`,
+				`Session: ${d.sessionId ?? "none yet"}`,
 			];
+			if (d.worktree) lines.push(`Branch: ${branchLine(d.worktree)}`);
 			if (d.related.length) lines.push(`Related: ${d.related.join(", ")}`);
 			if (d.env) lines.push(`Env: ${d.env.state}${d.env.error ? ` (${d.env.error.split("\n")[0]})` : ""}`);
 			if (d.wait) lines.push(`Waiting: ${d.wait.kind}`, quoteWorker(d.id, d.wait.text));
@@ -117,7 +128,7 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 			};
 		},
 
-		home_dispatch(p, c) {
+		async home_dispatch(p, c) {
 			const ws = hub.workspaces.must(p.workspace.trim());
 			if (ws.archived_at !== null) throw new HubError("invalid", `workspace ${ws.id} is archived`);
 			let playbook: string | null = null;
@@ -129,47 +140,11 @@ export function createTools(hub: Hub): (session: SessionRow, frame: CallFrame) =
 			}
 			const related = [...new Set((p.related ?? []).map(taskId))];
 			for (const r of related) hub.ledger.mustTask(r);
-			let checkout = p.checkout;
-			if (checkout.kind === "continue") {
-				const target = hub.ledger.mustTask(taskId(checkout.task));
-				checkout = { ...checkout, task: target.id };
-				if (target.workspace_id !== ws.id) throw new HubError("invalid", `${target.id} belongs to workspace ${target.workspace_id}, not ${ws.id}`);
-				if (!target.worktree_id) throw new HubError("invalid", `${target.id} has no worktree (read-only or not provisioned); use checkout {kind:"worktree"} or {kind:"readonly"}`);
-				const wt = hub.worktrees.get(target.worktree_id)!;
-				if (wt.state !== "ready") throw new HubError("conflict", `${target.id}'s worktree ${wt.path} is ${wt.state}`);
-				const session = hub.pool.liveForWorktree(wt.id);
-				const busy = session ? hub.ledger.openForSession(session.id) : undefined;
-				if (busy) {
-					throw new HubError(
-						"conflict",
-						`${busy.id} is still open (${statusText(busy)}) on ${session!.id} in that worktree. Close it with home_close, or continue it with home_send.`,
-					);
-				}
-			} else if (checkout.kind === "worktree" && checkout.branch) {
-				const existing = hub.worktrees.live(ws.id, checkout.branch);
-				if (existing) {
-					const owner = hub.ledger.tasksForWorktree(existing.id).at(-1);
-					throw new HubError("conflict", `branch ${checkout.branch} already has a worktree${owner ? ` (task ${owner.id})` : ""}; use checkout {kind:"continue"${owner ? `, task:"${owner.id}"` : ""}} or another branch`);
-				}
-			}
 			const dispatchKey = `${c.session.omp_session_id ?? c.session.id}/${c.agent.id}`;
-			const { task, created } = hub.ledger.createTask({
-				title: p.title,
-				workspaceId: ws.id,
-				checkout,
-				playbook,
-				brief: p.brief,
-				related,
-				dispatchKey,
-				actor: "dispatcher",
-			});
+			const { task, created, where } = await hub.dispatchTask({ title: p.title, workspace: ws, checkout: p.checkout, playbook, brief: p.brief, related, dispatchKey });
 			if (!created) return { text: `Already dispatched ${task.id} (${task.title}) from this dispatcher; use home_send for follow-ups.`, details: { taskId: task.id } };
-			hub.indexer.brief(task);
-			hub.provisioner.kick();
-			hub.changed("tasks", `task:${task.id}`, "state");
-			const where = checkout.kind === "worktree" ? `new worktree${checkout.branch ? ` ${checkout.branch}` : ""}` : checkout.kind === "continue" ? `continue ${checkout.task} (${checkout.session} session)` : "read-only main checkout";
 			return {
-				text: `${task.id} pending · ${ws.id} · ${where}${playbook ? ` · playbook ${playbook}` : ""}\nThe hub prepares the worktree, environment and session now; the home agent is notified when the worker reports. Do not call home_dispatch again.`,
+				text: `${task.id} pending · ${ws.id} · ${where}${playbook ? ` · playbook ${playbook}` : ""}\nThe hub prepares the checkout, environment and a fresh session now; the home agent is notified when the worker reports. Do not call home_dispatch again.`,
 				details: { taskId: task.id },
 			};
 		},

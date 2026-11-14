@@ -15,11 +15,14 @@
  * Each runs as a turn ending in an assistant line "RESULT ok|err ...".
  * Worker role: every prompt runs one turn that calls home_report, shaped by markers
  * [fake:question] [fake:noreport] [fake:hang] (until abort) [fake:env] (home_env + home_lease)
- * [fake:intents] (tools "Step one" for 1.2 s, then "Step two" for 1.5 s, before reporting).
+ * [fake:intents] (tools "Step one" for 1.2 s, then "Step two" for 1.5 s, before reporting)
+ * [fake:commit] (writes <session>.txt in its cwd and commits it, like a worker on a branch)
+ * [fake:edit] (writes <session>.md in its cwd, then tries to commit it; the report says whether git refused).
  * FAKE_OMP_START_DELAY_MS: like real omp's slow first launch, nothing is read or written until then.
  * Catalog commands: FAKE_OMP_CATALOG_FILE overrides models/defaultModel or fails a named command;
  * FAKE_OMP_CATALOG_LOG records catalog invocations for endpoint tests.
  */
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -295,6 +298,16 @@ function workerTurn(prompt: string): void {
 			}
 		}
 		let probe = "";
+		if (prompt.includes("[fake:commit]") || prompt.includes("[fake:edit]")) {
+			const file = `${process.env.OMP_HOME_SESSION ?? "worker"}.${prompt.includes("[fake:commit]") ? "txt" : "md"}`;
+			fs.writeFileSync(path.join(process.cwd(), file), `written by ${process.env.OMP_HOME_SESSION}\n`);
+			const git = (...args: string[]) => spawnSync("git", ["-c", "user.name=worker", "-c", "user.email=w@example.test", ...args], { cwd: process.cwd(), encoding: "utf8" });
+			const edit = prompt.includes("[fake:edit]");
+			// In the main checkout even staging would change the human's index; the empty commit only probes the guard.
+			if (!edit) git("add", file);
+			const commit = git("commit", "-qm", `add ${file}`, ...(edit ? ["--allow-empty"] : []));
+			probe = `\nCOMMIT ${commit.status === 0 ? "ok" : `refused: ${commit.stderr.trim()}`}`;
+		}
 		if (prompt.includes("[fake:env]")) {
 			const env = await toolCall("home_env", {}, hubTool("home_env", {}, MAIN_AGENT));
 			const lease = await toolCall("home_lease", { pool: "testers" }, hubTool("home_lease", { pool: "testers" }, MAIN_AGENT));

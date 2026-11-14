@@ -11,9 +11,11 @@ import { ModelPicker, useModelCatalog } from "../ModelPicker.tsx";
 import { AddRepository, BranchPicker } from "./AddRepository.tsx";
 import { RecipeSummary } from "../RecipeSummary.tsx";
 import { RecipeCheck } from "../RecipeCheck.tsx";
+import { WorkspaceBranches } from "../Branches.tsx";
 
 export function WorkspacesPanel() {
 	const t = useT().panels;
+	const branches = useT().branches;
 	const { format } = useI18n();
 	const { data, error, loading, reload } = useResource<WorkspaceDTO[]>("workspaces", "/api/workspaces");
 	const { mutate, toast } = useHub();
@@ -33,6 +35,7 @@ export function WorkspacesPanel() {
 				<div><h2>{t.workspaces.title}</h2><p className="muted">{t.workspaces.description}</p></div>
 				<Button className="primary add-repository-trigger" onClick={() => setAdding(true)}>{t.workspaces.add}</Button>
 			</div>
+			<p className="branches-explanation">{branches.explanation}</p>
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data?.length === 0 && <Empty title={t.workspaces.empty}>{t.workspaces.emptyDescription}</Empty>}
@@ -55,6 +58,7 @@ export function WorkspacesPanel() {
 						<Button className="small" onClick={() => setEditor(workspace)}>{t.common.edit}</Button>
 						{!workspace.archived && <Button className="small danger" onClick={() => setArchive(workspace)}>{t.workspaces.archive}</Button>}
 					</div>
+					<WorkspaceBranches workspace={workspace.id} />
 					<RecipeCheck workspace={workspace} />
 				</article>
 			))}

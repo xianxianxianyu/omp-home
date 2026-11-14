@@ -69,3 +69,5 @@
 .history-link { display: flex; align-items: baseline; gap: 10px; width: 100%; margin-top: 18px; padding: 10px 2px; border: 0; border-top: 1px solid var(--line); background: none; color: var(--fg); cursor: pointer; text-align: left; }
 .history-link .muted { flex: 1; font-size: 0.846154rem; }
 .history-link:hover span:first-child, .history-link:hover span:last-child { color: var(--accent); }
+.home-update-changes { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.home-update-changes code { margin-right: 6px; }

@@ -77,14 +77,14 @@ export const validationMessages = defineMessages(en, {
 const manifestReasons = defineMessages(
 	{
 		"AGENTS.md": () => "Switches to the omp-home workflow: the main chat routes work, workers use worktrees, decisions can be reverted. The rest of the repo list stays.",
-		".agents/skills/repo-worktree": () => "The hub manages every worktree; the old mw_worktree and manual scripts are removed.",
+		".agents/skills/repo-worktree": () => "Checkouts by lane: code changes get a hub-managed branch and worktree, removed after merge; the old mw_worktree and manual scripts are removed.",
 		".agents/skills/task-brief": () => "The dispatcher fills in the brief read-only and dispatches it once; the main chat no longer writes briefs.",
 		".agents/skills/test-env": () => "Test environments move to repos/<workspace>.env.yaml; the hub manages services, ports, databases and account leases.",
 		"repos/_example.env.yaml": () => "A complete example environment recipe; an existing file is never overwritten.",
 	},
 	{
 		"AGENTS.md": () => "改为 omp-home 的工作方式：主对话分派工作，执行者在工作树中干活，决定可以撤回。其余仓库清单保留。",
-		".agents/skills/repo-worktree": () => "工作树统一交给中枢管理，移除旧的 mw_worktree 和手工脚本。",
+		".agents/skills/repo-worktree": () => "按车道选择检出：代码改动使用中枢管理的分支和工作树，合并后自动回收；移除旧的 mw_worktree 和手工脚本。",
 		".agents/skills/task-brief": () => "调度器以只读方式补全任务说明后一次派发，主对话不再撰写任务说明。",
 		".agents/skills/test-env": () => "测试环境改用 repos/<workspace>.env.yaml，由中枢管理服务、端口、数据库和账号租约。",
 		"repos/_example.env.yaml": () => "提供完整的环境配方示例，不覆盖已有文件。",

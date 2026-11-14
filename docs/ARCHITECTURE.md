@@ -1,6 +1,6 @@
 # omp-home architecture
 
-One human talks to one long-lived omp session (the **main chat**). The main chat routes work to **worker** omp sessions, each running in a git worktree of a registered **workspace**, with a per-worktree test environment. Every worker turn ends in a report that reaches the main chat first; the main chat decides reversible matters and escalates the rest by opening that worker's session view beside the chat.
+One human talks to one long-lived omp session (the **main chat**). The main chat routes work to **worker** omp sessions of a registered **workspace**: code changes run on their own branch's git worktree with a per-worktree test environment; research and doc edits run in the human's main checkout, where git is read-only. Every worker turn ends in a report that reaches the main chat first; the main chat decides reversible matters and escalates the rest by opening that worker's session view beside the chat.
 
 ```mermaid
 flowchart LR
@@ -35,18 +35,26 @@ A hub restart ends every omp process. Sessions resume from their JSONL with `--r
 |---|---|---|
 | Workspaces (identity, path, base, worker model) | `server/workspaces.ts` | `workspace` table |
 | Env recipe | the user, via UI or agent | `<home>/repos/<workspace>.env.yaml` (git-versioned) |
-| Worktrees | `server/git.ts` | `worktree` table + git |
+| Worktrees and hub-managed branches; the only code that changes repositories (worktree add/remove/lock, ref deletes, fetches; enforced by `test/repo-mutations.test.ts`) | `server/worktrees.ts` | `worktree` table + git |
 | Worktree environments, services, leases | `server/env.ts` | `worktree_env`, `service`, `lease` |
 | Sessions and live processes | `server/pool.ts` | `session` table + in-memory process map |
 | Tasks, timeline, decisions, escalations, notices, outbox | `server/ledger.ts` | `task`, `task_event`, `task_link`, `decision`, `escalation`, `notice`, `outbox` |
 | Chat escrow and search index | `server/indexer.ts` | `chat_record`, `doc`, `doc_fts` |
 | Settings | `server/settings.ts` | `meta` + `~/.config/omp-home/config.json` (home path only) |
 
-Task status changes are decided only by the pure fold in `server/core/task.ts`. Notice delivery is decided only by `server/core/notices.ts`. Process admission is decided only by `server/core/pool.ts`. These modules do no I/O and carry the unit tests.
+Task status changes are decided only by the pure fold in `server/core/task.ts`. What happens to a branch (keep, settle its task, hold, retire) is decided only by `decide()` in `server/core/worktree.ts`. Notice delivery is decided only by `server/core/notices.ts`. Process admission is decided only by `server/core/pool.ts`. These modules do no I/O and carry the unit tests.
 
 ## Task lifecycle
 
 `pending → working → awaiting(wait) → done | cancelled`. A worker turn ending applies the report filed during that turn; a turn without `home_report` becomes `awaiting(no_report)` with the turn's final text. A human message to a worker (sent from its session view through the hub) reopens a finished task and resolves its open escalation. Process loss during a run becomes `awaiting(interrupted)`.
+
+A task is **settled** once it is accepted, cancelled or merged and nothing reopened it since (a run, a message, human input). Only a settled task lets the hub remove its worktree; `done` alone never does.
+
+## Branch lifecycle
+
+`home_dispatch.checkout` is a lane: `{lane:"branch", branch}` (a new name is `<type>/<kebab-slug>`; the same name later reuses the branch's worktree with a fresh session) or `{lane:"main", edit?}` (the main checkout; with `edit` the worker leaves changes uncommitted, and one unsettled editor per workspace is enforced by a partial unique index). The `worktree` table stores only the hub's intent, `live → retiring → retired`; phases (active, idle, parked, merged) are derived on each look.
+
+Every 5 minutes, at startup and after a task settles, the hub sweeps each workspace with live rows: it fetches the base's upstream at most every 15 minutes (non-interactive), then detects merges by ancestry, then by `merge-tree` tree equality (squash, rebase-merge), then by patch ids when that merge conflicts. A merge by the human settles the latest task (event `merged`, info notice to main). A merged or unused branch whose latest task is settled is retired when its worktree is clean, unlocked and on its own branch: in one transaction the row becomes `retiring` and the worker session is marked retired (every start, prompt, reopen and queue drain asks the same admission gate), then the process stops, the environment is torn down, `git worktree remove` runs without `--force`, and the branch is deleted by compare-and-swap (`update-ref -d <ref> <recorded sha>`). Each step looks before it acts, so a crash resumes at startup. The human can Remove a worktree (branch kept), Discard a branch (forced, sha recorded in the timeline) or Keep one (`git worktree lock`).
 
 ## Notices and the wake budget
 
@@ -57,7 +65,8 @@ Every task transition that matters creates one notice. The notifier batches pend
 - Workers have `ask` removed; questions end the turn via `home_report({status:"question"})`.
 - The bridge's `tool_call` handler blocks recognized `git push`, merge into protected branches, branch deletion, `gh pr merge` and similar in both `bash` and `eval` inputs.
 - Worker processes run with `core.hooksPath` pointed (through `GIT_CONFIG_*` env, so the user's repo is untouched) at `git-guard/`, whose `pre-push` always refuses and whose other hooks chain to the repository's own hooks.
-- Arbitrary code can still bypass these. Irreversible administrative actions in the hub (cleanup, service stop, workspace removal) are human-only UI actions.
+- A worker in the main checkout (`OMP_HOME_MAIN_CHECKOUT=1`) may run only reading git commands (`shared/main-checkout.ts`, checked by the bridge); `git-guard/pre-commit` refuses commits there as a backstop.
+- Arbitrary code can still bypass these. Irreversible administrative actions in the hub (removing an unmerged worktree, discarding a branch, service stop, workspace removal) are human-only UI actions; the hub itself deletes only what git shows is merged or unused.
 
 ## Synthesis record
 

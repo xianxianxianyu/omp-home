@@ -1,24 +1,21 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { promisify } from "node:util";
 import type { Language, RecipeCheckDTO, WorkspaceDTO } from "../shared/api.ts";
 import type { HomePaths } from "./config.ts";
 import type { EnvRecipe } from "./core/recipe.ts";
 import type { Db } from "./db.ts";
 import { Env, EnvError, environmentStep, processStartedAt, runShell, type EnvExecution, type EnvTarget, type ExecutionStep } from "./env.ts";
-import { HubError } from "./errors.ts";
-import { listWorktrees, worktreePath } from "./git.ts";
+import { errorText, HubError } from "./errors.ts";
+import { worktreePath } from "./git.ts";
 import { envMessages } from "./i18n-env.ts";
 import { recipeCheckMessages as m } from "./i18n-recipe-check.ts";
 import { render } from "./i18n.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { Workspaces, WorkspaceRow } from "./workspaces.ts";
+import { addScratchWorktree, removeScratchWorktree } from "./worktrees.ts";
 
-const exec = promisify(execFile);
-const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 interface CheckRow {
 	workspace_id: string;
@@ -177,13 +174,12 @@ export class RecipeChecks {
 		const target: EnvTarget = { id: run.row.id, path: run.row.path, branch: run.row.id };
 		let failed = false;
 		try {
-			await environmentStep(execution, "checkout", "worktree", `git worktree add --detach ${quote(target.path)} ${quote(run.row.base)}`, async output => {
+			await environmentStep(execution, "checkout", "worktree", null, async output => {
 				fs.mkdirSync(path.dirname(execution.log!), { recursive: true });
-				fs.mkdirSync(path.dirname(target.path), { recursive: true });
-				const result = await runShell(`git -C ${quote(ws.repo_path)} worktree add --detach -- ${quote(target.path)} ${quote(run.row.base)}`, { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: 120_000, log: execution.log!, signal, onOutput: output, onProcess: execution.process });
-				output(result.outputText ?? result.output);
-				if (result.code !== 0) throw new EnvError(m.commandFailed(result.code), result.code);
-				run.row.sha = (await exec("git", ["rev-parse", "HEAD"], { cwd: target.path, timeout: 5000 })).stdout.trim();
+				run.row.sha = await addScratchWorktree(ws.repo_path, target.path, run.row.base).catch(err => {
+					throw new EnvError(errorText(err));
+				});
+				output(`HEAD ${run.row.sha}`);
 			});
 			const exported = await this.#env.prepare(ws, target, recipe, execution);
 			const commands = this.#env.testCommands(ws, target, recipe);
@@ -228,19 +224,13 @@ export class RecipeChecks {
 			this.#env.releaseTarget(run.row.id);
 		}
 		try {
-			await environmentStep(execution, "teardown", "worktree", "git worktree remove --force; git worktree prune", async output => {
+			await environmentStep(execution, "teardown", "worktree", null, async () => {
 				await stopProcesses(run.processes);
 				run.processes = {};
 				this.#save(run);
-				const registered = (await listWorktrees(ws.repo_path)).some(wt => path.resolve(wt.path) === run.row.path);
-				let removeCode = 0;
-				if (registered) {
-					const result = await runShell(`git -C ${quote(ws.repo_path)} worktree remove --force -- ${quote(run.row.path)}`, { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: 120_000, log: execution.log!, onOutput: output });
-					removeCode = result.code;
-				}
-				if (removeCode === 0) fs.rmSync(run.row.path, { recursive: true, force: true });
-				const result = await runShell(`git -C ${quote(ws.repo_path)} worktree prune`, { cwd: ws.repo_path, env: { ...process.env }, timeoutMs: 120_000, log: execution.log!, onOutput: output });
-				if (removeCode !== 0 || result.code !== 0) throw new EnvError(m.commandFailed(removeCode || result.code), removeCode || result.code);
+				await removeScratchWorktree(ws.repo_path, run.row.path).catch(err => {
+					throw new EnvError(errorText(err));
+				});
 				run.row.cleaned = 1;
 			});
 		} catch {
