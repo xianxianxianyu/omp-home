@@ -128,8 +128,13 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: ",", code: "Comma", modifiers: 4, windowsVirtualKeyCode: 188 });
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: ",", code: "Comma", modifiers: 4, windowsVirtualKeyCode: 188 });
 	await page.waitForSelector('.settings-sheet');
-	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.map(element => element.textContent).join("|")), "General|Models|Appearance|Workspaces|Environment|Sessions|About");
+	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.map(element => element.textContent).join("|")), "General|Models|Appearance|Workspaces|Runtime|About");
 	await screenshot("12-settings-sheet");
+	// Runtime is diagnostics in one place: sessions first, then services, leases and worktree environments.
+	await page.click('.settings-sheet-nav button:nth-child(5)');
+	await page.waitForSelector('.settings-sheet-content .runtime-group table');
+	assert.deepEqual(await page.$$eval('.settings-sheet-content .section-title', elements => elements.map(element => element.textContent.split(" · ")[0])), ["Sessions", "Services", "Leases", "Environments"]);
+	await screenshot("23-settings-runtime");
 	await page.click('.settings-sheet-nav button:last-child');
 	await page.waitForFunction(() => document.querySelector('.settings-sheet-content')?.textContent.includes("Managed runtime"));
 	await screenshot("13-settings-about");
@@ -196,7 +201,7 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await page.waitForFunction(() => document.documentElement.lang === "zh");
 	await page.waitForFunction(() => !document.querySelector('.language-status')?.textContent.includes("正在保存"));
 	assert.equal(await evaluateApp('(async () => (await (await window.fetch("/api/settings")).json()).language)()'), "zh");
-	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.map(element => element.textContent).join("|")), "通用|模型|外观|仓库|环境|会话|关于");
+	assert.equal(await page.$$eval('.settings-sheet-nav button', elements => elements.map(element => element.textContent).join("|")), "通用|模型|外观|仓库|运行状态|关于");
 	assert.equal(await page.$eval('button[data-language="en"]', element => element.textContent), "English");
 	assert.equal(await page.$eval('button[data-language="zh"]', element => element.textContent), "中文");
 	await page.$eval('.settings-sheet-content', element => { element.scrollTop = 0; });

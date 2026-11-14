@@ -1,6 +1,5 @@
 import { useHub } from "./hub.tsx";
-import { ResourcesPanel } from "./panels/Resources.tsx";
-import { SessionsPanel } from "./panels/Sessions.tsx";
+import { RuntimePanel } from "./panels/Runtime.tsx";
 import { SettingsPanel } from "./panels/Settings.tsx";
 import { WorkspacesPanel } from "./panels/Workspaces.tsx";
 import { ModelsPanel } from "./panels/Models.tsx";
@@ -14,8 +13,7 @@ const SECTIONS = [
 	{ name: "Models", Panel: ModelsPanel },
 	{ name: "Appearance", Panel: AppearancePanel },
 	{ name: "Workspaces", Panel: WorkspacesPanel },
-	{ name: "Environment", Panel: ResourcesPanel },
-	{ name: "Sessions", Panel: SessionsPanel },
+	{ name: "Runtime", Panel: RuntimePanel },
 	{ name: "About", Panel: AboutPanel },
 ] as const;
 

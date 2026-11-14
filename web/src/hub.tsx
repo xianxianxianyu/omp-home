@@ -10,7 +10,7 @@ import { getLanguage, getT, LANGUAGE_CHANGED } from "./i18n/runtime.ts";
 import type { LocalizedText } from "./i18n/runtime.ts";
 
 export type RightView = { kind: "history" } | { kind: "task"; id: string };
-export type SettingsSection = "General" | "Models" | "Appearance" | "Workspaces" | "Environment" | "Sessions" | "About";
+export type SettingsSection = "General" | "Models" | "Appearance" | "Workspaces" | "Runtime" | "About";
 interface Snapshot<T> { data: T | undefined; error: Error | null; loading: boolean }
 interface Entry { topic: Topic; path: string; snapshot: Snapshot<unknown>; listeners: Set<() => void>; dirty: boolean; pending: boolean }
 class Cache {

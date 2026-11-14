@@ -14,7 +14,8 @@ function LeaseExpiry({ expiresAt, now }: { expiresAt: number | null; now: number
 	return <time dateTime={new Date(expiresAt).toISOString()} title={format.dateTime(expiresAt)} className={remaining <= 0 ? "error-text" : undefined}>{label}</time>;
 }
 
-export function ResourcesPanel() {
+/** Runtime → shared services, resource leases and worktree environments. */
+export function ResourcesSections() {
 	const t = useT().panels;
 	const { format } = useI18n();
 	const { data, error, loading, reload } = useResource<ResourcesDTO>("resources", "/api/resources");
@@ -24,11 +25,7 @@ export function ResourcesPanel() {
 	const [stop, setStop] = useState<ServiceDTO | null>(null);
 
 	return (
-		<div className="stack">
-			<div className="panel-heading">
-				<div><h2>{t.resources.title}</h2><p className="muted">{t.resources.description}</p></div>
-				<Button onClick={reload} disabled={loading}>{t.common.refresh}</Button>
-			</div>
+		<>
 			{error && <ErrorState error={error} retry={reload} />}
 			{loading && !data && <Loading />}
 			{data && <>
@@ -108,6 +105,6 @@ export function ResourcesPanel() {
 					setRelease(null);
 				}}
 			/>}
-		</div>
+		</>
 	);
 }

@@ -81,7 +81,8 @@ function SessionTable({ sessions, onRetire }: { sessions: SessionDTO[]; onRetire
 	);
 }
 
-export function SessionsPanel() {
+/** Runtime → sessions: every main/worker omp process, grouped by workspace. */
+export function SessionsSection() {
 	const t = useT().panels;
 	const { format } = useI18n();
 	const { mutate } = useHub();
@@ -101,30 +102,19 @@ export function SessionsPanel() {
 		}
 	}
 	const workspaceName = (id: string | null) => id === null ? t.sessions.unassigned : names.get(id) ?? id;
+	const groups: [string, SessionDTO[]][] = [
+		...(main.length > 0 ? [[t.common.main, main] as [string, SessionDTO[]]] : []),
+		...[...workers].sort(([a], [b]) => workspaceName(a).localeCompare(workspaceName(b))).map(([workspace, group]): [string, SessionDTO[]] => [workspaceName(workspace), group]),
+	];
+	const live = sessions.data?.filter(session => !session.retired && session.state !== "cold").length ?? 0;
 
 	return (
-		<div className="scroll">
-			<div className="panel-heading">
-				<div>
-					<h2>{t.sessions.title}</h2>
-					<p className="muted">{t.sessions.description}</p>
-				</div>
-				{sessions.data && <span className="pill">{t.sessions.counts(format.number(sessions.data.filter(session => !session.retired && session.state !== "cold").length), format.number(sessions.data.length))}</span>}
-			</div>
+		<Section title={sessions.data ? t.runtime.sessions(t.sessions.counts(format.number(live), format.number(sessions.data.length))) : t.runtime.sessions("")}>
 			{sessions.error && <ErrorState error={sessions.error} retry={sessions.reload} />}
 			{workspaces.error && <ErrorState error={workspaces.error} retry={workspaces.reload} />}
 			{sessions.loading && !sessions.data && <Loading />}
 			{sessions.data?.length === 0 && <Empty title={t.sessions.empty}>{t.sessions.emptyDescription}</Empty>}
-			{main.length > 0 && (
-				<Section title={t.common.main}>
-					<SessionTable sessions={main} onRetire={setRetiring} />
-				</Section>
-			)}
-			{[...workers].sort(([a], [b]) => workspaceName(a).localeCompare(workspaceName(b))).map(([workspace, group]) => (
-				<Section title={workspaceName(workspace)} key={workspace ?? "unassigned"}>
-					<SessionTable sessions={group} onRetire={setRetiring} />
-				</Section>
-			))}
+			{groups.map(([name, group]) => <div className="runtime-group" key={name}><div className="runtime-group-name">{name}</div><SessionTable sessions={group} onRetire={setRetiring} /></div>)}
 			{retiring && (
 				<Confirm
 					title={t.sessions.retireTitle(retiring.id)}
@@ -135,6 +125,6 @@ export function SessionsPanel() {
 					onClose={() => setRetiring(null)}
 				/>
 			)}
-		</div>
+		</Section>
 	);
 }

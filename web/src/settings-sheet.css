@@ -153,3 +153,6 @@
 }
 .main-chat-settings .inline-confirm { display: grid; gap: 10px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: var(--radius); background: var(--panel); }
 .main-chat-settings .inline-confirm p { margin: 0; }
+.runtime-group + .runtime-group { margin-top: 14px; }
+.runtime-group-name { margin-bottom: 6px; color: var(--muted); font-size: 0.846154rem; }
+table.grid td .pill { white-space: normal; max-width: 100%; }
