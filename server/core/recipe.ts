@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml, YAMLParseError } from "yaml";
 import { z } from "zod";
 import type { FieldError } from "../../shared/api.ts";
+import { fieldErrors, HubError, localizedField } from "../errors.ts";
+import { localizedCheck, validationMessages as m } from "../i18n-validation.ts";
 
 /**
  * Boundary parser for `<home>/repos/<workspace>.env.yaml`. Templates use `{var}`;
@@ -9,7 +11,9 @@ import type { FieldError } from "../../shared/api.ts";
  * per field because shared services cannot see per-worktree values.
  */
 
-const name = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/, "use letters, digits, - and _");
+const NAME = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const name = z.string().refine(v => NAME.test(v), localizedCheck(m.recipeName()));
 const command = z.string().min(1);
 
 const externalService = z.strictObject({
@@ -43,7 +47,7 @@ const recipeSchema = z.strictObject({
 			refreshTemplate: command.optional(),
 		})
 		.optional(),
-	env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "environment variable names only"), z.string()).default({}),
+	env: z.record(z.string().refine(v => ENV_NAME.test(v), localizedCheck(m.envVarName())), z.string()).default({}),
 	copy: z.array(z.string().min(1)).default([]),
 	setup: z.array(command).default([]),
 	teardown: z.array(command).default([]),
@@ -62,6 +66,7 @@ const recipeSchema = z.strictObject({
 export type EnvRecipe = z.infer<typeof recipeSchema>;
 export type ServiceSpec = EnvRecipe["services"][string];
 export type SecretField = z.infer<typeof secretField>;
+/** Errors carry English messages; localizeFieldErrors renders them for the UI. */
 export type RecipeResult = { ok: true; recipe: EnvRecipe; hash: string } | { ok: false; errors: FieldError[] };
 
 const VAR = /(?<!\$)\{([a-z][a-z0-9_.-]*)\}/g;
@@ -74,26 +79,25 @@ export function parseRecipe(text: string): RecipeResult {
 		return { ok: false, errors: [yamlError(err, text)] };
 	}
 	const parsed = recipeSchema.safeParse(doc ?? {});
-	if (!parsed.success) return { ok: false, errors: parsed.error.issues.map(i => ({ path: i.path.map(String).join("."), message: i.message })) };
+	if (!parsed.success) return { ok: false, errors: fieldErrors(parsed.error.issues) };
 	const recipe = parsed.data;
 	const errors = checkVariables(recipe);
 	if (errors.length) return { ok: false, errors };
 	const portNames = [...recipe.ports, ...servicePorts(recipe)];
 	const dup = portNames.find((p, i) => portNames.indexOf(p) !== i);
-	if (dup) return { ok: false, errors: [{ path: "ports", message: `port name "${dup}" is declared twice` }] };
+	if (dup) return { ok: false, errors: [localizedField("ports", m.duplicatePort(dup))] };
 	return { ok: true, recipe, hash: createHash("sha256").update(JSON.stringify(recipe)).digest("hex").slice(0, 16) };
 }
 
 /** The yaml library's messages embed a source excerpt; reduce them to "line N: what is wrong". */
 function yamlError(err: unknown, text: string): FieldError {
-	if (!(err instanceof YAMLParseError)) return { path: "", message: `YAML: ${err instanceof Error ? err.message : String(err)}` };
+	if (!(err instanceof YAMLParseError)) return localizedField("", m.yamlFailed(err instanceof Error ? err.message : String(err)));
 	const line = err.linePos?.[0].line;
-	const at = line ? `line ${line}: ` : "";
 	if (err.code === "DUPLICATE_KEY") {
 		const key = line ? /^\s*([^:#\s][^:]*):/.exec(text.split("\n")[line - 1] ?? "")?.[1]?.trim() : undefined;
-		return { path: key ?? "", message: `${at}duplicate key${key ? ` "${key}"` : ""}; each key may appear only once (delete one of them)` };
+		return localizedField(key ?? "", m.duplicateKey(line, key));
 	}
-	return { path: "", message: `${at}${err.message.split("\n")[0].replace(/ at line \d+, column \d+:?$/, "")}` };
+	return localizedField("", m.yamlSyntax(line, err.message.split("\n")[0].replace(/ at line \d+, column \d+:?$/, "")));
 }
 
 export function servicePorts(recipe: EnvRecipe): string[] {
@@ -128,10 +132,8 @@ function checkVariables(recipe: EnvRecipe): FieldError[] {
 
 	const errors: FieldError[] = [];
 	for (const [path, text, allowed] of fields) {
-		for (const m of text.matchAll(VAR)) {
-			if (!allowed.includes(m[1]!)) {
-				errors.push({ path, message: `unknown variable {${m[1]}}; available here: ${allowed.map(a => `{${a}}`).join(" ")}` });
-			}
+		for (const [, variable] of text.matchAll(VAR)) {
+			if (!allowed.includes(variable!)) errors.push(localizedField(path, m.unknownVariable(variable!, allowed.map(a => `{${a}}`).join(" "))));
 		}
 	}
 	return errors;
@@ -150,7 +152,7 @@ export interface Vars {
 export function expand(template: string, vars: Vars, mode: "shell" | "plain"): string {
 	return template.replace(VAR, (_whole, key: string) => {
 		const value = lookup(vars, key);
-		if (value === undefined) throw new Error(`{${key}} is not available in this context`);
+		if (value === undefined) throw new HubError("unprocessable", m.variableUnavailable(key));
 		return mode === "shell" ? `'${value.replaceAll("'", `'\\''`)}'` : value;
 	});
 }

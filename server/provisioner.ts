@@ -2,8 +2,10 @@ import type { CheckoutSpec } from "../shared/tools.ts";
 import { renderEnvelope, type ProvisionStep } from "./core/task.ts";
 import type { Db } from "./db.ts";
 import { EnvError, type Env } from "./env.ts";
-import { errorText } from "./errors.ts";
-import { ensureWorktree, isValidBranchName, worktreePath, type WorktreeRow, type Worktrees } from "./git.ts";
+import { errorText, HubError } from "./errors.ts";
+import { ensureWorktree, GitError, isValidBranchName, worktreePath, type WorktreeRow, type Worktrees } from "./git.ts";
+import { envMessages } from "./i18n-env.ts";
+import { render, type Message } from "./i18n.ts";
 import type { Ledger, TaskRow } from "./ledger.ts";
 import type { Pool, SessionRow } from "./pool.ts";
 import type { SettingsStore } from "./settings.ts";
@@ -11,10 +13,12 @@ import type { WorkspaceRow, Workspaces } from "./workspaces.ts";
 
 class ProvisionError extends Error {
 	readonly step: ProvisionStep;
+	readonly localizedText: Message | undefined;
 
-	constructor(step: ProvisionStep, message: string) {
-		super(message);
+	constructor(step: ProvisionStep, message: string | Message) {
+		super(render(message));
 		this.step = step;
+		this.localizedText = typeof message === "string" ? undefined : message;
 	}
 }
 
@@ -87,7 +91,8 @@ export class Provisioner {
 		} catch (err) {
 			const step = err instanceof ProvisionError ? err.step : err instanceof EnvError ? "env" : "session";
 			if (!(err instanceof ProvisionError) && !(err instanceof EnvError)) this.#d.log(`provision ${task.id}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-			this.#d.ledger.apply(task.id, { kind: "provision_failed", step, message: errorText(err) }, "hub");
+			const messageText = err instanceof ProvisionError || err instanceof EnvError || err instanceof GitError || err instanceof HubError ? err.localizedText : undefined;
+			this.#d.ledger.apply(task.id, { kind: "provision_failed", step, message: errorText(err), ...(messageText && typeof messageText !== "string" ? { messageText } : {}) }, "hub");
 		} finally {
 			this.#busy.delete(task.id);
 			this.#d.changed(task.id);
@@ -153,27 +158,27 @@ export class Provisioner {
 		if (checkout.kind === "continue") {
 			if (!continued!.worktree_id) return null;
 			const wt = this.#d.worktrees.get(continued!.worktree_id)!;
-			if (wt.state !== "ready") throw new ProvisionError("checkout", `${continued!.id}'s worktree ${wt.path} is ${wt.state}`);
+			if (wt.state !== "ready") throw new ProvisionError("checkout", envMessages.continuedWorktreeState(continued!.id, wt.path, wt.state));
 			return wt;
 		}
 		if (task.worktree_id) {
 			const wt = this.#d.worktrees.get(task.worktree_id)!;
-			if (wt.state !== "ready") throw new ProvisionError("checkout", `worktree ${wt.path} is ${wt.state}`);
+			if (wt.state !== "ready") throw new ProvisionError("checkout", envMessages.worktreeState(wt.path, wt.state));
 			return wt;
 		}
 		const branch = checkout.branch ?? defaultBranch(task.title, task.seq);
-		if (!(await isValidBranchName(ws.repo_path, branch))) throw new ProvisionError("checkout", `"${branch}" is not a valid branch name`);
+		if (!(await isValidBranchName(ws.repo_path, branch))) throw new ProvisionError("checkout", envMessages.invalidBranch(branch));
 		const base = checkout.base ?? ws.default_base;
 		const existing = this.#d.worktrees.live(ws.id, branch);
 		if (existing) {
 			const owner = this.#d.ledger.tasksForWorktree(existing.id).find(t => t.id !== task.id);
-			if (owner) throw new ProvisionError("checkout", `branch ${branch} already has worktree ${existing.path} (task ${owner.id}); dispatch with checkout {kind:"continue", task:"${owner.id}"} instead`);
+			if (owner) throw new ProvisionError("checkout", envMessages.branchInUse(branch, existing.path, owner.id));
 		}
 		const dir = existing?.path ?? worktreePath(ws.repo_path, branch, this.#d.settings.get().worktreeRoot);
 		try {
 			await ensureWorktree(ws.repo_path, dir, branch, base);
 		} catch (err) {
-			throw new ProvisionError("checkout", errorText(err));
+			throw new ProvisionError("checkout", err instanceof GitError ? err.localizedText ?? err.message : errorText(err));
 		}
 		return this.#d.worktrees.record({ workspaceId: ws.id, path: dir, branch, base });
 	}
@@ -190,7 +195,7 @@ export class Provisioner {
 			const current = this.#d.pool.liveForWorktree(worktree.id);
 			if (current) {
 				const open = this.#d.ledger.openForSession(current.id);
-				if (open && open.id !== task.id) throw new ProvisionError("session", `${current.id} in this worktree still has open task ${open.id}; close it first`);
+				if (open && open.id !== task.id) throw new ProvisionError("session", envMessages.sessionHasOpenTask(current.id, open.id));
 				if (checkout.kind === "continue") await this.#d.pool.retire(current.id);
 				else adopt = current;
 			}

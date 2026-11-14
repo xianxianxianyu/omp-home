@@ -1,8 +1,10 @@
 import type { WebSocket } from "ws";
 import type { Topic, UiEvent } from "../shared/api.ts";
+import { LanguageTracker, render, type Message } from "./i18n.ts";
 
 /** Broadcast channel to connected UIs. Invalidations are coalesced briefly; the UI refetches over HTTP. */
 export class UiChannel {
+	readonly language = new LanguageTracker();
 	readonly #clients = new Set<WebSocket>();
 	readonly #pending = new Set<Topic>();
 	#timer: NodeJS.Timeout | undefined;
@@ -25,6 +27,10 @@ export class UiChannel {
 			this.#pending.clear();
 			if (batch.length) this.send({ t: "invalidate", topics: batch });
 		}, 50);
+	}
+
+	toast(level: "info" | "error", text: Message | string): void {
+		this.send({ t: "toast", level, text: render(text, this.language.lastSeen) });
 	}
 
 	send(event: UiEvent): void {

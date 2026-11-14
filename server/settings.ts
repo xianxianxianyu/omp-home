@@ -2,10 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { stringify } from "yaml";
 import { z } from "zod";
-import { ACCENTS, DENSITIES, TEXT_SIZES, THEMES, THINKING_LEVELS, type AppearanceDTO, type SettingsDTO } from "../shared/api.ts";
+import { ACCENTS, DENSITIES, LANGUAGE_SETTINGS, TEXT_SIZES, THEMES, THINKING_LEVELS, type AppearanceDTO, type LanguageSetting, type SettingsDTO } from "../shared/api.ts";
 import { writeFileAtomic, type HomePaths } from "./config.ts";
 import type { Db } from "./db.ts";
 import { fieldErrors, HubError } from "./errors.ts";
+import { localizedCheck, validationMessages as m } from "./i18n-validation.ts";
 
 export const DEFAULT_PSTACK_ROOT = "/Volumes/NVMe2T/project/opensource/cursor-plugins/harness/pstack/claude-code";
 /** omp config every hub-spawned omp gets (also the compatibility self-check). */
@@ -13,6 +14,7 @@ export const OVERLAY_BASE = { startup: { setupWizard: false }, update: { auto: f
 
 export type Settings = Omit<SettingsDTO, "homePath">;
 const DEFAULT_APPEARANCE: AppearanceDTO = { theme: "system", accent: "amber", textSize: "default", density: "comfortable" };
+const DEFAULT_LANGUAGE: LanguageSetting = "system";
 
 export function isPstackRoot(dir: string): boolean {
 	return fs.existsSync(path.join(dir, "skills", "poteto-mode", "SKILL.md"));
@@ -33,6 +35,7 @@ export function defaultSettings(): Settings {
 		worktreeRoot: null,
 		ompPath: null,
 		appearance: { ...DEFAULT_APPEARANCE },
+		language: DEFAULT_LANGUAGE,
 	};
 }
 
@@ -47,7 +50,7 @@ const fields = {
 	pstackRoot: z
 		.string()
 		.nullable()
-		.refine(v => v === null || isPstackRoot(v), "not a pstack root: skills/poteto-mode/SKILL.md is missing"),
+		.refine(v => v === null || isPstackRoot(v), localizedCheck(m.notPstackRoot())),
 	mainModel: model,
 	mainThinking: z.enum(THINKING_LEVELS),
 	workerModel: model,
@@ -58,17 +61,18 @@ const fields = {
 	maxAutoWakes: z.number().int().min(0).max(20),
 	portRange: z
 		.tuple([z.number().int().min(1024).max(65535), z.number().int().min(1024).max(65535)])
-		.refine(([lo, hi]) => hi - lo >= 9, "the range needs at least 10 ports"),
+		.refine(([lo, hi]) => hi - lo >= 9, localizedCheck(m.portRangeTooSmall())),
 	worktreeRoot: z
 		.string()
 		.nullable()
-		.refine(v => v === null || path.isAbsolute(v), "must be an absolute path"),
+		.refine(v => v === null || path.isAbsolute(v), localizedCheck(m.absolutePath())),
 	ompPath: z
 		.string()
 		.nullable()
-		.refine(v => v === null || path.isAbsolute(v), "must be an absolute path"),
+		.refine(v => v === null || path.isAbsolute(v), localizedCheck(m.absolutePath())),
 };
-const patchSchema = z.strictObject({ ...fields, appearance: z.strictObject(appearanceFields).partial() }).partial();
+const language = z.enum(LANGUAGE_SETTINGS);
+const patchSchema = z.strictObject({ ...fields, appearance: z.strictObject(appearanceFields).partial(), language }).partial();
 const storedSchema = z.object({
 	...fields,
 	appearance: z.object({
@@ -77,6 +81,7 @@ const storedSchema = z.object({
 		textSize: appearanceFields.textSize.catch(DEFAULT_APPEARANCE.textSize),
 		density: appearanceFields.density.catch(DEFAULT_APPEARANCE.density),
 	}).catch({ ...DEFAULT_APPEARANCE }),
+	language: language.catch(DEFAULT_LANGUAGE),
 }).partial();
 
 /** Settings live in meta('settings'); overlays derived from them are rewritten on every change. */
@@ -101,7 +106,7 @@ export class SettingsStore {
 
 	update(patch: unknown): Settings {
 		const parsed = patchSchema.safeParse(patch);
-		if (!parsed.success) throw new HubError("unprocessable", "invalid settings", fieldErrors(parsed.error.issues));
+		if (!parsed.success) throw new HubError("unprocessable", m.invalidSettings(), fieldErrors(parsed.error.issues));
 		const current = this.get();
 		const next = { ...current, ...parsed.data, appearance: { ...current.appearance, ...parsed.data.appearance } };
 		this.#db.setMeta("settings", JSON.stringify(next));

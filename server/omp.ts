@@ -8,11 +8,13 @@ import { promisify } from "node:util";
 import { stringify } from "yaml";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
-import type { OmpDTO } from "../shared/api.ts";
+import type { Language, OmpDTO } from "../shared/api.ts";
 import { BRIDGE_ENV } from "../shared/bridge-wire.ts";
 import { toolsFor } from "../shared/tools.ts";
 import { writeFileAtomic } from "./config.ts";
-import { errorText, HubError } from "./errors.ts";
+import { errorMessage, HubError } from "./errors.ts";
+import { render, type Message } from "./i18n.ts";
+import { runtimeMessages as m } from "./i18n-runtime.ts";
 import { RpcClient } from "./rpc.ts";
 import { OVERLAY_BASE } from "./settings.ts";
 
@@ -46,7 +48,12 @@ export async function ompVersion(bin: string): Promise<string | null> {
  * when omp sends `ready`, the bridge says `hello`, and `get_state` lists main's home_* tools.
  * Returns null on success, else the reason.
  */
-export async function selfCheck(bin: string, pluginDir: string): Promise<string | null> {
+export async function selfCheck(bin: string, pluginDir: string, language: Language = "en"): Promise<string | null> {
+	const failure = await compatibilityFailure(bin, pluginDir);
+	return failure === null ? null : render(failure, language);
+}
+
+async function compatibilityFailure(bin: string, pluginDir: string): Promise<string | Message | null> {
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-home-check-"));
 	const overlay = path.join(tmp, "overlay.yml");
 	fs.writeFileSync(overlay, stringify(OVERLAY_BASE));
@@ -64,7 +71,7 @@ export async function selfCheck(bin: string, pluginDir: string): Promise<string 
 	let rpc: RpcClient | null = null;
 	const expired = Promise.withResolvers<never>();
 	expired.promise.catch(() => {});
-	const timer = setTimeout(() => expired.reject(new Error(`no answer within ${CHECK_TIMEOUT_MS / 1000}s`)), CHECK_TIMEOUT_MS);
+	const timer = setTimeout(() => expired.reject(new HubError("unavailable", m.checkTimeout(CHECK_TIMEOUT_MS / 1000))), CHECK_TIMEOUT_MS);
 	const deadline = expired.promise;
 	try {
 		await once(wss, "listening");
@@ -84,17 +91,17 @@ export async function selfCheck(bin: string, pluginDir: string): Promise<string 
 		);
 		rpc = client;
 		await Promise.race([client.ready, deadline]);
-		await Promise.race([hello.promise, client.exited.then(e => Promise.reject(new Error(`omp exited: ${e.detail}`))), deadline]).catch(err => {
-			throw new Error(`the omp-home bridge extension did not connect (${errorText(err)})`);
+		await Promise.race([hello.promise, client.exited.then(e => Promise.reject(new HubError("unavailable", m.checkExited(e.detail)))), deadline]).catch(err => {
+			throw new HubError("unavailable", m.bridgeDisconnected(errorMessage(err)));
 		});
 		const state = await client.request("get_state");
 		const dumped = z.object({ dumpTools: z.array(z.object({ name: z.string() })) }).safeParse(state);
-		if (!dumped.success) return "get_state has no tool list";
+		if (!dumped.success) return m.missingToolList();
 		const names = new Set(dumped.data.dumpTools.map(t => t.name));
 		const missing = toolsFor("main").filter(t => !names.has(t));
-		return missing.length ? `the bridge tools ${missing.join(", ")} are missing from get_state` : null;
+		return missing.length ? m.missingBridgeTools(missing.join(", ")) : null;
 	} catch (err) {
-		return errorText(err);
+		return errorMessage(err);
 	} finally {
 		clearTimeout(timer);
 		await rpc?.stop(2000);
@@ -110,6 +117,8 @@ export interface OmpOptions {
 	log(message: string): void;
 }
 
+type OmpStatus = Omit<OmpDTO, "warning"> & { warning: string | Message | null };
+
 /**
  * Which omp binary the hub spawns. Order: an explicit path (settings.ompPath; tests use
  * OMP_HOME_OMP_BIN) → the managed copy → omp on PATH / common install dirs. A PATH omp whose
@@ -119,51 +128,51 @@ export interface OmpOptions {
 export class OmpManager {
 	readonly #o: OmpOptions;
 	readonly #root: string;
-	#status: OmpDTO = { version: null, path: null, managed: false, warning: "omp has not been resolved yet" };
+	#status: OmpStatus = { version: null, path: null, managed: false, warning: m.ompUnresolved() };
 
 	constructor(opts: OmpOptions) {
 		this.#o = opts;
 		this.#root = path.join(opts.configDir, "omp");
 	}
 
-	status(): OmpDTO {
-		return this.#status;
+	status(language: Language = "en"): OmpDTO {
+		return { ...this.#status, warning: this.#status.warning === null ? null : render(this.#status.warning, language) };
 	}
 
 	bin(): string {
-		if (!this.#status.path) throw new HubError("unavailable", this.#status.warning ?? "omp was not found");
+		if (!this.#status.path) throw new HubError("unavailable", this.#status.warning ?? m.ompNotFound());
 		return this.#status.path;
 	}
 
 	/** Resolve (and possibly install) the binary. Returns a warning worth showing the human, if any. */
 	async resolve(explicit: string | null): Promise<OmpDTO> {
 		this.#status = await this.#resolve(explicit ?? process.env.OMP_HOME_OMP_BIN ?? null);
-		if (this.#status.warning) this.#o.log(`omp: ${this.#status.warning}`);
-		return this.#status;
+		if (this.#status.warning) this.#o.log(`omp: ${render(this.#status.warning)}`);
+		return this.status();
 	}
 
-	async #resolve(explicit: string | null): Promise<OmpDTO> {
+	async #resolve(explicit: string | null): Promise<OmpStatus> {
 		if (explicit) {
-			if (!executable(explicit)) return { version: null, path: null, managed: false, warning: `${explicit} (the configured omp path) is not an executable file` };
+			if (!executable(explicit)) return { version: null, path: null, managed: false, warning: m.ompNotExecutable(explicit) };
 			return { version: await ompVersion(explicit), path: explicit, managed: false, warning: null };
 		}
 		const managed = this.#current();
 		const found = [...(process.env.PATH ?? "").split(path.delimiter).filter(Boolean), ...COMMON_DIRS].map(dir => path.join(dir, "omp")).find(executable);
 		if (!found) {
 			if (managed) return { ...managed, managed: true, warning: null };
-			return { version: null, path: null, managed: false, warning: `omp was not found on PATH or in ${COMMON_DIRS.join(", ")}; install omp (https://omp.sh) or set its path in Settings` };
+			return { version: null, path: null, managed: false, warning: m.ompMissing(COMMON_DIRS.join(", ")) };
 		}
 		const version = await ompVersion(found);
 		if (managed && version === managed.version) return { ...managed, managed: true, warning: null };
-		const failure = version ? await selfCheck(found, this.#o.pluginDir) : `${found} --version printed no version`;
+		const failure = version ? await compatibilityFailure(found, this.#o.pluginDir) : m.ompNoVersion(found);
 		if (failure === null) {
 			const installed = this.#install(found, version!);
 			this.#o.log(`omp: ${found} ${version} passed the compatibility check; using the managed copy ${installed}`);
 			return { version, path: installed, managed: true, warning: null };
 		}
-		const reason = `omp ${version ?? "(unknown version)"} at ${found} failed the omp-home compatibility check: ${failure}`;
-		if (managed) return { ...managed, managed: true, warning: `${reason}. Still using omp ${managed.version}.` };
-		return { version, path: found, managed: false, warning: `${reason}. Using it anyway; sessions may not work.` };
+		const reason = m.ompCheckFailed(version, found, failure);
+		if (managed) return { ...managed, managed: true, warning: m.ompKeepingManaged(reason, managed.version) };
+		return { version, path: found, managed: false, warning: m.ompUsingUnchecked(reason) };
 	}
 
 	#current(): { version: string; path: string } | null {

@@ -1,6 +1,8 @@
-import type { CommandDTO } from "../shared/api.ts";
+import type { CommandDTO, Language } from "../shared/api.ts";
 import { NOTICE_MESSAGE } from "../shared/bridge-wire.ts";
-import { emptyTranscript, type Block, type Item, type SessionStatus, type SubagentView, type ToolView, type TranscriptEvent, type TranscriptView, type UiRequest, type UiResponse, type Usage } from "../shared/transcript.ts";
+import { emptyTranscript, type Block, type Item, type RequestAnswerKind, type SessionStatus, type SubagentView, type ToolView, type TranscriptEvent, type TranscriptView, type UiRequest, type UiResponse, type Usage } from "../shared/transcript.ts";
+import { render, type Message } from "./i18n.ts";
+import { runtimeMessages as m } from "./i18n-runtime.ts";
 
 /**
  * omp RPC frames → `TranscriptEvent`s. No I/O: the hub feeds frames in arrival order
@@ -22,9 +24,62 @@ const strings = (v: unknown): string[] => arr(v).flatMap(s => (typeof s === "str
 /** Tool output kept per tool (the tail: errors and results come last). */
 export const TOOL_OUTPUT_LIMIT = 32 * 1024;
 
-export function clipOutput(text: string): string {
+export function clipOutput(text: string, language: Language = "en"): string {
 	if (text.length <= TOOL_OUTPUT_LIMIT) return text;
-	return `…[${text.length - TOOL_OUTPUT_LIMIT} earlier characters not shown]\n${text.slice(-TOOL_OUTPUT_LIMIT)}`;
+	return `${render(m.truncated(text.length - TOOL_OUTPUT_LIMIT), language)}\n${text.slice(-TOOL_OUTPUT_LIMIT)}`;
+}
+
+function toolOutput(text: string): Pick<ToolView, "output" | "omittedCharacters"> {
+	return { output: clipOutput(text), omittedCharacters: Math.max(0, text.length - TOOL_OUTPUT_LIMIT) };
+}
+
+function localizedOutput(output: string, omittedCharacters: number | undefined, language: Language): string {
+	return omittedCharacters ? `${render(m.truncated(omittedCharacters), language)}\n${output.slice(-TOOL_OUTPUT_LIMIT)}` : output;
+}
+
+function localizedItem(item: Item, language: Language): Item {
+	return item.kind === "request" && item.answerKind ? { ...item, answer: render(m.answer(item.answerKind), language) } : item;
+}
+
+function localizedTool(tool: ToolView, language: Language): ToolView {
+	return tool.omittedCharacters ? { ...tool, output: localizedOutput(tool.output, tool.omittedCharacters, language) } : tool;
+}
+
+function localizedTools(tools: Record<string, ToolView>, language: Language): Record<string, ToolView> {
+	return Object.fromEntries(Object.entries(tools).map(([id, tool]) => [id, localizedTool(tool, language)]));
+}
+
+/** Render only provenance-marked hub text; never inspect or translate model/tool content. */
+export function localizedView(view: TranscriptView, language: Language = "en"): TranscriptView {
+	if (language === "en") return view;
+	return {
+		...view,
+		items: view.items.map(item => localizedItem(item, language)),
+		tools: localizedTools(view.tools, language),
+		subagents: Object.fromEntries(Object.entries(view.subagents).map(([id, sub]) => [id, { ...sub, transcript: localizedView(sub.transcript, language) }])),
+	};
+}
+
+export function localizedEvent<E extends TranscriptEvent>(event: E, language: Language = "en"): E {
+	if (language === "en") return event;
+	switch (event.t) {
+		case "reset":
+			return { ...event, view: localizedView(event.view, language) };
+		case "prepend":
+			return { ...event, items: event.items.map(item => localizedItem(item, language)), tools: localizedTools(event.tools, language) };
+		case "item":
+			return { ...event, item: localizedItem(event.item, language) };
+		case "tool":
+			return { ...event, tool: localizedTool(event.tool, language) };
+		case "tool_output":
+			return { ...event, output: localizedOutput(event.output, event.omittedCharacters, language) };
+		case "request_closed":
+			return event.answerKind ? { ...event, answer: render(m.answer(event.answerKind), language) } : event;
+		case "subagent_event":
+			return { ...event, event: localizedEvent(event.event, language) };
+		default:
+			return event;
+	}
 }
 
 /** Text of a message `content`: a string, or the text parts of a block array. */
@@ -199,11 +254,22 @@ export function responseFits(request: UiRequest, response: UiResponse): boolean 
 }
 
 /** One-line rendering of how a request was answered. */
-export function answerText(request: UiRequest, response: UiResponse): string {
-	if ("cancelled" in response) return "Cancelled";
-	if ("confirmed" in response) return response.confirmed ? "Yes" : "No";
+export function answerText(request: UiRequest, response: UiResponse, language: Language = "en"): string {
+	if ("cancelled" in response) return render(m.answer("cancelled"), language);
+	if ("confirmed" in response) return render(m.answer(response.confirmed ? "yes" : "no"), language);
 	if ("value" in response) return request.method === "input" && request.secret ? "••••••" : response.value;
 	return response.answers.map(a => [...a.selectedOptions, ...(a.customInput ? [a.customInput] : [])].join(", ")).join("; ");
+}
+
+function answerKind(response: UiResponse): RequestAnswerKind | undefined {
+	if ("cancelled" in response) return "cancelled";
+	if ("confirmed" in response) return response.confirmed ? "yes" : "no";
+	return undefined;
+}
+
+export function answerEvent(id: string, request: UiRequest, response: UiResponse): Extract<TranscriptEvent, { t: "request_closed" }> {
+	const kind = answerKind(response);
+	return { t: "request_closed", id, answer: answerText(request, response), ...(kind ? { answerKind: kind } : {}) };
 }
 
 export function commandsOf(v: unknown): CommandDTO[] {
@@ -256,7 +322,7 @@ export function historyView(messages: unknown[], now: number): { items: Item[]; 
 			case "toolResult": {
 				const callId = str(m.toolCallId);
 				const tool = callId ? tools[callId] : undefined;
-				if (tool) tools[tool.callId] = { ...tool, status: m.isError === true ? "error" : "done", output: clipOutput(textOf(m.content)), endedAt: at };
+				if (tool) tools[tool.callId] = { ...tool, status: m.isError === true ? "error" : "done", ...toolOutput(textOf(m.content)), endedAt: at };
 				return;
 			}
 			case "custom": {
@@ -272,7 +338,7 @@ export function historyView(messages: unknown[], now: number): { items: Item[]; 
 
 export interface Normalized {
 	events: TranscriptEvent[];
-	toast: { level: "info" | "error"; text: string } | null;
+	toast: { level: "info" | "error"; text: string | Message } | null;
 }
 
 function subagentStatus(v: unknown): SubagentView["status"] | null {
@@ -296,10 +362,10 @@ export class Normalizer {
 				return this.#uiRequest(view, f, now);
 			case "prompt_result": {
 				const error = rec(f.error);
-				return f.status === "error" ? { events: [], toast: { level: "error", text: `prompt failed: ${str(error?.message) ?? "unknown error"}` } } : none;
+				return f.status === "error" ? { events: [], toast: { level: "error", text: m.promptFailed(str(error?.message)) } } : none;
 			}
 			case "extension_error":
-				return { events: [], toast: { level: "error", text: `extension ${str(f.event) ?? ""} failed: ${str(f.error) ?? ""}` } };
+				return { events: [], toast: { level: "error", text: m.extensionFailed(str(f.event) ?? "", str(f.error) ?? "") } };
 			case "session_settled":
 				return { events: [{ t: "status", patch: { settled: true } }], toast: null };
 			case "command_output": {
@@ -338,7 +404,7 @@ export class Normalizer {
 			}
 			case "cancel": {
 				const target = str(f.targetId);
-				return target ? { events: [{ t: "request_closed", id: target, answer: "Withdrawn" }], toast: null } : none;
+				return target ? { events: [{ t: "request_closed", id: target, answer: render(m.answer("withdrawn")), answerKind: "withdrawn" }], toast: null } : none;
 			}
 			case "setStatus": {
 				const key = str(f.statusKey);
@@ -511,11 +577,11 @@ export class Normalizer {
 			case "tool_execution_start":
 				return [{ t: "tool", tool: { ...base, name: str(f.toolName) ?? base.name, intent: str(f.intent) ?? base.intent ?? intentOf(f.args), args: f.args ?? base.args, status: "running" } }];
 			case "tool_execution_update": {
-				const output = clipOutput(textOf(rec(f.partialResult)?.content));
-				return known ? [{ t: "tool_output", callId, output }] : [{ t: "tool", tool: { ...base, output } }];
+				const output = toolOutput(textOf(rec(f.partialResult)?.content));
+				return known ? [{ t: "tool_output", callId, ...output }] : [{ t: "tool", tool: { ...base, ...output } }];
 			}
 			default:
-				return [{ t: "tool", tool: { ...base, status: f.isError === true ? "error" : "done", output: clipOutput(textOf(rec(f.result)?.content)), endedAt: now } }];
+				return [{ t: "tool", tool: { ...base, status: f.isError === true ? "error" : "done", ...toolOutput(textOf(rec(f.result)?.content)), endedAt: now } }];
 		}
 	}
 }

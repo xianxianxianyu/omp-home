@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { FieldError } from "../../shared/api.ts";
 import { fieldError, parseResponse } from "./schemas.ts";
+import { LANGUAGE_HEADER } from "../../shared/api.ts";
+import { getLanguage } from "./i18n/runtime.ts";
 
 const TOKEN_KEY = "omp-home-token";
 
@@ -32,7 +34,7 @@ export class ApiError extends Error {
 export async function api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
 	const res = await fetch(path, {
 		method: init?.method ?? (init?.body === undefined ? "GET" : "POST"),
-		headers: { authorization: `Bearer ${token}`, ...(init?.body === undefined ? {} : { "content-type": "application/json" }) },
+		headers: { authorization: `Bearer ${token}`, [LANGUAGE_HEADER]: getLanguage(), ...(init?.body === undefined ? {} : { "content-type": "application/json" }) },
 		body: init?.body === undefined ? undefined : JSON.stringify(init.body),
 	});
 	const text = await res.text();

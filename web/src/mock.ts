@@ -12,7 +12,7 @@ const root = "/tmp/omp-home-demo";
 const subscribers = new Set<SocketHandlers>();
 const main: StateDTO["main"] = { sessionId: "M-1", state: "idle", wakesUsed: 2, wakesMax: 3, paused: false, pendingNotices: 1 };
 let setupDone = new URLSearchParams(location.search).get("setup") !== "1";
-let settings: SettingsDTO = { homePath: home, ompPath: null, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees`, appearance: { theme: "system", accent: "amber", textSize: "default", density: "comfortable" } };
+let settings: SettingsDTO = { homePath: home, ompPath: null, pstackRoot: `${root}/pstack`, mainModel: "openai-codex/gpt-6-astra", mainThinking: "high", workerModel: "anthropic/claude-opus-5-5", workerThinking: "high", dispatcherModel: null, maxLiveWorkers: 4, idleEvictMinutes: 20, maxAutoWakes: 3, portRange: [4100, 4199], worktreeRoot: `${home}/worktrees`, appearance: { theme: "system", accent: "amber", textSize: "default", density: "comfortable" }, language: "system" };
 const catalog: ModelCatalogDTO = {
 	defaultModel: "anthropic/claude-opus-5-5", fetchedAt: now, error: null,
 	models: [

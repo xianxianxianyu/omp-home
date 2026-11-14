@@ -8,8 +8,9 @@ import type { ProcState } from "../shared/api.ts";
 import type { HomePaths } from "./config.ts";
 import { admit, idleVictims, launchSpec, liveWorkers, procState, type PoolEntry, type Proc } from "./core/pool.ts";
 import type { Db } from "./db.ts";
-import { errorText, HubError } from "./errors.ts";
+import { errorMessage, errorText, HubError } from "./errors.ts";
 import { hooksDir } from "./git.ts";
+import { messages, type Message } from "./i18n.ts";
 import type { Resources } from "./resources.ts";
 import { RpcClient, RpcError, type RpcExit, type RpcFrame } from "./rpc.ts";
 import type { SessionSeed } from "./session-views.ts";
@@ -57,6 +58,7 @@ export interface ExitInfo {
 	incarnation: number;
 	/** Why: spawn error or the tail of omp's stderr. */
 	detail: string;
+	detailText?: Message | string;
 }
 
 export interface PoolDeps {
@@ -80,7 +82,7 @@ export interface PoolDeps {
 	ready(sessionId: string): void;
 	exited(session: SessionRow, info: ExitInfo): void;
 	changed(): void;
-	mainFailed(message: string): void;
+	mainFailed(message: Message): void;
 	log(message: string): void;
 }
 
@@ -124,7 +126,7 @@ export class Pool {
 
 	must(id: string): SessionRow {
 		const row = this.session(id);
-		if (!row) throw new HubError("not_found", `no session ${id}`);
+		if (!row) throw new HubError("not_found", messages.noSession(id));
 		return row;
 	}
 
@@ -211,7 +213,7 @@ export class Pool {
 	 */
 	ensureLive(id: string, opts: { human: boolean }): "live" | "starting" | "queued" {
 		const row = this.must(id);
-		if (row.retired_at !== null) throw new HubError("conflict", `session ${id} is retired`);
+		if (row.retired_at !== null) throw new HubError("conflict", messages.sessionRetired(id));
 		const live = this.#live.get(id);
 		if (live) {
 			if (live.proc.s === "stopping") {
@@ -236,7 +238,7 @@ export class Pool {
 			return "starting";
 		}
 		if (opts.human) {
-			throw new HubError("unavailable", `all ${this.liveWorkerCount()} worker slots are busy and none is idle; evict a worker or raise the live cap`);
+			throw new HubError("unavailable", messages.workerCapacity(this.liveWorkerCount()));
 		}
 		this.#enqueue(id, false);
 		return "queued";
@@ -299,10 +301,10 @@ export class Pool {
 		this.#launch(row, live).catch(err => {
 			if (this.#live.get(row.id) !== live) return;
 			this.#live.delete(row.id);
-			live.client.reject(new HubError("unavailable", `${row.id} could not start: ${errorText(err)}`));
+			live.client.reject(new HubError("unavailable", messages.startFailed(row.id, errorMessage(err))));
 			this.#d.log(`${row.id}: could not start omp: ${errorText(err)}`);
 			this.#d.db.run("UPDATE session SET pid = NULL, last_exit = 'clean' WHERE id = ?", row.id);
-			this.#d.exited(this.must(row.id), { intentional: false, wasRunning: false, neverConnected: true, exitCode: -1, incarnation: live.incarnation, detail: errorText(err) });
+			this.#d.exited(this.must(row.id), { intentional: false, wasRunning: false, neverConnected: true, exitCode: -1, incarnation: live.incarnation, detail: errorText(err), detailText: errorMessage(err) });
 			this.#changed();
 			if (row.kind === "main") this.#mainCrashed(row.id);
 			this.#drainQueue();
@@ -311,7 +313,7 @@ export class Pool {
 
 	async #launch(row: SessionRow, live: Live): Promise<void> {
 		const settings = this.#d.settings.get();
-		if (!fs.existsSync(row.cwd)) throw new Error(`working directory ${row.cwd} is missing`);
+		if (!fs.existsSync(row.cwd)) throw new HubError("unavailable", messages.cwdMissing(row.cwd));
 		let worker: Parameters<typeof launchSpec>[0]["worker"] = null;
 		let model: string | null;
 		let thinking: string;
@@ -435,7 +437,7 @@ export class Pool {
 
 	#onExit(id: string, live: Live, exit: RpcExit): void {
 		clearTimeout(live.helloTimer);
-		live.client.reject(new HubError("unavailable", `${id} exited before it was ready`));
+		live.client.reject(new HubError("unavailable", messages.exitedEarly(id)));
 		if (this.#live.get(id) !== live) return;
 		this.#live.delete(id);
 		const intentional = live.proc.s === "stopping";
@@ -453,7 +455,7 @@ export class Pool {
 		const now = Date.now();
 		this.#mainFailures = [...this.#mainFailures.filter(t => now - t < MAIN_FAILURE_WINDOW_MS), now];
 		if (this.#mainFailures.length >= MAIN_FAILURE_LIMIT) {
-			this.#d.mainFailed(`The main chat exited ${MAIN_FAILURE_LIMIT} times in 5 minutes; automatic restarts stopped. Check ${this.must(id).session_dir} and use Restart main.`);
+			this.#d.mainFailed(messages.mainFailed(MAIN_FAILURE_LIMIT, this.must(id).session_dir));
 			return;
 		}
 		const delay = MAIN_BACKOFF_MS[Math.min(this.#mainFailures.length - 1, MAIN_BACKOFF_MS.length - 1)]!;
@@ -468,7 +470,7 @@ export class Pool {
 	/** Human restart of the main chat: clears the failure history. */
 	async restartMain(): Promise<SessionRow> {
 		const main = this.currentMain();
-		if (!main) throw new HubError("not_found", "no main chat");
+		if (!main) throw new HubError("not_found", messages.noMain());
 		this.#mainFailures = [];
 		await this.stop(main.id, "restart");
 		this.ensureLive(main.id, { human: true });
@@ -494,7 +496,7 @@ export class Pool {
 		}
 		if (!live.rpc) {
 			this.#live.delete(id);
-			live.client.reject(new HubError("unavailable", `${id} was stopped`));
+			live.client.reject(new HubError("unavailable", messages.stopped(id)));
 			this.#changed();
 			return;
 		}
@@ -506,9 +508,9 @@ export class Pool {
 	/** The RPC client of a live (or starting) session, once it is set up. */
 	async client(id: string): Promise<RpcClient> {
 		const live = this.#live.get(id);
-		if (!live || live.proc.s === "stopping") throw new HubError("unavailable", `${id} is not running`);
+		if (!live || live.proc.s === "stopping") throw new HubError("unavailable", messages.notRunning(id));
 		const timeout = Promise.withResolvers<never>();
-		const timer = setTimeout(() => timeout.reject(new HubError("unavailable", `${id} did not finish starting within ${HELLO_TIMEOUT_MS / 1000}s`)), HELLO_TIMEOUT_MS);
+		const timer = setTimeout(() => timeout.reject(new HubError("unavailable", messages.startTimeout(id, HELLO_TIMEOUT_MS / 1000))), HELLO_TIMEOUT_MS);
 		try {
 			return await Promise.race([live.client.promise, timeout.promise]);
 		} finally {
@@ -524,7 +526,7 @@ export class Pool {
 
 	async evict(id: string): Promise<void> {
 		const live = this.#live.get(id);
-		if (live?.running) throw new HubError("conflict", `${id} is running a turn; cancel its task or wait for the turn to end`);
+		if (live?.running) throw new HubError("conflict", messages.busySession(id));
 		this.#queue = this.#queue.filter(q => q !== id);
 		await this.stop(id, "evict");
 	}

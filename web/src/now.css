@@ -30,7 +30,7 @@
 .task-progress-line { display: flex; align-items: center; gap: 12px; margin-top: 7px; font-size: 0.846154rem; }
 .phase-label { color: var(--muted); }
 .approval .phase-label { color: var(--accent); }
-.elapsed { color: var(--dim); font: 0.769231rem var(--mono); margin-left: auto; }
+.elapsed { color: var(--dim); font-size: 0.846154rem; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
 .task-card-main p { margin: 3px 0 0; font-size: 0.846154rem; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
 .playbook-chip { display: inline-block; font-size: 0.692308rem; color: var(--dim); padding: 0 5px; border: 1px solid var(--line-2); border-radius: 4px; margin-left: auto; flex-shrink: 0; }
 .task-card-menu { position: absolute; right: 6px; top: 8px; z-index: 1; }

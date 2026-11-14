@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { SessionDTO, WorkspaceDTO } from "../../../shared/api.ts";
 import { useHub, useResource } from "../hub.tsx";
+import { useI18n, useT } from "../i18n/index.tsx";
 import { Button, Confirm, Empty, ErrorState, Loading, RelativeTime, Section, Status } from "../ui.tsx";
 
 function sessionDot(session: SessionDTO): string {
@@ -16,13 +17,15 @@ function sessionDot(session: SessionDTO): string {
 }
 
 function SessionTable({ sessions, onRetire }: { sessions: SessionDTO[]; onRetire: (session: SessionDTO) => void }) {
+	const t = useT().panels;
+	const { format } = useI18n();
 	const { openSession, openTask, mutate } = useHub();
 
 	return (
 		<div className="table-wrap">
 			<table className="grid sessions-grid">
 				<thead>
-					<tr><th>Session</th><th>Branch / working directory</th><th>Model</th><th>RSS</th><th>Last activity</th><th>Open task</th><th>Actions</th></tr>
+					<tr><th>{t.sessions.session}</th><th>{t.sessions.branchDirectory}</th><th>{t.sessions.model}</th><th>{t.sessions.memory}</th><th>{t.sessions.lastActivity}</th><th>{t.sessions.openTask}</th><th>{t.common.actions}</th></tr>
 				</thead>
 				<tbody>
 					{[...sessions].sort((a, b) => Number(a.retired) - Number(b.retired) || (b.lastActivity ?? b.createdAt) - (a.lastActivity ?? a.createdAt)).map(session => (
@@ -33,14 +36,14 @@ function SessionTable({ sessions, onRetire }: { sessions: SessionDTO[]; onRetire
 									<strong className="mono">{session.id}</strong>
 								</div>
 								<Status value={session.retired ? "retired" : session.state} />
-								{session.pid !== null && <div className="muted mono">PID {session.pid}</div>}
+								{session.pid !== null && <div className="muted mono">{t.common.pid} {format.number(session.pid, { useGrouping: false })}</div>}
 							</td>
 							<td>
-								<div className="mono prewrap">{session.branch ?? "No branch"}</div>
+								<div className="mono prewrap">{session.branch ?? t.sessions.noBranch}</div>
 								<div className="muted mono prewrap" title={session.cwd}>{session.cwd}</div>
 							</td>
-							<td><span className="mono prewrap">{session.model || "Default"}</span></td>
-							<td>{session.rssMb === null ? <span className="dim">—</span> : `${session.rssMb.toLocaleString(undefined, { maximumFractionDigits: 1 })} MB`}</td>
+							<td><span className="mono prewrap">{session.model || t.common.default}</span></td>
+							<td>{session.rssMb === null ? <span className="dim">—</span> : t.sessions.memoryValue(format.number(session.rssMb, { maximumFractionDigits: 1 }))}</td>
 							<td><RelativeTime at={session.lastActivity} /></td>
 							<td>
 								{session.openTask ? (
@@ -50,23 +53,23 @@ function SessionTable({ sessions, onRetire }: { sessions: SessionDTO[]; onRetire
 										</button>
 										<div><Status value={session.openTask.status} /></div>
 									</>
-								) : <span className="dim">No open task</span>}
+								) : <span className="dim">{t.sessions.noTask}</span>}
 							</td>
 							<td>
 								<div className="actions">
 									<Button className="small" disabled={session.retired} onClick={async () => { await openSession(session.id); }}>
-										Attach
+										{t.sessions.attach}
 									</Button>
 									<Button
 										className="small"
 										disabled={session.retired || session.state === "cold" || session.state === "stopping"}
-										title="Stop the live process; its saved conversation can be attached again."
+										title={t.sessions.evictHint}
 										onClick={() => mutate<SessionDTO>(`/api/sessions/${encodeURIComponent(session.id)}/evict`, undefined, "POST")}
 									>
-										Evict
+										{t.sessions.evict}
 									</Button>
 									<Button className="small danger" disabled={session.retired} onClick={() => onRetire(session)}>
-										Retire
+										{t.sessions.retire}
 									</Button>
 								</div>
 							</td>
@@ -79,6 +82,8 @@ function SessionTable({ sessions, onRetire }: { sessions: SessionDTO[]; onRetire
 }
 
 export function SessionsPanel() {
+	const t = useT().panels;
+	const { format } = useI18n();
 	const { mutate } = useHub();
 	const sessions = useResource<SessionDTO[]>("sessions", "/api/sessions");
 	const workspaces = useResource<WorkspaceDTO[]>("workspaces", "/api/workspaces");
@@ -95,23 +100,23 @@ export function SessionsPanel() {
 			else workers.set(session.workspace, [session]);
 		}
 	}
-	const workspaceName = (id: string | null) => id === null ? "Unassigned workspace" : names.get(id) ?? id;
+	const workspaceName = (id: string | null) => id === null ? t.sessions.unassigned : names.get(id) ?? id;
 
 	return (
 		<div className="scroll">
 			<div className="panel-heading">
 				<div>
-					<h2>Sessions</h2>
-					<p className="muted">Attach to a conversation, or free a live process without losing its history.</p>
+					<h2>{t.sessions.title}</h2>
+					<p className="muted">{t.sessions.description}</p>
 				</div>
-				{sessions.data && <span className="pill">{sessions.data.filter(session => !session.retired && session.state !== "cold").length} live / {sessions.data.length} total</span>}
+				{sessions.data && <span className="pill">{t.sessions.counts(format.number(sessions.data.filter(session => !session.retired && session.state !== "cold").length), format.number(sessions.data.length))}</span>}
 			</div>
 			{sessions.error && <ErrorState error={sessions.error} retry={sessions.reload} />}
 			{workspaces.error && <ErrorState error={workspaces.error} retry={workspaces.reload} />}
 			{sessions.loading && !sessions.data && <Loading />}
-			{sessions.data?.length === 0 && <Empty title="No sessions yet">Sessions appear when main starts or assigns work to a worker.</Empty>}
+			{sessions.data?.length === 0 && <Empty title={t.sessions.empty}>{t.sessions.emptyDescription}</Empty>}
 			{main.length > 0 && (
-				<Section title="Main">
+				<Section title={t.common.main}>
 					<SessionTable sessions={main} onRetire={setRetiring} />
 				</Section>
 			)}
@@ -122,9 +127,9 @@ export function SessionsPanel() {
 			))}
 			{retiring && (
 				<Confirm
-					title={`Retire ${retiring.id}?`}
-					description={`End this ${retiring.kind === "main" ? "main" : "worker"} session and stop its process. It will no longer be available to attach. Task worktrees and branches are kept; clean them up separately.`}
-					confirmLabel="Retire session"
+					title={t.sessions.retireTitle(retiring.id)}
+					description={t.sessions.retireDescription(retiring.kind === "main" ? t.common.main : t.common.worker)}
+					confirmLabel={t.sessions.retireSession}
 					danger
 					onConfirm={() => mutate<SessionDTO>(`/api/sessions/${encodeURIComponent(retiring.id)}/retire`, undefined, "POST")}
 					onClose={() => setRetiring(null)}

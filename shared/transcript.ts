@@ -25,6 +25,8 @@ export interface ToolView {
 	status: "running" | "done" | "error";
 	/** Latest output text: streamed partial while running, final result text after. */
 	output: string;
+	/** Hub-added truncation framing; the output tail itself is never translated. */
+	omittedCharacters?: number;
 	startedAt: number;
 	endedAt: number | null;
 }
@@ -45,6 +47,9 @@ export type UiResponse =
 	| { answers: { id: string; selectedOptions: string[]; customInput?: string }[] }
 	| { cancelled: true };
 
+/** Hub-authored request answers, distinct from arbitrary human/model text. */
+export type RequestAnswerKind = "cancelled" | "yes" | "no" | "withdrawn" | "session_ended";
+
 export type Item =
 	| { kind: "user"; id: string; at: number; text: string; images: number; from: "human" | "agent" }
 	| {
@@ -61,7 +66,7 @@ export type Item =
 	/** Injected records: omp-home notices, IRC messages from other agents, other extension messages. */
 	| { kind: "notice"; id: string; at: number; source: "omp-home" | "irc" | "custom"; from: string | null; text: string }
 	/** A dialog omp is waiting on (tool approval, ask tool, extension prompt). `answer` is set once handled. */
-	| { kind: "request"; id: string; at: number; request: UiRequest; answer: string | null };
+	| { kind: "request"; id: string; at: number; request: UiRequest; answer: string | null; answerKind?: RequestAnswerKind };
 
 export interface SubagentView {
 	id: string;
@@ -105,8 +110,8 @@ export type TranscriptEvent =
 	| { t: "delta"; id: string; index: number; kind: "text" | "thinking"; text: string }
 	/** Insert or replace a tool by callId; when `itemId` is given the assistant item gets a tool block at `index`. */
 	| { t: "tool"; tool: ToolView; itemId?: string; index?: number }
-	| { t: "tool_output"; callId: string; output: string }
-	| { t: "request_closed"; id: string; answer: string }
+	| { t: "tool_output"; callId: string; output: string; omittedCharacters?: number }
+	| { t: "request_closed"; id: string; answer: string; answerKind?: RequestAnswerKind }
 	| { t: "status"; patch: Partial<SessionStatus> }
 	| { t: "subagent"; id: string; patch: Partial<Omit<SubagentView, "transcript" | "id">> }
 	| { t: "subagent_event"; id: string; event: TranscriptEvent };
@@ -189,10 +194,23 @@ export function reduceTranscript(view: TranscriptView, ev: TranscriptEvent): Tra
 		}
 		case "tool_output": {
 			const tool = view.tools[ev.callId];
-			return tool ? { ...view, tools: { ...view.tools, [ev.callId]: { ...tool, output: ev.output } } } : view;
+			if (!tool) return view;
+			const updated = { ...tool, output: ev.output };
+			if (ev.omittedCharacters === undefined) delete updated.omittedCharacters;
+			else updated.omittedCharacters = ev.omittedCharacters;
+			return { ...view, tools: { ...view.tools, [ev.callId]: updated } };
 		}
 		case "request_closed":
-			return { ...view, items: mapItem(view.items, ev.id, item => (item.kind === "request" ? { ...item, answer: ev.answer } : item)) };
+			return {
+				...view,
+				items: mapItem(view.items, ev.id, item => {
+					if (item.kind !== "request") return item;
+					const updated = { ...item, answer: ev.answer };
+					if (ev.answerKind === undefined) delete updated.answerKind;
+					else updated.answerKind = ev.answerKind;
+					return updated;
+				}),
+			};
 		case "status":
 			return { ...view, status: { ...view.status, ...ev.patch } };
 		case "subagent": {

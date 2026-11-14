@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { escalationResolution, foldTask, INITIAL, NOTICE_POLICY, noticeFor, progressPhase, renderEnvelope, type TaskEvent, type TaskState } from "../server/core/task.ts";
+import { escalationResolution, foldTask, INITIAL, NOTICE_POLICY, noticeFor, progressPhase, renderEnvelope, type TaskEvent, type TaskState, waitText } from "../server/core/task.ts";
 
 /** Replay events from a fresh task; returns the final state and the notice each event produced. */
 function replay(events: TaskEvent[], from: TaskState = INITIAL): { state: TaskState; notices: (string | null)[] } {
@@ -87,7 +87,12 @@ test("process loss interrupts working and approval states only", () => {
 
 test("approval waits are auto-escalated info notices and resolve back to working", () => {
 	const { state, notices } = replay([delivered, run(1), { kind: "approval_requested", tool: "bash", summary: "git reset --hard" }]);
-	assert.deepEqual(state.status, { s: "awaiting", wait: { kind: "approval", text: "bash: git reset --hard" } });
+	assert.equal(state.status.s, "awaiting");
+	if (state.status.s === "awaiting") {
+		assert.equal(state.status.wait.kind, "approval");
+		assert.equal(waitText(state.status.wait), "bash: git reset --hard");
+		assert.equal(waitText(state.status.wait, "zh"), "bash：git reset --hard");
+	}
 	assert.equal(notices.at(-1), "approval");
 	assert.deepEqual(NOTICE_POLICY.approval, { priority: "info", autoEscalate: true });
 	assert.equal(foldTask(state, { kind: "approval_resolved", approved: true }).status.s, "working");
@@ -95,7 +100,12 @@ test("approval waits are auto-escalated info notices and resolve back to working
 
 test("provisioning failures wait and a retry returns the task to pending", () => {
 	const failed = replay([{ kind: "provision_failed", step: "env", message: "setup exited 1" }]);
-	assert.deepEqual(failed.state.status, { s: "awaiting", wait: { kind: "provision_failed", text: "env: setup exited 1" } });
+	assert.equal(failed.state.status.s, "awaiting");
+	if (failed.state.status.s === "awaiting") {
+		assert.equal(failed.state.status.wait.kind, "provision_failed");
+		assert.equal(waitText(failed.state.status.wait), "env: setup exited 1");
+		assert.equal(waitText(failed.state.status.wait, "zh"), "准备环境：setup exited 1");
+	}
 	assert.equal(failed.notices[0], "provision_failed");
 	assert.equal(foldTask(failed.state, { kind: "provision_retry", text: "fixed the recipe" }).status.s, "pending");
 });
@@ -149,3 +159,55 @@ test("in-flight phase: provisioning without a session, queued for a slot, else t
 	assert.equal(progressPhase("cancelled", null), null);
 });
 
+test("generated run waits render bilingually while the stored default stays English", () => {
+	const cases: { events: TaskEvent[]; en: string; zh: string }[] = [
+		{ events: [run(1), { kind: "run_ended", seq: 1, stop: "aborted", text: "", error: null }], en: "The run was aborted.", zh: "运行已中止。" },
+		{ events: [run(1), { kind: "run_ended", seq: 1, stop: "error", text: "", error: null }], en: "The run failed.", zh: "运行失败。" },
+		{ events: [run(1), end(1, "completed", "")], en: "(no final text)", zh: "（无最终回复）" },
+		{ events: [run(1), report("progress", "Keep Raw /tmp/Foo"), end(1, "completed", "Need API_KEY")], en: "Progress report: Keep Raw /tmp/Foo\n\nFinal text: Need API_KEY", zh: "进展汇报：Keep Raw /tmp/Foo\n\n最终回复：Need API_KEY" },
+		{ events: [run(1), report("progress", "half way"), end(1, "completed", "")], en: "Progress report: half way\n\nFinal text: (no final text)", zh: "进展汇报：half way\n\n最终回复：（无最终回复）" },
+	];
+	for (const { events, en, zh } of cases) {
+		const { state } = replay(events);
+		assert.equal(state.status.s, "awaiting");
+		if (state.status.s !== "awaiting") continue;
+		assert.equal(state.status.wait.text, en);
+		assert.equal(waitText(state.status.wait), en);
+		assert.equal(waitText(state.status.wait, "en"), en);
+		assert.equal(waitText(state.status.wait, "zh"), zh);
+	}
+});
+
+test("raw reports, model text and errors are not translated even when they resemble hub wording", () => {
+	const cases: { events: TaskEvent[]; text: string }[] = [
+		{ events: [{ kind: "reported", status: "question", summary: "The run failed.", details: "Progress report: raw user text" }], text: "The run failed.\n\nProgress report: raw user text" },
+		{ events: [report("blocked", "env: missing API_KEY")], text: "env: missing API_KEY" },
+		{ events: [run(1), end(1, "completed", "(no final text)")], text: "(no final text)" },
+		{ events: [run(1), end(1, "aborted", "The run was aborted.")], text: "The run was aborted." },
+		{ events: [run(1), { kind: "run_ended", seq: 1, stop: "error", text: "", error: "The run failed." }], text: "The run failed." },
+		{ events: [run(1), { kind: "run_ended", seq: 1, stop: "error", text: "raw model error", error: null }], text: "raw model error" },
+		{ events: [run(1), { kind: "run_ended", seq: 1, stop: "error", text: "ignored", error: "" }], text: "" },
+		{ events: [run(1), { kind: "process_lost", reason: "hub restarted" }], text: "hub restarted" },
+	];
+	for (const { events, text } of cases) {
+		const { state } = replay(events);
+		assert.equal(state.status.s, "awaiting");
+		if (state.status.s !== "awaiting") continue;
+		assert.equal(waitText(state.status.wait), text);
+		assert.equal(waitText(state.status.wait, "zh"), text);
+	}
+});
+
+test("hub reason metadata translates without changing its English model-facing text", () => {
+	const lost = replay([run(1), { kind: "process_lost", reason: "hub restarted", reasonMessage: { en: "hub restarted", zh: "中枢已重启" } }]);
+	const failed = replay([{ kind: "provision_failed", step: "session", message: "could not start: raw stderr", messageText: { en: "could not start: raw stderr", zh: "无法启动：raw stderr" } }]);
+	for (const [state, en, zh] of [
+		[lost.state, "hub restarted", "中枢已重启"],
+		[failed.state, "session: could not start: raw stderr", "启动会话：无法启动：raw stderr"],
+	] as const) {
+		assert.equal(state.status.s, "awaiting");
+		if (state.status.s !== "awaiting") continue;
+		assert.equal(waitText(state.status.wait), en);
+		assert.equal(waitText(state.status.wait, "zh"), zh);
+	}
+});

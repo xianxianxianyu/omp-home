@@ -3,6 +3,7 @@ import type { Item, SubagentView, TranscriptEvent, TranscriptView, UiRequest, Ui
 
 const text = z.string().nullable();
 const time = z.number().nullable();
+const answerKind = z.enum(["cancelled", "yes", "no", "withdrawn", "session_ended"]);
 export const uiRequest: z.ZodType<UiRequest> = z.discriminatedUnion("method", [
 	z.object({ method: z.literal("select"), title: z.string(), options: z.array(z.string()), details: z.array(text) }),
 	z.object({ method: z.literal("confirm"), title: z.string(), message: z.string() }),
@@ -19,9 +20,9 @@ const item: z.ZodType<Item> = z.discriminatedUnion("kind", [
 	z.object({ kind: z.literal("user"), id: z.string(), at: z.number(), text: z.string(), images: z.number(), from: z.enum(["human", "agent"]) }),
 	z.object({ kind: z.literal("assistant"), id: z.string(), at: z.number(), blocks: z.array(block), streaming: z.boolean(), model: text, stopReason: text, error: text, usage: z.object({ input: z.number(), output: z.number(), cacheRead: z.number(), cacheWrite: z.number(), costUsd: z.number() }).nullable() }),
 	z.object({ kind: z.literal("notice"), id: z.string(), at: z.number(), source: z.enum(["omp-home", "irc", "custom"]), from: text, text: z.string() }),
-	z.object({ kind: z.literal("request"), id: z.string(), at: z.number(), request: uiRequest, answer: text }),
+	z.object({ kind: z.literal("request"), id: z.string(), at: z.number(), request: uiRequest, answer: text, answerKind: answerKind.optional() }),
 ]);
-const tool = z.object({ callId: z.string(), name: z.string(), intent: text, args: z.unknown(), status: z.enum(["running", "done", "error"]), output: z.string(), startedAt: z.number(), endedAt: time });
+const tool = z.object({ callId: z.string(), name: z.string(), intent: text, args: z.unknown(), status: z.enum(["running", "done", "error"]), output: z.string(), startedAt: z.number(), endedAt: time, omittedCharacters: z.number().optional() });
 const status = z.object({ phase: z.enum(["idle", "running", "compacting"]), settled: z.boolean(), queue: z.object({ steering: z.array(z.string()), followUp: z.array(z.string()) }), model: text, contextPercent: z.number().nullable(), statusLine: z.record(z.string(), z.string()), widgets: z.record(z.string(), z.array(z.string())) });
 const subagentFields = z.object({ agent: z.string(), task: z.string(), status: z.enum(["running", "completed", "failed", "aborted"]), parentToolCallId: text, lastIntent: text, startedAt: z.number(), endedAt: time });
 const subagent: z.ZodType<SubagentView> = z.lazy(() => subagentFields.extend({ id: z.string(), transcript: transcriptView }));
@@ -32,8 +33,8 @@ export const transcriptEvent: z.ZodType<TranscriptEvent> = z.lazy(() => z.discri
 	z.object({ t: z.literal("item"), item }),
 	z.object({ t: z.literal("delta"), id: z.string(), index: z.number().int().nonnegative(), kind: z.enum(["text", "thinking"]), text: z.string() }),
 	z.object({ t: z.literal("tool"), tool, itemId: z.string().optional(), index: z.number().int().nonnegative().optional() }),
-	z.object({ t: z.literal("tool_output"), callId: z.string(), output: z.string() }),
-	z.object({ t: z.literal("request_closed"), id: z.string(), answer: z.string() }),
+	z.object({ t: z.literal("tool_output"), callId: z.string(), output: z.string(), omittedCharacters: z.number().optional() }),
+	z.object({ t: z.literal("request_closed"), id: z.string(), answer: z.string(), answerKind: answerKind.optional() }),
 	z.object({ t: z.literal("status"), patch: status.partial() }),
 	z.object({ t: z.literal("subagent"), id: z.string(), patch: subagentFields.partial() }),
 	z.object({ t: z.literal("subagent_event"), id: z.string(), event: transcriptEvent }),

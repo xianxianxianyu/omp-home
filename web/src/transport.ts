@@ -1,4 +1,5 @@
 import { wsUrl } from "./api.ts";
+import { getLanguage } from "./i18n/runtime.ts";
 
 export interface SocketHandlers {
 	open: () => void;
@@ -15,7 +16,8 @@ let mockFactory: SocketFactory | undefined;
 export function installSocketFactory(factory: SocketFactory) { mockFactory = factory; }
 export function connectSocket(path: string, handlers: SocketHandlers): HubSocket {
 	if (mockFactory) return mockFactory(path, handlers);
-	const socket = new WebSocket(wsUrl(path));
+	const localizedPath = `${path}${path.includes("?") ? "&" : "?"}lang=${getLanguage()}`;
+	const socket = new WebSocket(wsUrl(localizedPath));
 	socket.onopen = handlers.open;
 	socket.onmessage = event => {
 		if (typeof event.data === "string") handlers.message(event.data);

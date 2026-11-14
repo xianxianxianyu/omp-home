@@ -4,10 +4,19 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Db } from "./db.ts";
+import { envMessages } from "./i18n-env.ts";
+import { render, type Message } from "./i18n.ts";
 
 const run = promisify(execFile);
 
-export class GitError extends Error {}
+export class GitError extends Error {
+	readonly localizedText: Message | undefined;
+
+	constructor(message: string | Message) {
+		super(render(message));
+		this.localizedText = typeof message === "string" ? undefined : message;
+	}
+}
 
 async function git(cwd: string, args: string[]): Promise<string> {
 	try {
@@ -57,7 +66,7 @@ export async function ensureWorktree(root: string, dir: string, branch: string, 
 	const target = await fs.realpath(dir).catch(() => path.resolve(dir));
 	const existing = (await listWorktrees(root)).find(w => path.resolve(w.path) === target);
 	if (existing) {
-		if (existing.branch !== branch) throw new GitError(`${dir} is a worktree on ${existing.branch ?? "detached HEAD"}, not ${branch}`);
+		if (existing.branch !== branch) throw new GitError(envMessages.worktreeBranchMismatch(dir, existing.branch, branch));
 		return;
 	}
 	await fs.mkdir(path.dirname(dir), { recursive: true });

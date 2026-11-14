@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
+import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, Language, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
 import type { BridgeToHub } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { TranscriptEvent, UiResponse } from "../shared/transcript.ts";
@@ -10,8 +10,9 @@ import { homePaths, type HomePaths } from "./config.ts";
 import { progressPhase } from "./core/task.ts";
 import { Db } from "./db.ts";
 import { Env } from "./env.ts";
-import { errorText, HubError } from "./errors.ts";
+import { errorMessage, errorText, HubError } from "./errors.ts";
 import { removeWorktree, worktreeStatus, Worktrees } from "./git.ts";
+import { messages, render, type Message } from "./i18n.ts";
 import { Indexer } from "./indexer.ts";
 import { isOpen, Ledger, waitOf, type ApplyResult, type DecisionRow, type EscalationRow, type TaskRow } from "./ledger.ts";
 import { Notifier } from "./notify.ts";
@@ -25,7 +26,7 @@ import { SessionViews } from "./session-views.ts";
 import { generatePstackPackage } from "./pstack.ts";
 import { SettingsStore } from "./settings.ts";
 import { createTools } from "./tools.ts";
-import { answerText, responseFits } from "./transcript.ts";
+import { answerEvent, responseFits } from "./transcript.ts";
 import type { UiChannel } from "./ui.ts";
 import { Workspaces } from "./workspaces.ts";
 
@@ -73,7 +74,7 @@ export class Hub {
 		this.#ui = opts.ui;
 		this.#log = opts.log;
 		this.omp = opts.omp;
-		this.views = new SessionViews((id, level, text) => this.#ui.send({ t: "toast", level, text: `${id}: ${text}` }));
+		this.views = new SessionViews((id, level, text) => this.#ui.toast(level, `${id}: ${render(text, this.#ui.language.lastSeen)}`));
 		this.db = new Db(this.paths.db);
 		this.settings = new SettingsStore(this.db, this.paths);
 		this.ledger = new Ledger(this.db);
@@ -106,7 +107,7 @@ export class Hub {
 				this.#watchOpenTasks();
 			},
 			mainFailed: message => {
-				this.#ui.send({ t: "toast", level: "error", text: message });
+				this.#ui.toast("error", message);
 				this.changed("state", "inbox");
 			},
 		});
@@ -144,7 +145,8 @@ export class Hub {
 		for (const task of this.ledger.runningTasks()) {
 			if (!task.session_id) continue;
 			const session = this.pool.must(task.session_id);
-			const r = this.ledger.apply(task.id, { kind: "process_lost", reason: "the hub restarted while this run was in progress" }, "hub", `lost:${session.id}:${session.incarnation}`);
+			const reasonMessage = messages.hubRestarted();
+			const r = this.ledger.apply(task.id, { kind: "process_lost", reason: reasonMessage.en, reasonMessage }, "hub", `lost:${session.id}:${session.incarnation}`);
 			this.afterApply(task.id, r);
 		}
 		this.worktrees.reconcile();
@@ -288,9 +290,10 @@ export class Hub {
 		const task = this.ledger.latestForSession(session.id);
 		if (!task) return;
 		if (info.neverConnected && task.status === "pending") {
+			const messageText = messages.spawnExited(info.exitCode, info.detailText ?? info.detail.slice(-1500));
 			const r = this.ledger.apply(
 				task.id,
-				{ kind: "provision_failed", step: "session", message: `omp exited before connecting to the hub (exit ${info.exitCode})${info.detail ? `: ${info.detail.slice(-1500)}` : ""}` },
+				{ kind: "provision_failed", step: "session", message: messageText.en, messageText },
 				"hub",
 				`spawnfail:${session.id}:${info.incarnation}`,
 			);
@@ -298,8 +301,8 @@ export class Hub {
 			return;
 		}
 		if (!info.intentional || info.wasRunning) {
-			const reason = info.intentional ? "the hub stopped the worker during a run" : `omp exited unexpectedly (code ${info.exitCode})`;
-			this.afterApply(task.id, this.ledger.apply(task.id, { kind: "process_lost", reason }, "hub", `lost:${session.id}:${info.incarnation}`));
+			const reasonMessage = info.intentional ? messages.workerStopped() : messages.workerExited(info.exitCode);
+			this.afterApply(task.id, this.ledger.apply(task.id, { kind: "process_lost", reason: reasonMessage.en, reasonMessage }, "hub", `lost:${session.id}:${info.incarnation}`));
 		}
 	}
 
@@ -328,10 +331,12 @@ export class Hub {
 			if (!(err instanceof HubError)) throw err;
 			started = false;
 		}
-		this.#ui.send({ t: "focus", sessionId: e.session_id, escalationId: e.id, reason: e.reason });
+		const language = this.#ui.language.lastSeen;
+		const reason = this.ledger.escalationDTO(e, language).reason;
+		this.#ui.send({ t: "focus", sessionId: e.session_id, escalationId: e.id, reason });
 		if (this.#ui.clients === 0) {
 			const quote = (s: string) => `"${s.replace(/[\\"]/g, "\\$&").replace(/\s+/g, " ").slice(0, 200)}"`;
-			execFile("osascript", ["-e", `display notification ${quote(e.reason)} with title ${quote(`omp-home · ${e.task_id} needs you`)}`], () => {});
+			execFile("osascript", ["-e", `display notification ${quote(reason)} with title ${quote(render(messages.needsAttention(e.task_id), language))}`], () => {});
 		}
 		this.changed("inbox", "state", "sessions");
 		return started;
@@ -355,9 +360,11 @@ export class Hub {
 			let decision: DecisionRow | null = null;
 			if (input.decision) {
 				const firstLine = input.text.split("\n")[0]!.slice(0, 120);
+				const summaryMessage = messages.answeredDecision(task.id, firstLine);
 				decision = this.ledger.logDecision({
 					taskId: task.id,
-					summary: `Answered ${task.id}: ${firstLine}`,
+					summary: summaryMessage.en,
+					summaryMessage,
 					why: input.decision.why,
 					revert: input.decision.revert,
 					reverts: null,
@@ -392,15 +399,15 @@ export class Hub {
 	 */
 	#taskSession(task: TaskRow, text: string, by: "main" | "human", dedupe: string): SessionRow | null {
 		if (!task.session_id) {
-			if (waitOf(task)?.kind !== "provision_failed") throw new HubError("unavailable", `${task.id} is still being set up; its brief is delivered first. Send follow-ups after its first report.`);
+			if (waitOf(task)?.kind !== "provision_failed") throw new HubError("unavailable", messages.taskSetup(task.id));
 			this.afterApply(task.id, this.ledger.apply(task.id, { kind: "provision_retry", text }, by, dedupe));
 			this.provisioner.kick();
 			return null;
 		}
 		const session = this.pool.must(task.session_id);
-		if (session.retired_at !== null) throw new HubError("conflict", `${task.id}'s session ${session.id} was retired (task cleaned up); dispatch a new task instead`);
+		if (session.retired_at !== null) throw new HubError("conflict", messages.taskRetired(task.id, session.id));
 		const other = this.ledger.openForSession(session.id);
-		if (other && other.id !== task.id) throw new HubError("conflict", `${session.id} now works on ${other.id}; send to ${other.id} instead`);
+		if (other && other.id !== task.id) throw new HubError("conflict", messages.otherTask(session.id, other.id));
 		return session;
 	}
 
@@ -418,16 +425,16 @@ export class Hub {
 	async abort(id: string): Promise<void> {
 		this.pool.must(id);
 		await this.pool.abort(id).catch(err => {
-			throw err instanceof RpcError ? new HubError("conflict", `omp refused abort: ${err.message}`) : err;
+			throw err instanceof RpcError ? new HubError("conflict", messages.abortRefused(errorMessage(err))) : err;
 		});
 	}
 
 	async respond(id: string, requestId: string, response: UiResponse): Promise<void> {
 		const request = this.views.openRequest(id, requestId);
-		if (!responseFits(request, response)) throw new HubError("invalid", `that answer does not fit a ${request.method} request`);
+		if (!responseFits(request, response)) throw new HubError("invalid", messages.answerMismatch(request.method));
 		const rpc = await this.pool.client(id);
 		rpc.send({ type: "extension_ui_response", id: requestId, ...response });
-		this.views.apply(id, { t: "request_closed", id: requestId, answer: answerText(request, response) });
+		this.views.apply(id, answerEvent(requestId, request, response));
 	}
 
 	commands(id: string): CommandDTO[] {
@@ -435,9 +442,9 @@ export class Hub {
 		return this.views.commands(id);
 	}
 
-	history(id: string, before: string): Extract<TranscriptEvent, { t: "prepend" }> {
+	history(id: string, before: string, language: Language = "en"): Extract<TranscriptEvent, { t: "prepend" }> {
 		this.pool.must(id);
-		return this.views.history(id, before);
+		return this.views.history(id, before, language);
 	}
 
 	async steerSubagent(id: string, agentId: string, text: string): Promise<void> {
@@ -447,20 +454,20 @@ export class Hub {
 	async cancelSubagent(id: string, agentId: string): Promise<void> {
 		const cancelled = await this.#command(id, "cancel_subagent", { subagentId: agentId });
 		if (cancelled !== true && !(typeof cancelled === "object" && cancelled !== null && "cancelled" in cancelled && cancelled.cancelled === true)) {
-			throw new HubError("conflict", `subagent ${agentId} is not running`);
+			throw new HubError("conflict", messages.subagentStopped(agentId));
 		}
 	}
 
 	/** WS stream: start the session if cold (human admission), then `reset` and increments. Throws HubError when no slot is free. */
-	stream(id: string, send: (ev: TranscriptEvent) => void): () => void {
+	stream(id: string, send: (ev: TranscriptEvent) => void, language: Language = "en"): () => void {
 		const session = this.pool.must(id);
 		if (session.retired_at === null) this.pool.ensureLive(id, { human: true });
-		return this.views.subscribe(id, send);
+		return this.views.subscribe(id, send, language);
 	}
 
 	#activeSession(id: string): SessionRow {
 		const session = this.pool.must(id);
-		if (session.retired_at !== null) throw new HubError("conflict", `${id} is retired`);
+		if (session.retired_at !== null) throw new HubError("conflict", messages.retired(id));
 		return session;
 	}
 
@@ -471,30 +478,34 @@ export class Hub {
 		try {
 			return await rpc.request(type, params);
 		} catch (err) {
-			if (err instanceof RpcError) throw new HubError("conflict", `omp: ${err.message}`);
+			if (err instanceof RpcError) throw new HubError("conflict", { en: `omp: ${errorText(err)}`, zh: `omp: ${errorText(err, "zh")}` });
 			throw err;
 		}
 	}
 
-	cancelTask(taskId: string, by: "main" | "human", reason: string, dedupe: string): DecisionRow | null {
+	cancelTask(taskId: string, by: "main" | "human", reason: string, dedupe: string, reasonMessage?: Message): DecisionRow | null {
 		const task = this.ledger.mustTask(taskId);
 		if (task.status === "cancelled") return null;
-		if (task.status === "done" && by === "main") throw new HubError("conflict", `${task.id} is already done`);
+		if (task.status === "done" && by === "main") throw new HubError("conflict", messages.taskDone(task.id));
 		const { logged, r } = this.db.tx(() => {
 			let decision: DecisionRow | null = null;
 			if (by === "main") {
+				const summaryMessage = messages.cancelledDecision(task.id);
+				const revertMessage = messages.resumeDecision(task.id);
 				decision = this.ledger.logDecision({
 					taskId: task.id,
-					summary: `Cancelled ${task.id}`,
+					summary: summaryMessage.en,
+					summaryMessage,
 					why: reason,
-					revert: `Dispatch a new task with checkout {kind:"continue", task:"${task.id}"} to resume the work`,
+					revert: revertMessage.en,
+					revertMessage,
 					reverts: null,
 					dedupeKey: `${dedupe}:decision`,
 					actor: "main",
 				});
 			}
 			this.ledger.dropPrompts(task.id);
-			return { logged: decision, r: this.ledger.apply(task.id, { kind: "cancelled", by, reason }, by, dedupe) };
+			return { logged: decision, r: this.ledger.apply(task.id, { kind: "cancelled", by, reason, ...(reasonMessage ? { reasonMessage } : {}) }, by, dedupe) };
 		});
 		if (task.session_id) void this.pool.abort(task.session_id).catch(err => this.#log(`${task.session_id}: abort failed: ${errorText(err)}`));
 		if (logged) this.indexer.decision(logged, task.workspace_id);
@@ -505,13 +516,17 @@ export class Hub {
 
 	acceptTask(taskId: string, reason: string, dedupe: string): DecisionRow {
 		const task = this.ledger.mustTask(taskId);
-		if (task.status === "cancelled") throw new HubError("conflict", `${task.id} is cancelled`);
+		if (task.status === "cancelled") throw new HubError("conflict", messages.taskCancelled(task.id));
 		const { d, r } = this.db.tx(() => {
+			const summaryMessage = messages.acceptedDecision(task.id);
+			const revertMessage = messages.reopenDecision(task.id);
 			const d = this.ledger.logDecision({
 				taskId: task.id,
-				summary: `Accepted ${task.id} as done`,
+				summary: summaryMessage.en,
+				summaryMessage,
 				why: reason,
-				revert: `home_send ${task.id} with what is missing to reopen it`,
+				revert: revertMessage.en,
+				revertMessage,
 				reverts: null,
 				dedupeKey: `${dedupe}:decision`,
 				actor: "main",
@@ -526,7 +541,7 @@ export class Hub {
 
 	escalate(taskId: string, reason: string, by: "main" | "hub"): { escalation: EscalationRow; created: boolean; started: boolean } {
 		const task = this.ledger.mustTask(taskId);
-		if (!task.session_id) throw new HubError("conflict", `${task.id} has no worker session yet`);
+		if (!task.session_id) throw new HubError("conflict", messages.noWorker(task.id));
 		const { escalation, created } = this.ledger.escalate(task.id, task.session_id, reason, by);
 		const started = this.#focus(escalation);
 		this.changed("tasks", `task:${task.id}`);
@@ -536,7 +551,7 @@ export class Hub {
 	/** Human-only: tear down the environment, remove the worktree (branch kept), retire the session. */
 	async cleanupTask(taskId: string): Promise<void> {
 		const task = this.ledger.mustTask(taskId);
-		if (isOpen(task.status)) throw new HubError("conflict", `${task.id} is ${task.status}; cancel or finish it before cleanup`);
+		if (isOpen(task.status)) throw new HubError("conflict", messages.cleanupOpenTask(task.id, task.status));
 		if (task.worktree_id) {
 			const openOnWorktree = this.ledger.tasksForWorktree(task.worktree_id).filter(t => isOpen(t.status));
 			const continuing = this.db.all<{ id: string }>(
@@ -544,11 +559,11 @@ export class Hub {
 				task.id,
 			);
 			const blockers = [...openOnWorktree.map(t => t.id), ...continuing.map(t => t.id)];
-			if (blockers.length) throw new HubError("conflict", `the worktree is still used by open task(s) ${blockers.join(", ")}`);
+			if (blockers.length) throw new HubError("conflict", messages.worktreeInUse(blockers.join(", ")));
 		}
 		if (task.session_id) {
 			const open = this.ledger.openForSession(task.session_id);
-			if (open) throw new HubError("conflict", `${task.session_id} has open task ${open.id}`);
+			if (open) throw new HubError("conflict", messages.sessionOpenTask(task.session_id, open.id));
 			await this.pool.retire(task.session_id);
 		}
 		if (task.worktree_id) {
@@ -564,7 +579,7 @@ export class Hub {
 	}
 
 	/** Human asks main to undo a decision: a prompt to main, and the wake budget resets. */
-	revertDecision(id: string): DecisionDTO {
+	revertDecision(id: string, language: Language = "en"): DecisionDTO {
 		const d = this.ledger.requestRevert(id);
 		const main = this.#requireMain();
 		this.ledger.noteHumanInput();
@@ -579,7 +594,7 @@ export class Hub {
 		this.pool.ensureLive(main.id, { human: true });
 		this.bridge.flush(main.id);
 		this.changed("decisions", "state", "inbox");
-		return this.ledger.decisionDTO(d);
+		return this.ledger.decisionDTO(d, language);
 	}
 
 	/** Retire the main chat and start a fresh one; unacknowledged notices move to the new chat. */
@@ -610,14 +625,14 @@ export class Hub {
 
 	#requireMain(): SessionRow {
 		const main = this.pool.currentMain();
-		if (!main) throw new HubError("unavailable", "no main chat");
+		if (!main) throw new HubError("unavailable", messages.noMain());
 		return main;
 	}
 
 	// ── views ────────────────────────────────────────────────────────────────
 
 	/** Live progress of an open task: its phase, what its worker is doing, and since when. Null once closed. */
-	progressOf(t: TaskRow): TaskProgress | null {
+	progressOf(t: TaskRow, language: Language = "en"): TaskProgress | null {
 		const session = t.session_id ? { queued: this.pool.queued(t.session_id), state: this.pool.state(t.session_id) } : null;
 		const phase = progressPhase(t.status, session);
 		if (!phase) return null;
@@ -627,36 +642,36 @@ export class Hub {
 				: phase === "queued"
 					? this.ledger.lastEventAt(t.id, ["queued_for_capacity"])
 					: this.pool.stateSince(t.session_id!);
-		return { phase, intent: t.session_id ? this.views.intent(t.session_id) : null, lastEvent: this.ledger.lastEventSummary(t.id), since: since ?? t.updated_at };
+		return { phase, intent: t.session_id ? this.views.intent(t.session_id) : null, lastEvent: this.ledger.lastEventSummary(t.id, language), since: since ?? t.updated_at };
 	}
 
-	taskSummary(t: TaskRow): TaskSummary {
-		return { ...this.ledger.summary(t, this.branchOf(t.worktree_id)), progress: this.progressOf(t) };
+	taskSummary(t: TaskRow, language: Language = "en"): TaskSummary {
+		return { ...this.ledger.summary(t, this.branchOf(t.worktree_id), language), progress: this.progressOf(t, language) };
 	}
 
 	branchOf(worktreeId: string | null): string | null {
 		return worktreeId ? (this.worktrees.get(worktreeId)?.branch ?? null) : null;
 	}
 
-	async taskDetail(id: string, events = 200): Promise<TaskDetail> {
+	async taskDetail(id: string, events = 200, language: Language = "en"): Promise<TaskDetail> {
 		const t = this.ledger.mustTask(id);
 		const wt = t.worktree_id ? (this.worktrees.get(t.worktree_id) ?? null) : null;
 		const git = wt && wt.state === "ready" && fs.existsSync(wt.path) ? await worktreeStatus(wt.path, wt.base).catch(() => null) : null;
 		const envRow = wt ? this.env.envRow(wt.id) : undefined;
 		return {
-			...this.ledger.summary(t, wt?.branch ?? null),
-			progress: this.progressOf(t),
+			...this.ledger.summary(t, wt?.branch ?? null, language),
+			progress: this.progressOf(t, language),
 			brief: t.brief,
 			envelope: t.envelope,
 			checkout: JSON.parse(t.checkout) as CheckoutSpec,
 			worktreePath: wt?.path ?? null,
 			related: this.ledger.related(t.id),
 			reports: this.ledger.reports(t.id),
-			events: this.ledger.events(t.id, events).map(e => this.ledger.eventDTO(e)),
-			decisions: this.ledger.decisions(t.id).map(d => this.ledger.decisionDTO(d)),
-			escalations: this.ledger.escalations({ taskId: t.id }).map(e => this.ledger.escalationDTO(e)),
+			events: this.ledger.events(t.id, events).map(e => this.ledger.eventDTO(e, language)),
+			decisions: this.ledger.decisions(t.id).map(d => this.ledger.decisionDTO(d, language)),
+			escalations: this.ledger.escalations({ taskId: t.id }).map(e => this.ledger.escalationDTO(e, language)),
 			git,
-			env: envRow ? this.env.envDTO(envRow) : null,
+			env: envRow ? this.env.envDTO(envRow, language) : null,
 		};
 	}
 
@@ -681,12 +696,12 @@ export class Hub {
 		};
 	}
 
-	inbox(): InboxDTO {
-		const escalations: EscalationDTO[] = this.ledger.escalations({ open: true }).map(e => this.ledger.escalationDTO(e));
+	inbox(language: Language = "en"): InboxDTO {
+		const escalations: EscalationDTO[] = this.ledger.escalations({ open: true }).map(e => this.ledger.escalationDTO(e, language));
 		return { escalations, main: this.notifier.main() };
 	}
 
-	state(version: string): StateDTO {
+	state(version: string, language: Language = "en"): StateDTO {
 		return {
 			version,
 			setup: { done: true, homePath: this.home },
@@ -694,7 +709,7 @@ export class Hub {
 			pool: { live: this.pool.liveWorkerCount(), cap: this.settings.get().maxLiveWorkers },
 			inboxOpen: this.ledger.escalations({ open: true }).length,
 			openTasks: this.ledger.listTasks({ status: "open" }).length,
-			omp: this.omp.status(),
+			omp: this.omp.status(language),
 		};
 	}
 }

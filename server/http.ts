@@ -5,13 +5,15 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
-import type { StateDTO } from "../shared/api.ts";
+import type { Language, StateDTO } from "../shared/api.ts";
 import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId } from "../shared/ids.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
-import { errorText, fieldErrors, HubError } from "./errors.ts";
+import { errorText, fieldErrors, HubError, localizeFieldErrors } from "./errors.ts";
 import { GitError } from "./git.ts";
 import type { Resources } from "./resources.ts";
 import { Hub } from "./hub.ts";
+import { languageFromHeader, languageFromUrl, messages, render } from "./i18n.ts";
+import { localizedCheck, validationMessages } from "./i18n-validation.ts";
 import { ModelCatalog } from "./models.ts";
 import { OmpManager } from "./omp.ts";
 import { generatePstackPackage } from "./pstack.ts";
@@ -27,7 +29,7 @@ export interface ServerOptions {
 	log(message: string): void;
 }
 
-type Handler = (ctx: { params: string[]; url: URL; body: unknown }) => unknown;
+type Handler = (ctx: { params: string[]; url: URL; body: unknown; language: Language }) => unknown;
 interface Route {
 	method: string;
 	pattern: RegExp;
@@ -53,7 +55,7 @@ const BODY_LIMIT = 4 * 1024 * 1024;
 const LOOPBACK = ["127.0.0.1", "localhost", "[::1]"];
 
 const setupSchema = z.strictObject({
-	homePath: z.string().refine(p => path.isAbsolute(p), "must be an absolute path"),
+	homePath: z.string().refine(p => path.isAbsolute(p), localizedCheck(validationMessages.absolutePath())),
 	pstackRoot: z.string().nullable(),
 	migrateHome: z.boolean(),
 });
@@ -76,7 +78,11 @@ const STREAM_UNAVAILABLE = 4503;
 
 function parse<T>(schema: z.ZodType<T>, body: unknown): T {
 	const r = schema.safeParse(body ?? {});
-	if (!r.success) throw new HubError("unprocessable", r.error.issues.map(i => `${i.path.join(".") || "body"}: ${i.message}`).join("; "), fieldErrors(r.error.issues));
+	if (!r.success) {
+		const errors = fieldErrors(r.error.issues);
+		const summary = (language: Language) => localizeFieldErrors(errors, language).map(e => `${e.path || "body"}: ${e.message}`).join("; ");
+		throw new HubError("unprocessable", { en: summary("en"), zh: summary("zh") }, errors);
+	}
 	return r.data;
 }
 
@@ -112,7 +118,7 @@ export class HubServer {
 			this.#handle(req, res).catch(err => {
 				this.#o.log(`${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
 				if (!res.headersSent) res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
-				res.end("bad request\n");
+				res.end(`${render(messages.badRequest(), languageFromHeader(req.headers))}\n`);
 			});
 		});
 		this.#server.on("upgrade", (req, socket, head) => this.#upgrade(req, socket, head));
@@ -153,7 +159,7 @@ export class HubServer {
 
 	async #resolveOmp(explicit: string | null): Promise<void> {
 		const status = await this.#omp.resolve(explicit);
-		if (status.warning) this.#ui.send({ t: "toast", level: "error", text: status.warning });
+		if (status.warning) this.#ui.toast("error", this.#omp.status(this.#ui.language.lastSeen).warning!);
 		this.#ui.invalidate("state");
 	}
 
@@ -171,7 +177,7 @@ export class HubServer {
 	}
 
 	#need(): Hub {
-		if (!this.#hub) throw new HubError("setup_required", "omp-home is not set up yet: choose a home repo first (POST /api/setup)");
+		if (!this.#hub) throw new HubError("setup_required", messages.setupRequired());
 		return this.#hub;
 	}
 
@@ -182,52 +188,57 @@ export class HubServer {
 	}
 
 	async #handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+		const language = languageFromHeader(req.headers);
 		const send = (status: number, body: unknown) => {
 			const text = JSON.stringify(body);
 			res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 			res.end(text);
 		};
 		if (!loopbackHost(req.headers.host)) {
-			send(403, { error: "forbidden host" });
+			send(403, { error: render(messages.forbiddenHost(), language) });
 			return;
 		}
 		const url = new URL(req.url ?? "/", "http://127.0.0.1");
 		if (!url.pathname.startsWith("/api/")) {
-			this.#static(url.pathname, res);
+			this.#static(url.pathname, res, language);
 			return;
 		}
 		const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
 		if (!this.#tokenOk(bearer)) {
-			send(401, { error: "missing or wrong token; open the URL the hub printed at startup", code: "unauthorized" });
+			send(401, { error: render(messages.unauthorized(), language), code: "unauthorized" });
 			return;
 		}
+		this.#ui.language.observe(language);
 		const method = req.method ?? "GET";
 		const match = this.#routes.map(r => ({ r, m: r.method === method ? r.pattern.exec(url.pathname) : null })).find(x => x.m);
 		if (!match) {
-			send(404, { error: `no route ${method} ${url.pathname}`, code: "not_found" });
+			send(404, { error: render(messages.noRoute(method, url.pathname), language), code: "not_found" });
 			return;
 		}
 		try {
 			const body = method === "GET" ? undefined : await readJson(req);
 			const params = match.m!.slice(1).map(p => decodeURIComponent(p));
-			const result = await match.r.handler({ params, url, body });
+			const result = await match.r.handler({ params, url, body, language });
 			send(200, result);
 		} catch (err) {
-			if (err instanceof HubError) send(err.status, { error: err.message, code: err.code, ...(err.errors ? { errors: err.errors } : {}) });
-			else if (err instanceof IdError) send(400, { error: err.message, code: "invalid" });
-			else if (err instanceof GitError) send(409, { error: err.message, code: "git" });
+			if (err instanceof HubError) send(err.status, { error: err.localized(language), code: err.code, ...(err.errors ? { errors: localizeFieldErrors(err.errors, language) } : {}) });
+			else if (err instanceof IdError) {
+				const match = /^invalid (.+?): (.*)$/.exec(err.message);
+				send(400, { error: match ? render(messages.invalidId(match[1]!, match[2]!), language) : err.message, code: "invalid" });
+			}
+			else if (err instanceof GitError) send(409, { error: render(err.localizedText ?? err.message, language), code: "git" });
 			else {
 				this.#o.log(`${method} ${url.pathname}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-				send(500, { error: errorText(err), code: "internal" });
+				send(500, { error: errorText(err, language), code: "internal" });
 			}
 		}
 	}
 
-	#static(pathname: string, res: http.ServerResponse): void {
+	#static(pathname: string, res: http.ServerResponse, language: Language): void {
 		const index = path.join(this.#dist, "index.html");
 		if (!fs.existsSync(index)) {
 			res.writeHead(503, { "content-type": "text/plain; charset=utf-8" });
-			res.end("omp-home UI is not built. Run `pnpm build`, then reload.\n");
+			res.end(`${render(messages.uiNotBuilt(), language)}\n`);
 			return;
 		}
 		let file = path.join(this.#dist, path.normalize(decodeURIComponent(pathname)).replace(/^([/\\])+/, ""));
@@ -254,7 +265,9 @@ export class HubServer {
 		const origin = req.headers.origin;
 		if (origin && !loopbackHost(URL.canParse(origin) ? new URL(origin).host : undefined)) return reject("403 Forbidden");
 		if (!this.#tokenOk(url.searchParams.get("token"))) return reject("401 Unauthorized");
+		const language = languageFromUrl(url);
 		if (url.pathname === "/api/events") {
+			this.#ui.language.observe(language);
 			this.#wss.handleUpgrade(req, socket, head, ws => this.#ui.add(ws));
 			return;
 		}
@@ -273,10 +286,10 @@ export class HubServer {
 				try {
 					detach = hub.stream(id, ev => {
 						if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(ev));
-					});
+					}, language);
 				} catch (err) {
 					if (!(err instanceof HubError)) throw err;
-					ws.close(STREAM_UNAVAILABLE, Buffer.from(err.message).subarray(0, 120).toString());
+					ws.close(STREAM_UNAVAILABLE, Buffer.from(err.localized(language)).subarray(0, 120).toString());
 					return;
 				}
 				ws.on("close", detach);
@@ -287,8 +300,8 @@ export class HubServer {
 		reject("404 Not Found");
 	}
 
-	#state(): StateDTO {
-		if (this.#hub) return this.#hub.state(this.#o.version);
+	#state(language: Language = "en"): StateDTO {
+		if (this.#hub) return this.#hub.state(this.#o.version, language);
 		const s = defaultSettings();
 		return {
 			version: this.#o.version,
@@ -297,7 +310,7 @@ export class HubServer {
 			pool: { live: 0, cap: s.maxLiveWorkers },
 			inboxOpen: 0,
 			openTasks: 0,
-			omp: this.#omp.status(),
+			omp: this.#omp.status(language),
 		};
 	}
 
@@ -310,8 +323,8 @@ export class HubServer {
 		const hub = () => this.#need();
 		const uiKey = () => `ui:${randomUUID()}`;
 
-		r("GET", "/api/state", () => this.#state());
-		r("GET", "/api/models", ({ url }) => this.#models.get(url.searchParams.get("refresh") === "1"));
+		r("GET", "/api/state", ({ language }) => this.#state(language));
+		r("GET", "/api/models", ({ url, language }) => this.#models.get(url.searchParams.get("refresh") === "1", language));
 		r("GET", "/api/settings", () => this.#hub?.settings.dto() ?? { homePath: this.#o.config.homePath ?? DEFAULT_HOME, ...defaultSettings() });
 		r("PUT", "/api/settings", ({ body }) => {
 			const h = hub();
@@ -324,8 +337,8 @@ export class HubServer {
 			void h.pool.tick();
 			return h.settings.dto();
 		});
-		r("GET", "/api/setup/preview", ({ url }) => previewSetup(url.searchParams.get("home") || this.#o.config.homePath || DEFAULT_HOME, this.#o.resources.templates));
-		r("POST", "/api/setup", async ({ body }) => {
+		r("GET", "/api/setup/preview", ({ url, language }) => previewSetup(url.searchParams.get("home") || this.#o.config.homePath || DEFAULT_HOME, this.#o.resources.templates, language));
+		r("POST", "/api/setup", async ({ body, language }) => {
 			const req = parse(setupSchema, body);
 			const home = path.resolve(req.homePath);
 			applySetup(home, this.#o.resources.templates, req.migrateHome);
@@ -351,14 +364,14 @@ export class HubServer {
 				await h.start();
 			}
 			this.#ui.invalidate("state", "settings", "sessions");
-			return this.#state();
+			return this.#state(language);
 		});
 
-		r("GET", "/api/tasks", ({ url }) => {
+		r("GET", "/api/tasks", ({ url, language }) => {
 			const h = hub();
 			const rawStatus = url.searchParams.get("status");
 			const parsed = rawStatus ? taskStatusFilter.safeParse(rawStatus) : null;
-			if (parsed && !parsed.success) throw new HubError("invalid", `status must be one of ${taskStatusFilter.options.join(", ")}`);
+			if (parsed && !parsed.success) throw new HubError("invalid", messages.statusFilter(taskStatusFilter.options.join(", ")));
 			const status = parsed?.data;
 			const workspace = url.searchParams.get("workspace") || undefined;
 			const q = url.searchParams.get("q")?.trim();
@@ -369,35 +382,36 @@ export class HubServer {
 				for (const t of h.ledger.listTasks({ status, workspace })) if (t.id.toLowerCase() === needle || t.title.toLowerCase().includes(needle)) hits.add(t.id);
 				ids = [...hits];
 			}
-			return h.ledger.listTasks({ status, workspace, ids }).map(t => h.taskSummary(t));
+			return h.ledger.listTasks({ status, workspace, ids }).map(t => h.taskSummary(t, language));
 		});
-		r("GET", "/api/tasks/:id", ({ params }) => hub().taskDetail(parseTaskId(params[0])));
-		r("POST", "/api/tasks/:id/cancel", ({ params, body }) => {
+		r("GET", "/api/tasks/:id", ({ params, language }) => hub().taskDetail(parseTaskId(params[0]), 200, language));
+		r("POST", "/api/tasks/:id/cancel", ({ params, body, language }) => {
 			const id = parseTaskId(params[0]);
-			hub().cancelTask(id, "human", parse(reasonSchema, body).reason ?? "cancelled by the human", uiKey());
-			return hub().taskDetail(id);
+			const reason = parse(reasonSchema, body).reason;
+			hub().cancelTask(id, "human", reason ?? messages.cancelledDefault().en, uiKey(), reason === undefined ? messages.cancelledDefault() : undefined);
+			return hub().taskDetail(id, 200, language);
 		});
-		r("POST", "/api/tasks/:id/cleanup", async ({ params }) => {
+		r("POST", "/api/tasks/:id/cleanup", async ({ params, language }) => {
 			const id = parseTaskId(params[0]);
 			await hub().cleanupTask(id);
-			return hub().taskDetail(id);
+			return hub().taskDetail(id, 200, language);
 		});
-		r("POST", "/api/tasks/:id/message", async ({ params, body }) => {
+		r("POST", "/api/tasks/:id/message", async ({ params, body, language }) => {
 			const id = parseTaskId(params[0]);
 			await hub().messageTask(id, parse(textSchema, body).text, uiKey());
-			return hub().taskDetail(id);
+			return hub().taskDetail(id, 200, language);
 		});
 
 		r("GET", "/api/chat", ({ url }) => {
 			const num = (key: string) => {
 				const v = url.searchParams.get(key);
 				if (v === null || v === "") return undefined;
-				if (!/^\d+$/.test(v)) throw new HubError("invalid", `${key} must be a chat record id`);
+				if (!/^\d+$/.test(v)) throw new HubError("invalid", messages.chatRecordId(key));
 				return Number(v);
 			};
 			const before = num("before");
 			const after = num("after");
-			if (before !== undefined && after !== undefined) throw new HubError("invalid", "pass before or after, not both");
+			if (before !== undefined && after !== undefined) throw new HubError("invalid", messages.oneChatCursor());
 			const limit = Math.min(200, Math.max(1, num("limit") ?? 50));
 			return hub().indexer.chat({ before, after, limit });
 		});
@@ -417,7 +431,7 @@ export class HubServer {
 		r("POST", "/api/sessions/:id/evict", async ({ params }) => {
 			const h = hub();
 			const id = parseSessionId(params[0]);
-			if (h.pool.must(id).kind === "main") throw new HubError("invalid", "the main chat is not evicted; use Restart main");
+			if (h.pool.must(id).kind === "main") throw new HubError("invalid", messages.mainEviction());
 			await h.pool.evict(id);
 			return h.sessionDTO(h.pool.must(id));
 		});
@@ -425,9 +439,9 @@ export class HubServer {
 			const h = hub();
 			const id = parseSessionId(params[0]);
 			const s = h.pool.must(id);
-			if (s.kind === "main") throw new HubError("invalid", "retire the main chat with New chat");
+			if (s.kind === "main") throw new HubError("invalid", messages.mainRetirement());
 			const open = h.ledger.openForSession(id);
-			if (open) throw new HubError("conflict", `${id} has open task ${open.id}; close it first`);
+			if (open) throw new HubError("conflict", messages.openTask(id, open.id));
 			await h.pool.retire(id);
 			return h.sessionDTO(h.pool.must(id));
 		});
@@ -446,10 +460,10 @@ export class HubServer {
 			return { ok: true };
 		});
 		r("GET", "/api/sessions/:id/commands", ({ params }) => hub().commands(parseSessionId(params[0])));
-		r("GET", "/api/sessions/:id/history", ({ params, url }) => {
+		r("GET", "/api/sessions/:id/history", ({ params, url, language }) => {
 			const before = url.searchParams.get("before");
-			if (!before) throw new HubError("invalid", "pass before=<id of the first item you hold>");
-			return hub().history(parseSessionId(params[0]), before);
+			if (!before) throw new HubError("invalid", messages.historyCursor());
+			return hub().history(parseSessionId(params[0]), before, language);
 		});
 		r("POST", "/api/sessions/:id/subagents/:agent/steer", async ({ params, body }) => {
 			await hub().steerSubagent(parseSessionId(params[0]), params[1]!, parse(textSchema, body).text);
@@ -459,39 +473,39 @@ export class HubServer {
 			await hub().cancelSubagent(parseSessionId(params[0]), params[1]!);
 			return { ok: true };
 		});
-		r("POST", "/api/main/restart", async () => {
+		r("POST", "/api/main/restart", async ({ language }) => {
 			await hub().pool.restartMain();
-			return this.#state();
+			return this.#state(language);
 		});
-		r("POST", "/api/main/new", async () => {
+		r("POST", "/api/main/new", async ({ language }) => {
 			await hub().newMain();
-			return this.#state();
+			return this.#state(language);
 		});
-		r("POST", "/api/main/continue", () => {
+		r("POST", "/api/main/continue", ({ language }) => {
 			hub().continueMain();
-			return this.#state();
+			return this.#state(language);
 		});
 
-		r("GET", "/api/inbox", () => hub().inbox());
-		r("POST", "/api/escalations/:id/seen", ({ params }) => {
+		r("GET", "/api/inbox", ({ language }) => hub().inbox(language));
+		r("POST", "/api/escalations/:id/seen", ({ params, language }) => {
 			const h = hub();
 			const e = h.ledger.markSeen(parseEscalationId(params[0]));
 			h.changed("inbox", "state");
-			return h.ledger.escalationDTO(e);
+			return h.ledger.escalationDTO(e, language);
 		});
-		r("POST", "/api/escalations/:id/dismiss", ({ params }) => {
+		r("POST", "/api/escalations/:id/dismiss", ({ params, language }) => {
 			const h = hub();
 			const e = h.ledger.dismiss(parseEscalationId(params[0]));
 			h.changed("inbox", "state", "tasks", `task:${e.task_id}`, "sessions");
-			return h.ledger.escalationDTO(e);
+			return h.ledger.escalationDTO(e, language);
 		});
 
-		r("GET", "/api/decisions", ({ url }) => {
+		r("GET", "/api/decisions", ({ url, language }) => {
 			const h = hub();
 			const task = url.searchParams.get("task");
-			return h.ledger.decisions(task ? parseTaskId(task) : undefined).map(d => h.ledger.decisionDTO(d));
+			return h.ledger.decisions(task ? parseTaskId(task) : undefined).map(d => h.ledger.decisionDTO(d, language));
 		});
-		r("POST", "/api/decisions/:id/revert", ({ params }) => hub().revertDecision(parseDecisionId(params[0])));
+		r("POST", "/api/decisions/:id/revert", ({ params, language }) => hub().revertDecision(parseDecisionId(params[0]), language));
 
 		r("GET", "/api/workspaces", () => hub().workspaces.list(true).map(w => hub().workspaces.dto(w)));
 		r("POST", "/api/workspaces/scan", () => hub().workspaces.scan());
@@ -513,22 +527,22 @@ export class HubServer {
 			h.changed("workspaces", "state");
 			return h.workspaces.dto(w);
 		});
-		r("GET", "/api/workspaces/:id/recipe", ({ params }) => hub().workspaces.readRecipe(parseWorkspaceId(params[0])));
-		r("PUT", "/api/workspaces/:id/recipe", ({ params, body }) => {
+		r("GET", "/api/workspaces/:id/recipe", ({ params, language }) => hub().workspaces.readRecipe(parseWorkspaceId(params[0]), language));
+		r("PUT", "/api/workspaces/:id/recipe", ({ params, body, language }) => {
 			const h = hub();
-			const dto = h.workspaces.writeRecipe(parseWorkspaceId(params[0]), parse(recipeSchema, body).text);
+			const dto = h.workspaces.writeRecipe(parseWorkspaceId(params[0]), parse(recipeSchema, body).text, language);
 			h.changed("workspaces", "resources");
 			return dto;
 		});
 
-		r("GET", "/api/resources", () => hub().env.resources());
-		r("POST", "/api/services/:id/:action", ({ params }) => {
+		r("GET", "/api/resources", ({ language }) => hub().env.resources(language));
+		r("POST", "/api/services/:id/:action", ({ params, language }) => {
 			const action = z.enum(["start", "stop", "check"]).safeParse(params[1]);
-			if (!action.success) throw new HubError("not_found", `no service action ${params[1]}`);
-			return hub().env.serviceAction(params[0]!, action.data);
+			if (!action.success) throw new HubError("not_found", messages.serviceAction(params[1]!));
+			return hub().env.serviceAction(params[0]!, action.data, language);
 		});
 		r("POST", "/api/leases/:id/release", ({ params }) => {
-			if (!/^\d+$/.test(params[0]!)) throw new HubError("invalid", "lease ids are numbers");
+			if (!/^\d+$/.test(params[0]!)) throw new HubError("invalid", messages.leaseId());
 			return hub().env.release(Number(params[0]));
 		});
 	}
@@ -540,13 +554,13 @@ async function readJson(req: http.IncomingMessage): Promise<unknown> {
 	for await (const chunk of req) {
 		const buf = chunk as Buffer;
 		size += buf.length;
-		if (size > BODY_LIMIT) throw new HubError("invalid", "request body too large");
+		if (size > BODY_LIMIT) throw new HubError("invalid", messages.bodyTooLarge());
 		chunks.push(buf);
 	}
 	if (!size) return undefined;
 	try {
 		return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 	} catch {
-		throw new HubError("invalid", "request body is not JSON");
+		throw new HubError("invalid", messages.bodyNotJson());
 	}
 }

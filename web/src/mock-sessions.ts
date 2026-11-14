@@ -29,7 +29,7 @@ function seed(sessionId: string): TranscriptView {
 		return view;
 	}
 	const tools: ToolView[] = [
-		{ callId: "read-1", name: "read", intent: "Reading search boundaries", args: { path: "src/search/index.ts:30-80" }, output: "export async function indexChanged(paths: string[]) {\n  return index.update(paths);\n}", status: "done", startedAt: now - 85000, endedAt: now - 83000 },
+		{ callId: "read-1", name: "read", intent: "Reading search boundaries", args: { path: "src/search/index.ts:30-80" }, output: "…[1234 earlier characters not shown]\nexport async function indexChanged(paths: string[]) {\n  return index.update(paths);\n}", omittedCharacters: 1234, status: "done", startedAt: now - 85000, endedAt: now - 83000 },
 		{ callId: "bash-1", name: "bash", intent: "Verifying incremental indexing", args: { command: "pnpm test -- search", cwd: "/worktrees/atlas/T-11" }, output: "Running search tests…", status: "running", startedAt: now - 3000, endedAt: null },
 		{ callId: "dispatch-1", name: "home_dispatch", intent: "Routing isolated search work", args: { title: "Make search indexing incremental", workspace: "atlas", playbook: "feature" }, output: '{"task":"T-11","session":"W-11","status":"working"}', status: "done", startedAt: now - 80000, endedAt: now - 78000 },
 		{ callId: "task-1", name: "task", intent: "Reviewing boundaries in parallel", args: { tasks: [{ agent: "scout", task: "Trace the indexing boundary" }, { agent: "reviewer", task: "Review migration risks" }] }, output: "Spawned scout-1 and reviewer-1. Results arrive automatically.", status: "done", startedAt: now - 76000, endedAt: now - 75000 },
@@ -127,8 +127,10 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 				const request = z.object({ requestId: z.string(), response: uiResponse }).parse(body);
 				const response = request.response;
 				const answer = "value" in response ? response.value : "confirmed" in response ? response.confirmed ? "Yes" : "No" : "answers" in response ? response.answers.map(answer => `${answer.id}: ${[...answer.selectedOptions, answer.customInput].filter(Boolean).join(", ")}`).join("\n") : "Cancelled";
-				emit(id, { t: "request_closed", id: request.requestId, answer });
-				const old = history.get(id); if (old) history.set(id, reduceTranscript(old, { t: "request_closed", id: request.requestId, answer }));
+				const answerKind = "confirmed" in response ? response.confirmed ? "yes" : "no" : "cancelled" in response ? "cancelled" : undefined;
+				const event: TranscriptEvent = { t: "request_closed", id: request.requestId, answer, ...(answerKind ? { answerKind } : {}) };
+				emit(id, event);
+				const old = history.get(id); if (old) history.set(id, reduceTranscript(old, event));
 				return { ok: true };
 			}
 			if (action === "subagents") {

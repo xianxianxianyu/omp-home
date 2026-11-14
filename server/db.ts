@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
+import { errorText, HubError } from "./errors.ts";
+import { messages } from "./i18n.ts";
 import { resolveResources } from "./resources.ts";
 
 const SCHEMA_VERSION = "1";
@@ -36,7 +38,7 @@ export class Db {
 			return;
 		}
 		const version = this.meta("schema_version");
-		if (version !== SCHEMA_VERSION) throw new Error(`home.db has schema version ${version ?? "none"}; this hub supports ${SCHEMA_VERSION}`);
+		if (version !== SCHEMA_VERSION) throw new HubError("conflict", messages.databaseVersion(version, SCHEMA_VERSION));
 	}
 
 	#prepare(sql: string): StatementSync {
@@ -112,8 +114,6 @@ function checkTrigram(db: DatabaseSync): void {
 	try {
 		db.exec("CREATE VIRTUAL TABLE temp.trigram_probe USING fts5(x, tokenize = 'trigram'); DROP TABLE temp.trigram_probe;");
 	} catch (err) {
-		throw new Error(
-			`This Node build's SQLite lacks FTS5 with the trigram tokenizer (needed for search, including Chinese). Use Node 26+ from nodejs.org. (${err instanceof Error ? err.message : String(err)})`,
-		);
+		throw new HubError("unavailable", messages.sqliteUnsupported(errorText(err)));
 	}
 }

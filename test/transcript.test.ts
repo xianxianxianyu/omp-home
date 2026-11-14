@@ -4,7 +4,8 @@ import path from "node:path";
 import { test } from "node:test";
 import { emptyTranscript, MAX_ITEMS, reduceTranscript, type Item, type TranscriptEvent, type TranscriptView } from "../shared/transcript.ts";
 import { SessionViews } from "../server/session-views.ts";
-import { answerText, currentIntent, historyView, Normalizer, responseFits, uiRequestOf } from "../server/transcript.ts";
+import { render } from "../server/i18n.ts";
+import { answerEvent, answerText, currentIntent, historyView, Normalizer, responseFits, TOOL_OUTPUT_LIMIT, uiRequestOf } from "../server/transcript.ts";
 
 /**
  * Recorded omp 18.20 RPC frames (main session: home_status, bash, a `task` subagent that
@@ -27,7 +28,7 @@ function replay(upTo = frames.length): { view: TranscriptView; toasts: string[] 
 	frames.slice(0, upTo).forEach((frame, i) => {
 		const out = normalizer.frame(view, frame, 1_000 + i);
 		for (const ev of out.events) view = reduceTranscript(view, ev);
-		if (out.toast) toasts.push(out.toast.text);
+		if (out.toast) toasts.push(render(out.toast.text));
 	});
 	return { view, toasts };
 }
@@ -240,3 +241,73 @@ test("current intent: the running tool's, else the most recent one's", () => {
 	assert.equal(currentIntent({ ...view, tools }), "Still running", "a running tool wins over newer finished ones");
 });
 
+test("request answer metadata distinguishes hub labels from identical raw text and clears on replacement", () => {
+	const request = { method: "confirm" as const, title: "Proceed?", message: "Really?" };
+	let view = reduceTranscript(emptyTranscript(), { t: "item", item: { kind: "request", id: "q", at: 0, request, answer: null } });
+	view = reduceTranscript(view, answerEvent("q", request, { confirmed: true }));
+	assert.deepEqual(view.items[0], { kind: "request", id: "q", at: 0, request, answer: "Yes", answerKind: "yes" });
+	view = reduceTranscript(view, { t: "request_closed", id: "q", answer: "Yes" });
+	assert.deepEqual(view.items[0], { kind: "request", id: "q", at: 0, request, answer: "Yes" });
+	assert.equal(answerText(request, { cancelled: true }, "zh"), "已取消");
+	assert.equal(answerText(request, { confirmed: false }, "zh"), "否");
+	assert.equal(answerText({ method: "input", title: "", placeholder: null, secret: false }, { value: "Cancelled" }, "zh"), "Cancelled");
+});
+
+test("tool output metadata propagates and clears without changing raw text", () => {
+	const tool = { callId: "call", name: "bash", intent: null, args: null, status: "running" as const, output: "", startedAt: 0, endedAt: null };
+	let view = reduceTranscript(emptyTranscript(), { t: "tool", tool });
+	view = reduceTranscript(view, { t: "tool_output", callId: "call", output: "…[2 earlier characters not shown]\ntail", omittedCharacters: 2 });
+	assert.equal(view.tools.call?.omittedCharacters, 2);
+	assert.equal(view.tools.call?.output, "…[2 earlier characters not shown]\ntail");
+	view = reduceTranscript(view, { t: "tool_output", callId: "call", output: "…[2 earlier characters not shown]\nraw" });
+	assert.equal(view.tools.call?.omittedCharacters, undefined);
+	assert.equal(view.tools.call?.output, "…[2 earlier characters not shown]\nraw");
+});
+
+test("session streams render each language independently without translating model or human text", () => {
+	const views = new SessionViews(() => {});
+	let en = emptyTranscript();
+	let zh = emptyTranscript();
+	const stopEn = views.subscribe("M-1", event => {
+		en = reduceTranscript(en, event);
+	}, "en");
+	const stopZh = views.subscribe("M-1", event => {
+		zh = reduceTranscript(zh, event);
+	}, "zh");
+	views.frame("M-1", { type: "extension_ui_request", id: "q", method: "confirm", title: "Proceed?", message: "Really?" });
+	views.apply("M-1", answerEvent("q", views.openRequest("M-1", "q"), { confirmed: true }));
+	views.frame("M-1", { type: "extension_ui_request", id: "input", method: "input", title: "Name?" });
+	views.apply("M-1", answerEvent("input", views.openRequest("M-1", "input"), { value: "Yes" }));
+	const tail = "Model output stays English.\n" + "x".repeat(TOOL_OUTPUT_LIMIT - 28);
+	assert.equal(tail.length, TOOL_OUTPUT_LIMIT);
+	views.frame("M-1", { type: "tool_execution_start", toolCallId: "call", toolName: "bash", args: { command: "printf" } });
+	views.frame("M-1", { type: "tool_execution_update", toolCallId: "call", partialResult: { content: "prefix" + tail } });
+	assert.equal(en.items[0]?.kind === "request" && en.items[0].answer, "Yes");
+	assert.equal(zh.items[0]?.kind === "request" && zh.items[0].answer, "是");
+	assert.equal(zh.items[1]?.kind === "request" && zh.items[1].answer, "Yes");
+	assert.equal(en.tools.call?.output, "…[6 earlier characters not shown]\n" + tail);
+	assert.equal(zh.tools.call?.output, "…[前 6 个字符已省略]\n" + tail);
+	assert.deepEqual(views.view("M-1"), en);
+	assert.deepEqual(views.view("M-1", "zh"), zh);
+	const earlier = views.history("M-1", "input", "zh").items[0];
+	assert.equal(earlier?.kind === "request" && earlier.answer, "是");
+	views.frame("M-1", { type: "tool_execution_update", toolCallId: "call", partialResult: { content: "Short English output" } });
+	assert.equal(zh.tools.call?.output, "Short English output");
+	views.frame("M-1", { type: "extension_ui_request", id: "ended", method: "confirm", title: "Proceed?", message: "Really?" });
+	views.ended("M-1");
+	const ended = zh.items.at(-1);
+	assert.equal(ended?.kind === "request" && ended.answer, "会话已结束");
+	stopEn();
+	stopZh();
+});
+
+test("normalizer localizes only its own diagnostic framing", () => {
+	const normalizer = new Normalizer();
+	const prompt = normalizer.frame(emptyTranscript(), { type: "prompt_result", status: "error", error: { message: "Provider refused this request" } }, 0).toast;
+	assert.ok(prompt);
+	assert.equal(render(prompt.text), "prompt failed: Provider refused this request");
+	assert.equal(render(prompt.text, "zh"), "提示词提交失败：Provider refused this request");
+	const extension = normalizer.frame(emptyTranscript(), { type: "extension_error", event: "before_agent_start", error: "Raw omp error" }, 0).toast;
+	assert.ok(extension);
+	assert.equal(render(extension.text, "zh"), "扩展 before_agent_start 失败：Raw omp error");
+});

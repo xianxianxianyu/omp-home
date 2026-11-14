@@ -5,8 +5,8 @@ import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { homePaths } from "../server/config.ts";
 import { Db } from "../server/db.ts";
-import { HubError } from "../server/errors.ts";
-import { SettingsStore } from "../server/settings.ts";
+import { HubError, localizeFieldErrors } from "../server/errors.ts";
+import { defaultSettings, SettingsStore } from "../server/settings.ts";
 
 const appearance = { theme: "system", accent: "amber", textSize: "default", density: "comfortable" };
 
@@ -18,6 +18,16 @@ function store(t: TestContext): { db: Db; settings: SettingsStore } {
 		fs.rmSync(home, { recursive: true, force: true });
 	});
 	return { db, settings: new SettingsStore(db, homePaths(home)) };
+}
+
+function rejection(update: () => unknown): HubError {
+	try {
+		update();
+	} catch (err) {
+		if (err instanceof HubError) return err;
+		throw err;
+	}
+	assert.fail("expected a HubError");
 }
 
 test("appearance defaults and partial patches persist without resetting other fields", t => {
@@ -65,4 +75,41 @@ test("appearance and thinking patch validation rejects invalid values without wr
 		assert.throws(() => settings.update(patch), err => err instanceof HubError && err.status === 422);
 		assert.equal(db.meta("settings"), before);
 	}
+});
+
+test("language defaults to system, persists, and rejects unknown values without writing", t => {
+	const { db, settings } = store(t);
+	assert.equal(defaultSettings().language, "system");
+	assert.equal(settings.dto().language, "system");
+	assert.equal(settings.update({ language: "zh" }).language, "zh");
+	assert.equal(settings.update({ appearance: { theme: "dark" } }).language, "zh");
+	assert.equal(new SettingsStore(db, homePaths(settings.dto().homePath)).get().language, "zh");
+	assert.equal(settings.update({ language: "en" }).language, "en");
+	const before = db.meta("settings");
+	for (const language of ["fr", "zh-CN", "", null, 1]) {
+		assert.equal(rejection(() => settings.update({ language })).errors?.[0]?.path, "language");
+		assert.equal(db.meta("settings"), before);
+	}
+	db.setMeta("settings", JSON.stringify({ mainModel: "custom", language: "fr" }));
+	assert.equal(settings.get().language, "system");
+	assert.equal(settings.get().mainModel, "custom");
+});
+
+test("settings validation reads English by default and renders Chinese for the UI", t => {
+	const { settings } = store(t);
+	const err = rejection(() => settings.update({ portRange: [41000, 41001], worktreeRoot: "relative/worktrees" }));
+	assert.equal(err.status, 422);
+	assert.equal(err.message, "invalid settings");
+	assert.equal(err.localized("en"), "invalid settings");
+	assert.equal(err.localized("zh"), "设置无效");
+	const english = [
+		{ path: "portRange", message: "the range needs at least 10 ports" },
+		{ path: "worktreeRoot", message: "must be an absolute path" },
+	];
+	assert.deepEqual(err.errors, english);
+	assert.deepEqual(localizeFieldErrors(err.errors!, "en"), english);
+	assert.deepEqual(localizeFieldErrors(err.errors!, "zh"), [
+		{ path: "portRange", message: "端口范围至少要包含 10 个端口" },
+		{ path: "worktreeRoot", message: "必须是绝对路径" },
+	]);
 });

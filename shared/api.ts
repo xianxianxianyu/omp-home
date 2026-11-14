@@ -290,6 +290,25 @@ export const ACCENTS = ["amber", "blue", "green", "violet", "rose", "graphite"] 
 export const TEXT_SIZES = ["small", "default", "large"] as const;
 export const DENSITIES = ["comfortable", "compact"] as const;
 
+/** UI languages. "system" resolves on the client from the OS/browser language list. */
+export const LANGUAGES = ["en", "zh"] as const;
+export type Language = (typeof LANGUAGES)[number];
+export const LANGUAGE_SETTINGS = ["system", ...LANGUAGES] as const;
+export type LanguageSetting = (typeof LANGUAGE_SETTINGS)[number];
+/**
+ * The client's resolved language, sent on every API request (and as `?lang=` on the events socket). The hub answers
+ * human-facing text it authors (errors, field messages, summaries) in it and remembers the last one for pushed toasts.
+ * Text written for models (prompts, tool results) stays English.
+ */
+export const LANGUAGE_HEADER = "x-omp-home-language";
+
+/** The first zh* or en* tag in the user's preference list decides; English otherwise. */
+export function resolveLanguage(setting: LanguageSetting, preferred: readonly string[]): Language {
+	if (setting !== "system") return setting;
+	const first = preferred.map(tag => tag.toLowerCase()).find(tag => tag.startsWith("zh") || tag.startsWith("en"));
+	return first?.startsWith("zh") ? "zh" : "en";
+}
+
 /** How the UI looks. Stored with the hub settings: the app's page origin changes every launch, so localStorage cannot hold it. */
 export interface AppearanceDTO {
 	theme: (typeof THEMES)[number];
@@ -315,6 +334,7 @@ export interface SettingsDTO {
 	/** Explicit omp binary; null = managed copy, else PATH. */
 	ompPath: string | null;
 	appearance: AppearanceDTO;
+	language: LanguageSetting;
 }
 
 export type SettingsPatch = Partial<Omit<SettingsDTO, "homePath" | "appearance">> & { appearance?: Partial<AppearanceDTO> };

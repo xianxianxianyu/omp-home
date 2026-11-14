@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { admit, evictable, idleVictims, launchSpec, type PoolEntry } from "../server/core/pool.ts";
 import { expand, parseRecipe } from "../server/core/recipe.ts";
 import { planQuery } from "../server/core/search.ts";
+import { HubError, localizeFieldErrors } from "../server/errors.ts";
 
 const repo = path.resolve(import.meta.dirname, "..");
 
@@ -41,13 +42,42 @@ test("unknown variables, worktree variables in shared services and unknown keys 
 	assert.deepEqual(pastedBelowExample.errors, [{ path: "version", message: 'line 4: duplicate key "version"; each key may appear only once (delete one of them)' }]);
 });
 
+test("recipe errors read English for models and render in Chinese for the UI", () => {
+	const cases: [string, { path: string; en: string; zh: string }][] = [
+		[
+			'version: 1\nports: [web]\nenv: { URL: "http://127.0.0.1:{port.wbe}" }\n',
+			{
+				path: "env.URL",
+				en: "unknown variable {port.wbe}; available here: {repo} {worktree} {branch} {slug} {port.web}",
+				zh: "未知变量 {port.wbe}；此处可用：{repo} {worktree} {branch} {slug} {port.web}",
+			},
+		],
+		["version: 1\nports: [-web]\n", { path: "ports.0", en: "use letters, digits, - and _", zh: "只能使用字母、数字、- 和 _" }],
+		["version: 1\nports: [web, web]\n", { path: "ports", en: 'port name "web" is declared twice', zh: "端口名「web」声明了两次" }],
+		[
+			"version: 1\nversion: 1\n",
+			{ path: "version", en: 'line 2: duplicate key "version"; each key may appear only once (delete one of them)', zh: "第 2 行：键「version」重复；每个键只能出现一次（删掉其中一个）" },
+		],
+	];
+	for (const [text, { path: field, en, zh }] of cases) {
+		const r = parseRecipe(text);
+		assert.ok(!r.ok, text);
+		assert.deepEqual(r.errors, [{ path: field, message: en }]);
+		assert.deepEqual(localizeFieldErrors(r.errors, "en"), [{ path: field, message: en }]);
+		assert.deepEqual(localizeFieldErrors(r.errors, "zh"), [{ path: field, message: zh }]);
+	}
+	const badYaml = parseRecipe("version: 1\nports: [web\n");
+	assert.ok(!badYaml.ok);
+	assert.match(localizeFieldErrors(badYaml.errors, "zh")[0]!.message, /^第 3 行：/);
+});
+
 test("shell variables pass through; expansion single-quotes values in shell mode", () => {
 	const r = parseRecipe('version: 1\nports: [web]\nsetup: ["echo ${HOME} {branch} > out-{port.web}"]\n');
 	assert.ok(r.ok, JSON.stringify(!r.ok && r.errors));
 	const vars = { repo: "/r", worktree: "/w", branch: "it's/x", slug: "its_x", port: { web: 41001 } };
 	assert.equal(expand(r.recipe.setup[0]!, vars, "shell"), "echo ${HOME} 'it'\\''s/x' > out-'41001'");
 	assert.equal(expand("{branch}:{port.web}", vars, "plain"), "it's/x:41001");
-	assert.throws(() => expand("{db.name}", vars, "plain"), /not available/);
+	assert.throws(() => expand("{db.name}", vars, "plain"), err => err instanceof HubError && err.message === "{db.name} is not available in this context" && err.localized("zh") === "{db.name} 在此处不可用");
 });
 
 test("search planning sends 3+ character terms to FTS and shorter ones to LIKE", () => {

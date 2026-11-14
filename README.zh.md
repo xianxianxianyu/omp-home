@@ -175,7 +175,7 @@ docs/         架构和流水线图
 <details>
 <summary><b>要花多少钱？</b></summary>
 
-omp-home 本身不收费、不依赖任何外部服务。花费只有主聊天、dispatcher 和 worker 通过你现有的 omp 服务商产生的模型用量；可以在 **Settings → Models** 里给 worker 选便宜一点的模型。
+omp-home 本身不收费、不依赖任何外部服务。花费只有主聊天、dispatcher 和 worker 通过你现有的 omp 服务商产生的模型用量；可以在「设置 → 模型」里给执行者选便宜一点的模型（列表来自 `omp models`）；主题、强调色、字号、密度和界面语言（中文 / English / 跟随系统）在「设置 → 外观」里。
 </details>
 
 <details>

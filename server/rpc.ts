@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import type { Language } from "../shared/api.ts";
+import { render, type Message } from "./i18n.ts";
+import { runtimeMessages as m } from "./i18n-runtime.ts";
 
 /** omp RPC protocol v1: one JSON object per line on stdio; omp keeps each frame within 1 MiB. */
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -24,10 +27,16 @@ export interface RpcExit {
 
 export class RpcError extends Error {
 	readonly code: string | null;
+	readonly localizedText: string | Message;
 
-	constructor(message: string, code: string | null = null) {
-		super(message);
+	constructor(message: string | Message, code: string | null = null) {
+		super(render(message));
 		this.code = code;
+		this.localizedText = message;
+	}
+
+	localized(language: Language): string {
+		return render(this.localizedText, language);
 	}
 }
 
@@ -89,7 +98,7 @@ export class RpcClient {
 		this.#child.on("close", (code, signal) => {
 			const detail = spawnError ?? this.#stderr.trim();
 			this.#exit = { code, signal, detail };
-			const err = new RpcError(`omp exited (${signal ?? `code ${code}`})${detail ? `: ${detail.slice(-500)}` : ""}`, "exited");
+			const err = new RpcError(m.rpcExited(code, signal, detail.slice(-500)), "exited");
 			if (!this.#ready) ready.reject(err);
 			for (const p of this.#pending.values()) {
 				clearTimeout(p.timer);
@@ -133,7 +142,7 @@ export class RpcClient {
 				this.#pending.delete(frame.id);
 				clearTimeout(pending.timer);
 				if (frame.success === true) pending.resolve(frame.data);
-				else pending.reject(new RpcError(typeof frame.error === "string" ? frame.error : `${String(frame.command)} failed`, typeof frame.code === "string" ? frame.code : null));
+				else pending.reject(new RpcError(typeof frame.error === "string" ? frame.error : m.rpcCommandFailed(String(frame.command)), typeof frame.code === "string" ? frame.code : null));
 				return;
 			}
 		}
@@ -146,7 +155,7 @@ export class RpcClient {
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		const timer = setTimeout(() => {
 			this.#pending.delete(id);
-			reject(new RpcError(`omp did not answer ${type} within ${timeoutMs / 1000}s`, "timeout"));
+			reject(new RpcError(m.rpcTimeout(type, timeoutMs / 1000), "timeout"));
 		}, timeoutMs);
 		this.#pending.set(id, { resolve, reject, timer });
 		try {
@@ -161,9 +170,9 @@ export class RpcClient {
 
 	/** Write one non-command frame (e.g. `extension_ui_response`). */
 	send(frame: Record<string, unknown>): void {
-		if (!this.alive) throw new RpcError("omp is not running", "exited");
+		if (!this.alive) throw new RpcError(m.rpcNotRunning(), "exited");
 		const line = JSON.stringify(frame);
-		if (Buffer.byteLength(line, "utf8") + 1 > MAX_FRAME_BYTES) throw new RpcError("message exceeds omp's 1 MiB frame limit", "too_large");
+		if (Buffer.byteLength(line, "utf8") + 1 > MAX_FRAME_BYTES) throw new RpcError(m.rpcTooLarge(), "too_large");
 		this.#child.stdin!.write(`${line}\n`);
 	}
 

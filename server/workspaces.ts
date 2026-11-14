@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import type { RecipeDTO, ScanCandidate, WorkspaceDTO } from "../shared/api.ts";
+import type { Language, RecipeDTO, ScanCandidate, WorkspaceDTO } from "../shared/api.ts";
 import { IdError, parseWorkspaceId, slugify } from "../shared/ids.ts";
 import { writeFileAtomic, type HomePaths } from "./config.ts";
 import { parseRecipe, type EnvRecipe } from "./core/recipe.ts";
 import type { Db } from "./db.ts";
-import { fieldErrors, HubError } from "./errors.ts";
+import { fieldErrors, HubError, localizedField, localizeFieldErrors } from "./errors.ts";
 import { defaultBase, repoRoot } from "./git.ts";
+import { messages } from "./i18n.ts";
+import { validationMessages as m } from "./i18n-validation.ts";
 
 export interface WorkspaceRow {
 	id: string;
@@ -19,6 +21,7 @@ export interface WorkspaceRow {
 	archived_at: number | null;
 }
 
+/** Invalid-recipe errors carry English messages for model-facing callers; localizeFieldErrors renders them for the UI. */
 export type LoadedRecipe =
 	| { status: "missing" }
 	| { status: "invalid"; errors: RecipeDTO["errors"] }
@@ -53,10 +56,7 @@ export class Workspaces {
 
 	must(id: string): WorkspaceRow {
 		const row = this.get(id);
-		if (!row) {
-			const known = this.list().map(w => w.id);
-			throw new HubError("not_found", `no workspace "${id}"${known.length ? `; known: ${known.join(", ")}` : ""}`);
-		}
+		if (!row) throw new HubError("not_found", m.noWorkspace(id, this.list().map(w => w.id)));
 		return row;
 	}
 
@@ -66,28 +66,29 @@ export class Workspaces {
 
 	async create(body: unknown): Promise<WorkspaceRow> {
 		const parsed = createSchema.safeParse(body);
-		if (!parsed.success) throw new HubError("unprocessable", "invalid workspace", fieldErrors(parsed.error.issues));
+		if (!parsed.success) throw new HubError("unprocessable", m.invalidWorkspace(), fieldErrors(parsed.error.issues));
 		const input = parsed.data;
 		const resolved = path.resolve(input.repoPath);
-		if (!fs.existsSync(resolved)) throw new HubError("unprocessable", `${resolved} does not exist`, [{ path: "repoPath", message: "does not exist" }]);
+		if (!fs.existsSync(resolved)) throw new HubError("unprocessable", m.pathMissing(resolved), [localizedField("repoPath", m.doesNotExist())]);
 		let root: string;
 		try {
 			root = fs.realpathSync(await repoRoot(resolved));
 		} catch {
-			throw new HubError("unprocessable", `${resolved} is not inside a git repository`, [{ path: "repoPath", message: "not a git repository" }]);
+			throw new HubError("unprocessable", m.notInGitRepo(resolved), [localizedField("repoPath", m.notGitRepo())]);
 		}
 		const taken = this.#db.get<WorkspaceRow>("SELECT * FROM workspace WHERE repo_path = ?", root);
-		if (taken) throw new HubError("conflict", `${root} is already workspace "${taken.id}"`);
+		if (taken) throw new HubError("conflict", m.repoTaken(root, taken.id));
 		const name = input.name ?? path.basename(root);
 		let id: string;
 		if (input.id !== undefined) {
 			try {
 				id = parseWorkspaceId(input.id);
 			} catch (err) {
-				if (err instanceof IdError) throw new HubError("unprocessable", err.message, [{ path: "id", message: err.message }]);
-				throw err;
+				if (!(err instanceof IdError)) throw err;
+				const invalid = messages.invalidId("workspace id", JSON.stringify(input.id));
+				throw new HubError("unprocessable", invalid, [localizedField("id", invalid)]);
 			}
-			if (this.get(id)) throw new HubError("conflict", `workspace id "${id}" is taken`);
+			if (this.get(id)) throw new HubError("conflict", m.workspaceIdTaken(id));
 		} else {
 			const base = slugify(name);
 			id = base;
@@ -114,7 +115,7 @@ export class Workspaces {
 	patch(id: string, body: unknown): WorkspaceRow {
 		this.must(id);
 		const parsed = patchSchema.safeParse(body);
-		if (!parsed.success) throw new HubError("unprocessable", "invalid workspace patch", fieldErrors(parsed.error.issues));
+		if (!parsed.success) throw new HubError("unprocessable", m.invalidWorkspacePatch(), fieldErrors(parsed.error.issues));
 		const p = parsed.data;
 		if (p.name !== undefined) this.#db.run("UPDATE workspace SET name = ? WHERE id = ?", p.name, id);
 		if (p.defaultBase !== undefined) this.#db.run("UPDATE workspace SET default_base = ? WHERE id = ?", p.defaultBase, id);
@@ -125,7 +126,7 @@ export class Workspaces {
 	archive(id: string): WorkspaceRow {
 		this.must(id);
 		const open = this.#db.get<{ n: number }>("SELECT count(*) AS n FROM task WHERE workspace_id = ? AND status NOT IN ('done','cancelled')", id)!.n;
-		if (open) throw new HubError("conflict", `workspace "${id}" has ${open} open task(s); close them first`);
+		if (open) throw new HubError("conflict", m.workspaceOpenTasks(id, open));
 		this.#db.run("UPDATE workspace SET archived_at = coalesce(archived_at, ?) WHERE id = ?", Date.now(), id);
 		return this.must(id);
 	}
@@ -149,23 +150,23 @@ export class Workspaces {
 		return r.ok ? { status: "ok", recipe: r.recipe, hash: r.hash } : { status: "invalid", errors: r.errors };
 	}
 
-	readRecipe(id: string): RecipeDTO {
+	readRecipe(id: string, language: Language = "en"): RecipeDTO {
 		this.must(id);
 		const file = this.recipePath(id);
 		const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
 		const loaded = this.loadRecipe(id);
-		return { workspace: id, path: file, text, status: loaded.status, errors: loaded.status === "invalid" ? loaded.errors : [] };
+		return { workspace: id, path: file, text, status: loaded.status, errors: loaded.status === "invalid" ? localizeFieldErrors(loaded.errors, language) : [] };
 	}
 
 	/** Validated, atomic write; an invalid recipe is rejected with field errors and not written. */
-	writeRecipe(id: string, text: string): RecipeDTO {
+	writeRecipe(id: string, text: string, language: Language = "en"): RecipeDTO {
 		this.must(id);
 		const r = parseRecipe(text);
-		if (!r.ok) throw new HubError("unprocessable", "invalid recipe", r.errors);
+		if (!r.ok) throw new HubError("unprocessable", m.invalidRecipe(), r.errors);
 		const file = this.recipePath(id);
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		writeFileAtomic(file, text.endsWith("\n") ? text : `${text}\n`);
-		return this.readRecipe(id);
+		return this.readRecipe(id, language);
 	}
 
 	dto(w: WorkspaceRow): WorkspaceDTO {

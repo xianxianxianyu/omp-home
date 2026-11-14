@@ -1,8 +1,10 @@
-import type { CommandDTO } from "../shared/api.ts";
+import type { CommandDTO, Language } from "../shared/api.ts";
 import { emptyStatus, emptyTranscript, MAX_ITEMS, reduceTranscript, type Item, type ToolView, type TranscriptEvent, type TranscriptView, type UiRequest } from "../shared/transcript.ts";
 import { HubError } from "./errors.ts";
+import { render, type Message } from "./i18n.ts";
+import { runtimeMessages as m } from "./i18n-runtime.ts";
 import type { RpcFrame } from "./rpc.ts";
-import { commandsOf, currentIntent, historyView, Normalizer, statusFromState } from "./transcript.ts";
+import { commandsOf, currentIntent, historyView, localizedEvent, localizedView, Normalizer, statusFromState } from "./transcript.ts";
 
 /** Items per `history?before=` page. */
 const HISTORY_PAGE = 100;
@@ -39,9 +41,9 @@ function toolIds(items: readonly Item[]): string[] {
  */
 export class SessionViews {
 	readonly #entries = new Map<string, Entry>();
-	readonly #toast: (sessionId: string, level: "info" | "error", text: string) => void;
+	readonly #toast: (sessionId: string, level: "info" | "error", text: string | Message) => void;
 
-	constructor(toast: (sessionId: string, level: "info" | "error", text: string) => void) {
+	constructor(toast: (sessionId: string, level: "info" | "error", text: string | Message) => void) {
 		this.#toast = toast;
 	}
 
@@ -54,16 +56,17 @@ export class SessionViews {
 		return e;
 	}
 
-	view(id: string): TranscriptView {
-		return this.#entry(id).view;
+	view(id: string, language: Language = "en"): TranscriptView {
+		return localizedView(this.#entry(id).view, language);
 	}
 
 	/** Stream subscription: `reset` now, then every increment. Returns the unsubscribe function. */
-	subscribe(id: string, send: Subscriber): () => void {
+	subscribe(id: string, send: Subscriber, language: Language = "en"): () => void {
 		const e = this.#entry(id);
-		e.subscribers.add(send);
-		send({ t: "reset", view: e.view });
-		return () => e.subscribers.delete(send);
+		const subscriber: Subscriber = event => send(localizedEvent(event, language));
+		e.subscribers.add(subscriber);
+		subscriber({ t: "reset", view: e.view });
+		return () => e.subscribers.delete(subscriber);
 	}
 
 	/** The session's current tool intent; null when it has no view in this hub. */
@@ -122,7 +125,7 @@ export class SessionViews {
 		const e = this.#entries.get(id);
 		if (!e) return;
 		for (const item of e.view.items) {
-			if (item.kind === "request" && item.answer === null) this.#broadcast(e, { t: "request_closed", id: item.id, answer: "Session ended" });
+			if (item.kind === "request" && item.answer === null) this.#broadcast(e, { t: "request_closed", id: item.id, answer: render(m.answer("session_ended")), answerKind: "session_ended" });
 			if (item.kind === "assistant" && item.streaming) this.#broadcast(e, { t: "item", item: { ...item, streaming: false } });
 		}
 		this.#broadcast(e, { t: "status", patch: { phase: "idle", settled: true, queue: { steering: [], followUp: [] } } });
@@ -131,8 +134,8 @@ export class SessionViews {
 	/** The open dialog `requestId`, or a HubError for unknown and already answered ones. */
 	openRequest(id: string, requestId: string): UiRequest {
 		const item = this.#entries.get(id)?.view.items.find(i => i.id === requestId);
-		if (!item || item.kind !== "request") throw new HubError("not_found", `no request ${requestId} in ${id}`);
-		if (item.answer !== null) throw new HubError("conflict", `request ${requestId} was already answered (${item.answer})`);
+		if (!item || item.kind !== "request") throw new HubError("not_found", m.noRequest(requestId, id));
+		if (item.answer !== null) throw new HubError("conflict", m.requestAnswered(requestId, item.answerKind ? m.answer(item.answerKind) : item.answer));
 		return item.request;
 	}
 
@@ -141,11 +144,11 @@ export class SessionViews {
 	}
 
 	/** The page of items before `before` (an item id the client holds). */
-	history(id: string, before: string): Prepend {
+	history(id: string, before: string, language: Language = "en"): Prepend {
 		const e = this.#entry(id);
 		const all = [...e.older, ...e.view.items];
 		const at = all.findIndex(i => i.id === before);
-		if (at < 0) throw new HubError("not_found", `unknown history cursor ${before}; reload the session`);
+		if (at < 0) throw new HubError("not_found", m.historyCursor(before));
 		const start = Math.max(0, at - HISTORY_PAGE);
 		const items = all.slice(start, at);
 		const tools: Record<string, ToolView> = {};
@@ -153,7 +156,7 @@ export class SessionViews {
 			const tool = e.olderTools[callId] ?? e.view.tools[callId];
 			if (tool) tools[callId] = tool;
 		}
-		return { t: "prepend", items, tools, earlierCursor: start > 0 ? items[0]!.id : null };
+		return localizedEvent({ t: "prepend", items, tools, earlierCursor: start > 0 ? items[0]!.id : null }, language);
 	}
 
 	forget(id: string): void {

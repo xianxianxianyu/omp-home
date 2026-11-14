@@ -1,9 +1,10 @@
-import type { Actor, DecisionDTO, EscalationDTO, ReportDTO, TaskEventDTO, TaskStatus, TaskSummary } from "../shared/api.ts";
+import type { Actor, DecisionDTO, EscalationDTO, Language, ReportDTO, TaskEventDTO, TaskStatus, TaskSummary } from "../shared/api.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { BatchItem } from "./core/notices.ts";
 import {
 	escalationResolution,
 	foldTask,
+	INITIAL,
 	NOTICE_POLICY,
 	noticeFor,
 	type NoticeKind,
@@ -13,9 +14,12 @@ import {
 	type TaskEvent,
 	type TaskState,
 	type Wait,
+	waitText,
 } from "./core/task.ts";
 import type { Db } from "./db.ts";
 import { HubError } from "./errors.ts";
+import { taskMessages } from "./i18n-task.ts";
+import { type Message, render } from "./i18n.ts";
 
 export interface TaskRow {
 	id: string;
@@ -138,7 +142,7 @@ export class Ledger {
 
 	mustTask(id: string): TaskRow {
 		const row = this.task(id);
-		if (!row) throw new HubError("not_found", `no task ${id}`);
+		if (!row) throw new HubError("not_found", taskMessages.noTask(id));
 		return row;
 	}
 
@@ -246,8 +250,8 @@ export class Ledger {
 		}
 		const session = this.mustTask(taskId).session_id;
 		if (notice && NOTICE_POLICY[notice].autoEscalate && session && !this.openEscalation(taskId)) {
-			const reason = after.status.s === "awaiting" ? `${after.status.wait.kind}: ${after.status.wait.text}` : notice;
-			result.opened.push(this.#insertEscalation(taskId, session, reason, "hub"));
+			const reasonMessage = after.status.s === "awaiting" ? taskMessages.autoEscalation(after.status.wait.kind, after.status.wait.message ?? after.status.wait.text) : undefined;
+			result.opened.push(this.#insertEscalation(taskId, session, reasonMessage?.en ?? notice, "hub", reasonMessage));
 		}
 		return result;
 	}
@@ -315,13 +319,13 @@ export class Ledger {
 	}
 
 	/** Everything of a TaskSummary the ledger knows; live progress comes from the hub. */
-	summary(row: TaskRow, branch: string | null): Omit<TaskSummary, "progress"> {
+	summary(row: TaskRow, branch: string | null, language: Language = "en"): Omit<TaskSummary, "progress"> {
 		return {
 			id: row.id,
 			title: row.title,
 			workspace: row.workspace_id,
 			status: row.status,
-			wait: waitOf(row),
+			wait: this.#waitSummary(row, language),
 			sessionId: row.session_id,
 			branch,
 			playbook: row.playbook,
@@ -331,10 +335,25 @@ export class Ledger {
 		};
 	}
 
+	#waitSummary(row: TaskRow, language: Language): TaskSummary["wait"] {
+		let wait = waitOf(row);
+		if (!wait) return null;
+		if (language !== "en" && !wait.message && wait.kind !== "question" && wait.kind !== "blocked") {
+			// Older projections have only English text. Replay their source events rather than
+			// guessing from text that could equally have been written by the worker.
+			let state = INITIAL;
+			for (const event of this.#db.all<EventRow>("SELECT * FROM task_event WHERE task_id = ? ORDER BY id", row.id)) {
+				state = foldTask(state, JSON.parse(event.data) as TaskEvent);
+			}
+			if (state.status.s === "awaiting" && state.status.wait.kind === wait.kind && state.status.wait.text === wait.text) wait = state.status.wait;
+		}
+		return { kind: wait.kind, text: waitText(wait, language) };
+	}
+
 	/** One-line rendering of the task's latest event. */
-	lastEventSummary(taskId: string): string | null {
+	lastEventSummary(taskId: string, language: Language = "en"): string | null {
 		const e = this.#db.get<EventRow>("SELECT * FROM task_event WHERE task_id = ? ORDER BY id DESC LIMIT 1", taskId);
-		return e ? describeEvent(JSON.parse(e.data) as TaskEvent) : null;
+		return e ? this.#eventSummary(e, JSON.parse(e.data) as TaskEvent, language) : null;
 	}
 
 	/** When the latest event of one of `kinds` happened. */
@@ -346,20 +365,30 @@ export class Ledger {
 		return this.eventsOf(taskId, "reported").map(({ at, event }) => ({ at, status: event.status, summary: event.summary, details: event.details }));
 	}
 
-	eventDTO(e: EventRow): TaskEventDTO {
+	eventDTO(e: EventRow, language: Language = "en"): TaskEventDTO {
 		const data = JSON.parse(e.data) as TaskEvent;
-		return { id: e.id, at: e.at, actor: e.actor, kind: e.kind, summary: describeEvent(data), data: data as unknown as Record<string, unknown> };
+		return { id: e.id, at: e.at, actor: e.actor, kind: e.kind, summary: this.#eventSummary(e, data, language), data: data as unknown as Record<string, unknown> };
+	}
+
+	#eventSummary(row: EventRow, event: TaskEvent, language: Language): string {
+		if (event.kind === "escalated" && language !== "en") {
+			const reasonMessage = this.#escalationMessage(row, event);
+			if (reasonMessage) return describeEvent({ ...event, reasonMessage }, language);
+		}
+		return describeEvent(event, language);
 	}
 
 	// ── decisions ────────────────────────────────────────────────────────────
 
-	logDecision(input: { taskId: string | null; summary: string; why: string; revert: string; reverts: string | null; dedupeKey: string | null; actor: Actor }): DecisionRow {
+	logDecision(input: {
+		taskId: string | null; summary: string; why: string; revert: string; reverts: string | null; dedupeKey: string | null; actor: Actor;
+	} & ({ summaryMessage?: never; revertMessage?: never } | { taskId: string; summaryMessage?: Message; revertMessage?: Message })): DecisionRow {
 		return this.#db.tx(() => {
 			if (input.dedupeKey) {
 				const existing = this.#db.get<DecisionRow>("SELECT * FROM decision WHERE dedupe_key = ?", input.dedupeKey);
 				if (existing) return existing;
 			}
-			if (input.reverts && !this.decision(input.reverts)) throw new HubError("not_found", `no decision ${input.reverts}`);
+			if (input.reverts && !this.decision(input.reverts)) throw new HubError("not_found", taskMessages.noDecision(input.reverts));
 			const { id } = this.#db.nextId("D");
 			this.#db.run(
 				"INSERT INTO decision (id, task_id, at, summary, why, revert_plan, reverts, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -372,7 +401,11 @@ export class Ledger {
 				input.reverts,
 				input.dedupeKey,
 			);
-			if (input.taskId) this.#append(input.taskId, { kind: "decided", decision: id, summary: input.summary }, input.actor, null);
+			if (input.taskId) this.#append(input.taskId, {
+				kind: "decided", decision: id, summary: input.summary,
+				...(input.summaryMessage ? { summaryMessage: input.summaryMessage } : {}),
+				...(input.revertMessage ? { revertMessage: input.revertMessage } : {}),
+			}, input.actor, null);
 			return this.decision(id)!;
 		});
 	}
@@ -389,20 +422,24 @@ export class Ledger {
 
 	requestRevert(id: string): DecisionRow {
 		const d = this.decision(id);
-		if (!d) throw new HubError("not_found", `no decision ${id}`);
+		if (!d) throw new HubError("not_found", taskMessages.noDecision(id));
 		this.#db.run("UPDATE decision SET revert_requested_at = coalesce(revert_requested_at, ?) WHERE id = ?", this.#now(), id);
 		return this.decision(id)!;
 	}
 
-	decisionDTO(d: DecisionRow): DecisionDTO {
+	decisionDTO(d: DecisionRow, language: Language = "en"): DecisionDTO {
 		const revertedBy = this.#db.get<{ id: string }>("SELECT id FROM decision WHERE reverts = ? ORDER BY at LIMIT 1", d.id)?.id ?? null;
+		const event = language !== "en" && d.task_id ? this.#db.get<EventRow>(
+			"SELECT * FROM task_event WHERE task_id = ? AND kind = 'decided' AND json_extract(data, '$.decision') = ? LIMIT 1", d.task_id, d.id,
+		) : undefined;
+		const metadata = event ? JSON.parse(event.data) as Extract<TaskEvent, { kind: "decided" }> : undefined;
 		return {
 			id: d.id,
 			taskId: d.task_id,
 			at: d.at,
-			summary: d.summary,
+			summary: render(metadata?.summaryMessage ?? d.summary, language),
 			why: d.why,
-			revert: d.revert_plan,
+			revert: render(metadata?.revertMessage ?? d.revert_plan, language),
 			reverts: d.reverts,
 			revertRequestedAt: d.revert_requested_at,
 			revertedBy,
@@ -434,7 +471,7 @@ export class Ledger {
 		});
 	}
 
-	#insertEscalation(taskId: string, sessionId: string, reason: string, by: "main" | "hub"): EscalationRow {
+	#insertEscalation(taskId: string, sessionId: string, reason: string, by: "main" | "hub", reasonMessage?: Message): EscalationRow {
 		const { id } = this.#db.nextId("E");
 		this.#db.run(
 			"INSERT INTO escalation (id, task_id, session_id, reason, opened_by, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -445,13 +482,13 @@ export class Ledger {
 			by,
 			this.#now(),
 		);
-		this.#append(taskId, { kind: "escalated", escalation: id, by, reason }, by, null);
+		this.#append(taskId, { kind: "escalated", escalation: id, by, reason, ...(reasonMessage ? { reasonMessage } : {}) }, by, null);
 		return this.escalation(id)!;
 	}
 
 	markSeen(id: string): EscalationRow {
 		const e = this.escalation(id);
-		if (!e) throw new HubError("not_found", `no escalation ${id}`);
+		if (!e) throw new HubError("not_found", taskMessages.noEscalation(id));
 		this.#db.run("UPDATE escalation SET seen_at = coalesce(seen_at, ?) WHERE id = ?", this.#now(), id);
 		return this.escalation(id)!;
 	}
@@ -459,7 +496,7 @@ export class Ledger {
 	dismiss(id: string): EscalationRow {
 		return this.#db.tx(() => {
 			const e = this.escalation(id);
-			if (!e) throw new HubError("not_found", `no escalation ${id}`);
+			if (!e) throw new HubError("not_found", taskMessages.noEscalation(id));
 			if (e.resolved_at === null) {
 				this.#db.run("UPDATE escalation SET resolved_at = ?, resolution = 'dismissed' WHERE id = ?", this.#now(), id);
 				this.#append(e.task_id, { kind: "escalation_closed", escalation: id, resolution: "dismissed" }, "human", null);
@@ -468,19 +505,36 @@ export class Ledger {
 		});
 	}
 
-	escalationDTO(e: EscalationRow): EscalationDTO {
+	escalationDTO(e: EscalationRow, language: Language = "en"): EscalationDTO {
+		const event = language !== "en" && e.opened_by === "hub" ? this.#db.get<EventRow>(
+			"SELECT * FROM task_event WHERE task_id = ? AND kind = 'escalated' AND json_extract(data, '$.escalation') = ? LIMIT 1", e.task_id, e.id,
+		) : undefined;
+		const message = event ? this.#escalationMessage(event, JSON.parse(event.data) as Extract<TaskEvent, { kind: "escalated" }>) : undefined;
 		return {
 			id: e.id,
 			taskId: e.task_id,
 			taskTitle: this.task(e.task_id)?.title ?? "",
 			sessionId: e.session_id,
-			reason: e.reason,
+			reason: render(message ?? e.reason, language),
 			openedBy: e.opened_by,
 			openedAt: e.opened_at,
 			seenAt: e.seen_at,
 			resolvedAt: e.resolved_at,
 			resolution: e.resolution,
 		};
+	}
+
+	#escalationMessage(row: EventRow, event: Extract<TaskEvent, { kind: "escalated" }>): Message | undefined {
+		if (event.by !== "hub") return undefined;
+		if (event.reasonMessage) return event.reasonMessage;
+		// Before metadata was recorded, only approval requests were auto-escalated.
+		// Require the original source event and exact generated reason, never a text prefix.
+		const source = this.#db.get<EventRow>("SELECT * FROM task_event WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT 1", row.task_id, row.id);
+		if (!source) return undefined;
+		const data = JSON.parse(source.data) as TaskEvent;
+		if (data.kind !== "approval_requested") return undefined;
+		const message = taskMessages.autoEscalation("approval", taskMessages.waitApproval(data.tool, data.summary));
+		return message.en === event.reason ? message : undefined;
 	}
 
 	// ── outbox ───────────────────────────────────────────────────────────────
@@ -611,51 +665,75 @@ export class Ledger {
 }
 
 /** One-line rendering for timelines. */
-export function describeEvent(e: TaskEvent): string {
+export function describeEvent(e: TaskEvent, language: Language = "en"): string {
+	let message: Message;
 	switch (e.kind) {
 		case "created":
-			return `created in ${e.workspace} (${e.checkout.kind}${e.playbook ? `, playbook ${e.playbook}` : ""})`;
+			message = taskMessages.created(e.workspace, e.checkout.kind, e.playbook);
+			break;
 		case "checked_out":
-			return `worktree ${e.worktree} on ${e.branch} at ${e.path}`;
+			message = taskMessages.checkedOut(e.worktree, e.branch, e.path);
+			break;
 		case "provisioned":
-			return `${e.reusedSession ? "reusing" : "new"} session ${e.session}`;
+			message = taskMessages.provisioned(e.session, e.reusedSession);
+			break;
 		case "provision_failed":
-			return `provisioning failed at ${e.step}: ${e.message}`;
+			message = taskMessages.provisionFailed(e.step, e.messageText ?? e.message);
+			break;
 		case "provision_retry":
-			return "provisioning retried";
+			message = taskMessages.provisionRetry();
+			break;
 		case "queued_for_capacity":
-			return `waiting for a worker slot (${e.live}/${e.cap} live)`;
+			message = taskMessages.queued(e.live, e.cap);
+			break;
 		case "delivered":
-			return `${e.what} delivered (outbox #${e.outbox})`;
+			message = taskMessages.delivered(e.what, e.outbox);
+			break;
 		case "run_started":
-			return `run ${e.seq} started`;
+			message = taskMessages.runStarted(e.seq);
+			break;
 		case "run_ended":
-			return `run ${e.seq} ended: ${e.stop}${e.error ? ` (${e.error})` : ""}`;
+			message = taskMessages.runEnded(e.seq, e.stop, e.error);
+			break;
 		case "reported":
-			return `report ${e.status}: ${e.summary}`;
+			message = taskMessages.reported(e.status, e.summary);
+			break;
 		case "approval_requested":
-			return `approval requested for ${e.tool}: ${e.summary}`;
+			message = taskMessages.approvalRequested(e.tool, e.summary);
+			break;
 		case "approval_resolved":
-			return e.approved ? "approved" : "denied";
+			message = taskMessages.approvalResolved(e.approved);
+			break;
 		case "human_input":
-			return `human typed: ${e.text}`;
+			message = taskMessages.humanInput(e.text);
+			break;
 		case "message_sent":
-			return `${e.by} sent (${e.mode})${e.decision ? ` with ${e.decision}` : ""}: ${e.text}`;
+			message = taskMessages.messageSent(e.by, e.mode, e.decision, e.text);
+			break;
 		case "process_lost":
-			return `process lost: ${e.reason}`;
+			message = taskMessages.processLost(e.reasonMessage ?? e.reason);
+			break;
 		case "policy_blocked":
-			return `blocked ${e.tool}: ${e.command}`;
+			message = taskMessages.policyBlocked(e.tool, e.command);
+			break;
 		case "escalated":
-			return `${e.escalation} opened by ${e.by}: ${e.reason}`;
+			message = taskMessages.escalated(e.escalation, e.by, e.by === "hub" ? e.reasonMessage ?? e.reason : e.reason);
+			break;
 		case "escalation_closed":
-			return `${e.escalation} closed: ${e.resolution}`;
+			message = taskMessages.escalationClosed(e.escalation, e.resolution);
+			break;
 		case "decided":
-			return `${e.decision}: ${e.summary}`;
+			message = taskMessages.decided(e.decision, e.summaryMessage ?? e.summary);
+			break;
 		case "accepted":
-			return `accepted as done: ${e.reason}`;
+			message = taskMessages.accepted(e.reason);
+			break;
 		case "cancelled":
-			return `cancelled by ${e.by}: ${e.reason}`;
+			message = taskMessages.cancelled(e.by, e.reasonMessage ?? e.reason);
+			break;
 		case "cleaned_up":
-			return "environment torn down and worktree removed";
+			message = taskMessages.cleanedUp();
+			break;
 	}
+	return render(message, language);
 }

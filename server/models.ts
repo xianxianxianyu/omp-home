@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
-import { THINKING_LEVELS, type ModelCatalogDTO, type ModelDTO } from "../shared/api.ts";
-import { errorText } from "./errors.ts";
+import { THINKING_LEVELS, type Language, type ModelCatalogDTO, type ModelDTO } from "../shared/api.ts";
+import { errorMessage } from "./errors.ts";
+import { render, type Message } from "./i18n.ts";
 
 const execFileP = promisify(execFile);
 const thinkingSchema = z.enum(THINKING_LEVELS);
@@ -27,10 +28,16 @@ interface ModelSource {
 	overlay?: string;
 }
 
+type Catalog = Omit<ModelCatalogDTO, "error"> & { error: string | Message | null };
+
+function catalogDTO(value: Catalog, language: Language): ModelCatalogDTO {
+	return { ...value, error: value.error === null ? null : render(value.error, language) };
+}
+
 interface Cache {
 	key: string;
-	value: ModelCatalogDTO | null;
-	pending: Promise<ModelCatalogDTO> | null;
+	value: Catalog | null;
+	pending: Promise<Catalog> | null;
 }
 
 const EMPTY_CATALOG: ModelCatalogDTO = { models: [], defaultModel: null, fetchedAt: 0, error: null };
@@ -44,20 +51,20 @@ export class ModelCatalog {
 		this.#source = source;
 	}
 
-	async get(refresh = false): Promise<ModelCatalogDTO> {
+	async get(refresh = false, language: Language = "en"): Promise<ModelCatalogDTO> {
 		let source: ModelSource;
 		try {
 			source = this.#source();
 		} catch (err) {
-			return { ...(this.#cache?.value ?? EMPTY_CATALOG), error: errorText(err) };
+			return catalogDTO({ ...(this.#cache?.value ?? EMPTY_CATALOG), error: errorMessage(err) }, language);
 		}
 		const previous = this.#cache?.value;
 		const key = JSON.stringify(source);
 		if (this.#cache?.key !== key) this.#cache = { key, value: null, pending: null };
 		const cache = this.#cache;
 		if (!refresh) {
-			if (cache.pending) return cache.pending;
-			if (cache.value) return cache.value;
+			if (cache.pending) return catalogDTO(await cache.pending, language);
+			if (cache.value) return catalogDTO(cache.value, language);
 		}
 		// Refresh mutates omp's provider cache, so it must finish before the next catalog command.
 		const request = (cache.pending ?? Promise.resolve()).then(async () => {
@@ -87,13 +94,13 @@ export class ModelCatalog {
 				}
 				cache.value = { models, defaultModel, fetchedAt: Date.now(), error: null };
 			} catch (err) {
-				cache.value = { ...(cache.value ?? previous ?? EMPTY_CATALOG), error: errorText(err) };
+				cache.value = { ...(cache.value ?? previous ?? EMPTY_CATALOG), error: errorMessage(err) };
 			}
 			return cache.value;
 		}).finally(() => {
 			if (cache.pending === request) cache.pending = null;
 		});
 		cache.pending = request;
-		return request;
+		return catalogDTO(await request, language);
 	}
 }

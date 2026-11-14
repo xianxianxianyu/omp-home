@@ -1,6 +1,8 @@
-import type { ProcState, TaskProgress, TaskStatus, WaitKind } from "../../shared/api.ts";
+import type { Language, ProcState, TaskProgress, TaskStatus, WaitKind } from "../../shared/api.ts";
 import type { StopReason } from "../../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../../shared/tools.ts";
+import { taskMessages } from "../i18n-task.ts";
+import { type Message, render } from "../i18n.ts";
 
 /** The only place task status changes are decided. Pure: no I/O. */
 
@@ -13,6 +15,8 @@ export interface Report {
 export interface Wait {
 	kind: WaitKind;
 	text: string;
+	/** Only hub-authored text carries translation metadata; text stays English for model consumers. */
+	message?: Message;
 }
 export type Status = { s: "pending" } | { s: "working" } | { s: "awaiting"; wait: Wait } | { s: "done" } | { s: "cancelled" };
 export interface TaskState {
@@ -28,7 +32,7 @@ export type TaskEvent =
 	| { kind: "created"; title: string; workspace: string; checkout: CheckoutSpec; playbook: string | null; related: string[] }
 	| { kind: "checked_out"; worktree: string; path: string; branch: string }
 	| { kind: "provisioned"; session: string; reusedSession: boolean }
-	| { kind: "provision_failed"; step: ProvisionStep; message: string }
+	| { kind: "provision_failed"; step: ProvisionStep; message: string; messageText?: Message }
 	| { kind: "provision_retry"; text: string }
 	| { kind: "queued_for_capacity"; live: number; cap: number }
 	| { kind: "delivered"; outbox: number; what: "brief" | "message" }
@@ -39,22 +43,30 @@ export type TaskEvent =
 	| { kind: "approval_resolved"; approved: boolean }
 	| { kind: "human_input"; text: string }
 	| { kind: "message_sent"; by: "main" | "human"; text: string; mode: "next" | "now"; decision: string | null }
-	| { kind: "process_lost"; reason: string }
+	| { kind: "process_lost"; reason: string; reasonMessage?: Message }
 	| { kind: "policy_blocked"; tool: string; reason: string; command: string }
-	| { kind: "escalated"; escalation: string; by: "main" | "hub"; reason: string }
+	| { kind: "escalated"; escalation: string; by: "main" | "hub"; reason: string; reasonMessage?: Message }
 	| { kind: "escalation_closed"; escalation: string; resolution: EscalationResolution }
-	| { kind: "decided"; decision: string; summary: string }
+	| { kind: "decided"; decision: string; summary: string; summaryMessage?: Message; revertMessage?: Message }
 	| { kind: "accepted"; reason: string; decision: string | null }
-	| { kind: "cancelled"; by: "main" | "human"; reason: string }
+	| { kind: "cancelled"; by: "main" | "human"; reason: string; reasonMessage?: Message }
 	| { kind: "cleaned_up" };
 
 export type TaskEventKind = TaskEvent["kind"];
 
 export const INITIAL: TaskState = { status: { s: "pending" }, runOpen: false, runReport: null };
 const WORKING: Status = { s: "working" };
-const awaiting = (kind: WaitKind, text: string): Status => ({ s: "awaiting", wait: { kind, text } });
+const awaiting = (kind: WaitKind, text: string | Message): Status => ({
+	s: "awaiting",
+	wait: typeof text === "string" ? { kind, text } : { kind, text: text.en, message: text },
+});
 const isTerminal = (s: Status) => s.s === "done" || s.s === "cancelled";
 const isWaiting = (s: Status, kind: WaitKind) => s.s === "awaiting" && s.wait.kind === kind;
+
+/** Render only known hub wording; worker reports and error payloads remain verbatim. */
+export function waitText(wait: Wait, language: Language = "en"): string {
+	return render(wait.message ?? wait.text, language);
+}
 
 function applyReport(r: Report | null): Status | null {
 	if (!r) return null;
@@ -64,10 +76,10 @@ function applyReport(r: Report | null): Status | null {
 }
 
 function stopStatus(e: Extract<TaskEvent, { kind: "run_ended" }>, progress: Report | null): Status {
-	if (e.stop === "aborted") return awaiting("aborted", e.text || "The run was aborted.");
-	if (e.stop === "error") return awaiting("error", e.error ?? (e.text || "The run failed."));
-	const final = e.text || "(no final text)";
-	return awaiting("no_report", progress ? `Progress report: ${progress.summary}\n\nFinal text: ${final}` : final);
+	if (e.stop === "aborted") return awaiting("aborted", e.text || taskMessages.waitAborted());
+	if (e.stop === "error") return awaiting("error", e.error ?? (e.text || taskMessages.waitFailed()));
+	const final = e.text || taskMessages.waitNoFinal();
+	return awaiting("no_report", progress ? taskMessages.waitProgress(progress.summary, final) : final);
 }
 
 export function foldTask(t: TaskState, e: TaskEvent): TaskState {
@@ -75,7 +87,7 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 		case "created":
 			return INITIAL;
 		case "provision_failed":
-			return t.status.s === "pending" ? { ...t, status: awaiting("provision_failed", `${e.step}: ${e.message}`) } : t;
+			return t.status.s === "pending" ? { ...t, status: awaiting("provision_failed", taskMessages.waitProvision(e.step, e.messageText ?? e.message)) } : t;
 		case "provision_retry":
 			return isWaiting(t.status, "provision_failed") ? { ...t, status: { s: "pending" } } : t;
 		case "delivered":
@@ -92,7 +104,7 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 			if (isTerminal(t.status)) return { ...t, runOpen: false, runReport: null };
 			return { status: applyReport(t.runReport) ?? stopStatus(e, t.runReport), runOpen: false, runReport: null };
 		case "approval_requested":
-			return isTerminal(t.status) ? t : { ...t, status: awaiting("approval", `${e.tool}: ${e.summary}`) };
+			return isTerminal(t.status) ? t : { ...t, status: awaiting("approval", taskMessages.waitApproval(e.tool, e.summary)) };
 		case "approval_resolved":
 			return isWaiting(t.status, "approval") ? { ...t, status: WORKING } : t;
 		case "human_input":
@@ -100,7 +112,7 @@ export function foldTask(t: TaskState, e: TaskEvent): TaskState {
 		case "message_sent":
 			return t.status.s === "pending" ? t : { ...t, status: WORKING };
 		case "process_lost":
-			if (t.status.s === "working" || isWaiting(t.status, "approval")) return { status: awaiting("interrupted", e.reason), runOpen: false, runReport: null };
+			if (t.status.s === "working" || isWaiting(t.status, "approval")) return { status: awaiting("interrupted", e.reasonMessage ?? e.reason), runOpen: false, runReport: null };
 			return { ...t, runOpen: false, runReport: null };
 		case "accepted":
 			return { ...t, status: { s: "done" } };

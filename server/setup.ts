@@ -2,9 +2,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import type { SetupPreview } from "../shared/api.ts";
+import type { Language, SetupPreview } from "../shared/api.ts";
 import { homePaths } from "./config.ts";
 import { HubError } from "./errors.ts";
+import { render, type Message } from "./i18n.ts";
+import { manifestReason, validationMessages as m } from "./i18n-validation.ts";
 import { DEFAULT_PSTACK_ROOT, isPstackRoot } from "./settings.ts";
 
 const entrySchema = z.object({
@@ -112,8 +114,9 @@ export function pstackCandidates(home: string): string[] {
 	return [...new Set(guesses)].filter(isPstackRoot);
 }
 
-export function previewSetup(homeInput: string, templatesRoot: string): SetupPreview {
-	if (!path.isAbsolute(homeInput)) throw new HubError("invalid", "home path must be absolute");
+/** What setup would change. Reasons render in `language` for the UI; what applySetup writes does not depend on it. */
+export function previewSetup(homeInput: string, templatesRoot: string, language: Language = "en"): SetupPreview {
+	if (!path.isAbsolute(homeInput)) throw new HubError("invalid", m.homeNotAbsolute());
 	const home = path.resolve(homeInput);
 	const exists = fs.existsSync(home);
 	let isGitRepo = false;
@@ -125,14 +128,13 @@ export function previewSetup(homeInput: string, templatesRoot: string): SetupPre
 		}
 	}
 	const changes: Change[] = [];
-	if (gitignoreNeedsLine(home)) {
-		changes.push({ path: ".gitignore", action: fs.existsSync(path.join(home, ".gitignore")) ? "replace" : "create", reason: `add ${GITIGNORE_LINE}: hub database, transcripts and logs stay out of git` });
-	}
+	const add = (target: string | Message, action: Change["action"], reason: Message) => changes.push({ path: render(target, language), action, reason: render(reason, language) });
+	if (gitignoreNeedsLine(home)) add(".gitignore", fs.existsSync(path.join(home, ".gitignore")) ? "replace" : "create", m.gitignoreReason(GITIGNORE_LINE));
 	for (const { entry, effect } of plan(home, templatesRoot)) {
 		if (effect === "none") continue;
-		const reason = entry.action === "section" ? `section "${entry.heading}": ${entry.reason}` : entry.reason;
-		changes.push({ path: entry.path, action: effect, reason });
-		if (effect === "replace") changes.push({ path: `.omp-home/backup/<setup time>/${entry.path}`, action: "backup", reason: `previous ${entry.path}` });
+		const reason = manifestReason(entry.path) ?? { en: entry.reason, zh: entry.reason };
+		add(entry.path, effect, entry.action === "section" ? m.sectionReason(entry.heading!, reason) : reason);
+		if (effect === "replace") add(m.backupPath(entry.path), "backup", m.backupReason(entry.path));
 	}
 	return { homePath: home, exists, isGitRepo, changes, pstackCandidates: pstackCandidates(home) };
 }
