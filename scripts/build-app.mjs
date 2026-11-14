@@ -42,7 +42,7 @@ if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const version = process.env.OMP_HOME_APP_VERSION ?? pkg.version;
 if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(version)) throw new Error(`Invalid app version: ${version}`);
-const repository = process.env.OMP_HOME_RELEASE_REPOSITORY ?? 'OWNER/omp-home';
+const repository = process.env.OMP_HOME_RELEASE_REPOSITORY ?? 'xianxianxianyu/omp-home';
 if (!/^[\w.-]+\/[\w.-]+$/.test(repository)) throw new Error('OMP_HOME_RELEASE_REPOSITORY must be owner/repo');
 const endpoint = new URL(process.env.OMP_HOME_UPDATER_ENDPOINT ?? `https://github.com/${repository}/releases/latest/download/latest.json`);
 const localUpdate = endpoint.protocol === 'http:' && endpoint.hostname === '127.0.0.1';

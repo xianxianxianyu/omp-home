@@ -12,7 +12,7 @@ pnpm install
 pnpm tauri signer generate --ci -p '' -w ~/.config/omp-home-release/updater.key
 # If generating a new key, replace plugins.updater.pubkey in src-tauri/tauri.conf.json
 # with the contents of updater.key.pub before distributing any app.
-OMP_HOME_RELEASE_REPOSITORY=your-owner/your-repo pnpm build:app
+pnpm build:app   # set OMP_HOME_RELEASE_REPOSITORY=owner/repo when publishing from a fork
 ```
 
 A signing keypair has already been generated on this workstation at `~/.config/omp-home-release/updater.key`; its public half is committed in `src-tauri/tauri.conf.json`. Do not overwrite that key when publishing updates for installations using that public key. The private key is not in the repository. Key generation uses an empty password; set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if using a password-protected replacement.
@@ -23,7 +23,7 @@ A signing keypair has already been generated on this workstation at `~/.config/o
 - `desktop/src-tauri/target/release/bundle/dmg/*.dmg`
 - `desktop/src-tauri/target/release/bundle/macos/omp-home.app.tar.gz` and `.sig`
 
-The app version comes from root `package.json`; `OMP_HOME_APP_VERSION` overrides it only for a particular build, without modifying repository files. `OMP_HOME_RELEASE_REPOSITORY` configures the updater's GitHub owner/repo. Its deliberately nonfunctional default is `OWNER/omp-home`; set the real repository for distribution. `OMP_HOME_UPDATER_ENDPOINT` replaces the endpoint at build time. Only HTTPS or `http://127.0.0.1:<port>/…` is accepted; insecure transport is enabled only for the explicit loopback override. Subsequent builds without that override restore the normal HTTPS endpoint; the source config is never rewritten.
+The app version comes from root `package.json`; `OMP_HOME_APP_VERSION` overrides it only for a particular build, without modifying repository files. `OMP_HOME_RELEASE_REPOSITORY` configures the updater's GitHub owner/repo. Its default is `xianxianxianyu/omp-home`; set it when publishing from a fork. `OMP_HOME_UPDATER_ENDPOINT` replaces the endpoint at build time. Only HTTPS or `http://127.0.0.1:<port>/…` is accepted; insecure transport is enabled only for the explicit loopback override. Subsequent builds without that override restore the normal HTTPS endpoint; the source config is never rewritten.
 
 ## First launch
 
@@ -48,7 +48,7 @@ Logs are appended to `~/Library/Logs/omp-home/desktop.log` with owner-only permi
 To generate a manifest locally:
 
 ```sh
-OMP_HOME_RELEASE_REPOSITORY=your-owner/your-repo pnpm updater:json
+pnpm updater:json
 # Overrides: --bundle-dir DIR --url URL --notes TEXT --output FILE
 ```
 

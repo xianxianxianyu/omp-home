@@ -21,7 +21,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNGNEYwMTY3RkZEOEUxQUUKUldTdTRkai9ad0ZQUDhGQVE3MmlacU4wSnhnSGs0YXpOMXNNRjI1NVdEKzRDOHo1ellEbVdES2MK",
-      "endpoints": ["https://github.com/OWNER/omp-home/releases/latest/download/latest.json"]
+      "endpoints": ["https://github.com/xianxianxianyu/omp-home/releases/latest/download/latest.json"]
     }
   }
 }
