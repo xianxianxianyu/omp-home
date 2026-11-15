@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
-import type { Language, StateDTO } from "../shared/api.ts";
+import { MAX_PROMPT_IMAGE_BYTES, MAX_PROMPT_IMAGES, PROMPT_IMAGE_TYPES, type AbortResult, type Language, type StateDTO } from "../shared/api.ts";
 import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId, parseWorktreeId } from "../shared/ids.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError, localizeFieldErrors } from "./errors.ts";
@@ -35,6 +35,7 @@ interface Route {
 	method: string;
 	pattern: RegExp;
 	handler: Handler;
+	bodyLimit: number;
 }
 
 const MIME: Record<string, string> = {
@@ -53,6 +54,8 @@ const MIME: Record<string, string> = {
 };
 
 const BODY_LIMIT = 4 * 1024 * 1024;
+/** A message with the most and largest images it may carry, base64-encoded (4 characters per 3 bytes). */
+const MESSAGE_BODY_LIMIT = BODY_LIMIT + MAX_PROMPT_IMAGES * Math.ceil(MAX_PROMPT_IMAGE_BYTES / 3) * 4;
 const LOOPBACK = ["127.0.0.1", "localhost", "[::1]"];
 
 const setupSchema = z.strictObject({
@@ -72,7 +75,23 @@ const pickFolderSchema = z.strictObject({
 const removeSchema = z.strictObject({ deleteBranch: z.boolean() });
 const keepSchema = z.strictObject({ keep: z.boolean() });
 const taskStatusFilter = z.enum(["pending", "working", "awaiting", "done", "cancelled", "open", "closed"]);
-const promptSchema = z.strictObject({ text: z.string().min(1).max(20_000), mode: z.enum(["auto", "steer", "followUp"]).optional() });
+const imagesSchema = z
+	.array(
+		z.strictObject({
+			data: z.base64().refine(data => data.length > 0 && Buffer.byteLength(data, "base64") <= MAX_PROMPT_IMAGE_BYTES, localizedCheck(validationMessages.imageTooLarge(MAX_PROMPT_IMAGE_BYTES / 1024 / 1024))),
+			mimeType: z.enum(PROMPT_IMAGE_TYPES),
+		}),
+	)
+	.max(MAX_PROMPT_IMAGES)
+	.default([]);
+const promptSchema = z
+	.strictObject({ text: z.string().max(20_000), images: imagesSchema, mode: z.enum(["auto", "steer", "followUp"]).optional() })
+	.refine(p => p.text.length > 0 || p.images.length > 0, { ...localizedCheck(validationMessages.textOrImages()), path: ["text"] });
+const editSchema = z
+	.strictObject({ itemId: z.string().min(1), text: z.string().max(20_000), images: imagesSchema })
+	.refine(p => p.text.length > 0 || p.images.length > 0, { ...localizedCheck(validationMessages.textOrImages()), path: ["text"] });
+const queueRemoveSchema = z.strictObject({ message: z.string(), queue: z.enum(["steering", "followUp"]) });
+const queuePromoteSchema = z.strictObject({ message: z.string() });
 const respondSchema = z.strictObject({
 	requestId: z.string().min(1),
 	response: z.union([
@@ -225,7 +244,7 @@ export class HubServer {
 			return;
 		}
 		try {
-			const body = method === "GET" ? undefined : await readJson(req);
+			const body = method === "GET" ? undefined : await readJson(req, match.r.bodyLimit);
 			const params = match.m!.slice(1).map(p => decodeURIComponent(p));
 			const result = await match.r.handler({ params, url, body, language });
 			send(200, result);
@@ -323,8 +342,8 @@ export class HubServer {
 		};
 	}
 
-	#route(method: string, pattern: string, handler: Handler): void {
-		this.#routes.push({ method, pattern: new RegExp(`^${pattern.replace(/:[a-z]+/g, "([^/]+)")}$`), handler });
+	#route(method: string, pattern: string, handler: Handler, bodyLimit = BODY_LIMIT): void {
+		this.#routes.push({ method, pattern: new RegExp(`^${pattern.replace(/:[a-z]+/g, "([^/]+)")}$`), handler, bodyLimit });
 	}
 
 	#defineRoutes(): void {
@@ -449,13 +468,34 @@ export class HubServer {
 			await h.pool.retire(id);
 			return h.sessionDTO(h.pool.must(id));
 		});
-		r("POST", "/api/sessions/:id/prompt", async ({ params, body }) => {
-			const p = parse(promptSchema, body);
-			await hub().prompt(parseSessionId(params[0]), p.text, p.mode ?? "auto");
-			return { ok: true };
+		r(
+			"POST",
+			"/api/sessions/:id/prompt",
+			async ({ params, body }) => {
+				const p = parse(promptSchema, body);
+				await hub().prompt(parseSessionId(params[0]), p.text, p.mode ?? "auto", p.images);
+				return { ok: true };
+			},
+			MESSAGE_BODY_LIMIT,
+		);
+		r("POST", "/api/sessions/:id/abort", async ({ params }): Promise<AbortResult> => ({ restored: await hub().abort(parseSessionId(params[0])) }));
+		r("POST", "/api/sessions/:id/queue/remove", async ({ params, body }) => {
+			const p = parse(queueRemoveSchema, body);
+			return { removed: await hub().removeQueued(parseSessionId(params[0]), p.message, p.queue) };
 		});
-		r("POST", "/api/sessions/:id/abort", async ({ params }) => {
-			await hub().abort(parseSessionId(params[0]));
+		r("POST", "/api/sessions/:id/queue/promote", async ({ params, body }) => ({ promoted: await hub().promoteQueued(parseSessionId(params[0]), parse(queuePromoteSchema, body).message) }));
+		r(
+			"POST",
+			"/api/sessions/:id/edit",
+			async ({ params, body }) => {
+				const p = parse(editSchema, body);
+				await hub().edit(parseSessionId(params[0]), p.itemId, p.text, p.images);
+				return { ok: true };
+			},
+			MESSAGE_BODY_LIMIT,
+		);
+		r("POST", "/api/sessions/:id/retry", async ({ params }) => {
+			await hub().retry(parseSessionId(params[0]));
 			return { ok: true };
 		});
 		r("POST", "/api/sessions/:id/respond", async ({ params, body }) => {
@@ -560,13 +600,13 @@ export class HubServer {
 	}
 }
 
-async function readJson(req: http.IncomingMessage): Promise<unknown> {
+async function readJson(req: http.IncomingMessage, limit: number): Promise<unknown> {
 	const chunks: Buffer[] = [];
 	let size = 0;
 	for await (const chunk of req) {
 		const buf = chunk as Buffer;
 		size += buf.length;
-		if (size > BODY_LIMIT) throw new HubError("invalid", messages.bodyTooLarge());
+		if (size > limit) throw new HubError("invalid", messages.bodyTooLarge());
 		chunks.push(buf);
 	}
 	if (!size) return undefined;

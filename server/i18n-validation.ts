@@ -6,6 +6,8 @@ const en = {
 	notPstackRoot: () => "not a pstack root: skills/poteto-mode/SKILL.md is missing",
 	portRangeTooSmall: () => "the range needs at least 10 ports",
 	absolutePath: () => "must be an absolute path",
+	imageTooLarge: (mb: number) => `each image must be at most ${mb} MB`,
+	textOrImages: () => "type a message or attach an image",
 
 	homeNotAbsolute: () => "home path must be absolute",
 	gitignoreReason: (line: string) => `add ${line}: hub database, transcripts and logs stay out of git`,
@@ -41,6 +43,8 @@ export const validationMessages = defineMessages(en, {
 	notPstackRoot: () => "不是 pstack 根目录：缺少 skills/poteto-mode/SKILL.md",
 	portRangeTooSmall: () => "端口范围至少要包含 10 个端口",
 	absolutePath: () => "必须是绝对路径",
+	imageTooLarge: mb => `每张图片不能超过 ${mb} MB`,
+	textOrImages: () => "输入消息或添加图片",
 
 	homeNotAbsolute: () => "home 仓库路径必须是绝对路径",
 	gitignoreReason: line => `添加 ${line}：中枢数据库、会话记录和日志不纳入 git`,

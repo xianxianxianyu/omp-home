@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { emptyTranscript, MAX_ITEMS, reduceTranscript, type Item, type TranscriptEvent, type TranscriptView } from "../shared/transcript.ts";
 import { SessionViews } from "../server/session-views.ts";
 import { render } from "../server/i18n.ts";
-import { answerEvent, answerText, currentIntent, historyView, Normalizer, responseFits, TOOL_OUTPUT_LIMIT, uiRequestOf } from "../server/transcript.ts";
+import { answerEvent, answerText, branchEntry, currentIntent, historyView, Normalizer, responseFits, TOOL_OUTPUT_LIMIT, uiRequestOf } from "../server/transcript.ts";
 
 /**
  * Recorded omp 18.20 RPC frames (main session: home_status, bash, a `task` subagent that
@@ -154,7 +154,7 @@ test("history pages become items with tool results; IRC notices keep their live 
 });
 
 test("session views: bounded live window, older items paged by cursor, reset on reseed", () => {
-	const views = new SessionViews(() => {});
+	const views = new SessionViews(() => {}, () => new Set());
 	const user = (i: number) => ({ role: "user", content: [{ type: "text", text: `m${i}` }], timestamp: i, attribution: "user" });
 	views.seed("M-1", { messages: Array.from({ length: MAX_ITEMS + 150 }, (_, i) => user(i)), commands: { commands: [{ name: "help", description: "Show help", source: "builtin" }] }, state: { isStreaming: false, isSettled: true, model: { id: "opus" }, contextUsage: { percent: 12.345 } } });
 	const sent: TranscriptEvent[] = [];
@@ -188,6 +188,24 @@ test("session views: bounded live window, older items paged by cursor, reset on 
 	assert.deepEqual(views.openRequest("M-1", "q1"), { method: "confirm", title: "Proceed?", message: "Really?" });
 	views.ended("M-1");
 	assert.throws(() => views.openRequest("M-1", "q1"), /already answered \(Session ended\)/);
+});
+
+test("a message the human sent maps to omp's branch entry by text, repeats counted from the end", () => {
+	const views = new SessionViews(() => {}, () => new Set());
+	const msg = (text: string, attribution = "user") => ({ role: "user", content: [{ type: "text", text }], timestamp: 1, attribution });
+	views.seed("M-1", { messages: [msg("again"), msg("other"), msg("Summary so far", "agent"), msg("again")], commands: null, state: null });
+	// omp lists one more, older "again" that the view no longer shows (compacted away).
+	const branch = { messages: [{ entryId: "e0", text: "again" }, { entryId: "e1", text: "again" }, { entryId: "e2", text: "other" }, { entryId: "e4", text: "again" }] };
+	const first = views.humanMessage("M-1", "h0");
+	assert.deepEqual(first, { text: "again", images: 0, sameAfter: 1 });
+	assert.equal(branchEntry(branch, first.text, first.sameAfter), "e1");
+	const last = views.humanMessage("M-1", null);
+	assert.equal(branchEntry(branch, last.text, last.sameAfter), "e4");
+	assert.equal(branchEntry(branch, "gone", 0), null);
+	assert.equal(branchEntry(branch, "other", 1), null);
+	assert.throws(() => views.humanMessage("M-1", "h2"), /not sent by you/);
+	assert.throws(() => views.humanMessage("M-1", "h9"), /no message h9 in M-1/);
+	assert.throws(() => new SessionViews(() => {}, () => new Set()).humanMessage("W-1", null), /no message of yours/);
 });
 
 test("dialog requests: shapes, fitting answers and their one-line rendering", () => {
@@ -265,7 +283,7 @@ test("tool output metadata propagates and clears without changing raw text", () 
 });
 
 test("session streams render each language independently without translating model or human text", () => {
-	const views = new SessionViews(() => {});
+	const views = new SessionViews(() => {}, () => new Set());
 	let en = emptyTranscript();
 	let zh = emptyTranscript();
 	const stopEn = views.subscribe("M-1", event => {

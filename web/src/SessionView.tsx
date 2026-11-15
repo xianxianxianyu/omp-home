@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CommandDTO, PromptRequest, RespondRequest } from "../../shared/api.ts";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { AbortResult, CommandDTO, EditRequest, RespondRequest } from "../../shared/api.ts";
 import { emptyTranscript, reduceTranscript } from "../../shared/transcript.ts";
 import type { Item, SubagentView, TranscriptEvent, TranscriptView, UiResponse } from "../../shared/transcript.ts";
 import { api } from "./api.ts";
@@ -8,7 +8,9 @@ import { useI18n, useT } from "./i18n/index.tsx";
 import { connectSocket } from "./transport.ts";
 import type { HubSocket } from "./transport.ts";
 import { transcriptEvent } from "./transcript-schema.ts";
+import { Composer, QueueChips, appendParagraphs, useDraft } from "./Composer.tsx";
 import { TranscriptItem } from "./TranscriptItems.tsx";
+import type { MessageActions } from "./TranscriptItems.tsx";
 import "./session.css";
 
 const PAGE_SIZE = 60;
@@ -60,55 +62,6 @@ function useSession(sessionId: string) {
 	return { view, connected, error: error?.kind === "commands" ? t.commandsError(error.message) : error?.kind === "invalidEvent" ? t.invalidEvent : error?.kind === "capacity" ? error.reason || t.noWorkerSlot : null, commands, generation, history, setHistory, blocked, retry: () => setRetryToken(value => value + 1) };
 }
 
-function Composer({ sessionId, connected, running, commands, focused, main, abort, meta, escapeAborts, onNewChat }: { sessionId: string; connected: boolean; running: boolean; commands: CommandDTO[]; focused: boolean; main: boolean; abort: () => Promise<void>; meta: string; escapeAborts: boolean; onNewChat?: () => void }) {
-	const catalog = useT();
-	const t = catalog.session.composer;
-	const shell = catalog.shell.app;
-	const { noteComposerInput } = useHub();
-	const [text, setText] = useState("");
-	const [mode, setMode] = useState<"auto" | "steer">("auto");
-	const [pending, setPending] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const [selected, setSelected] = useState(0);
-	const [menuDismissed, setMenuDismissed] = useState(false);
-	const input = useRef<HTMLTextAreaElement>(null);
-	const composing = useRef(false);
-	const compositionEnded = useRef(0);
-	const query = text.match(/^\/([^\s]*)$/)?.[1].toLowerCase();
-	const matches = query === undefined ? [] : commands.flatMap(command => {
-		if (command.name.toLowerCase().startsWith(query)) return [{ command, score: 0 }];
-		for (const [score, value] of [command.name, command.description ?? ""].entries()) {
-			let index = 0;
-			for (const char of value.toLowerCase()) if (char === query[index]) index++;
-			if (index === query.length) return [{ command, score: score + 1 }];
-		}
-		return [];
-	}).sort((a, b) => a.score - b.score).slice(0, 8).map(match => match.command);
-	const menuOpen = matches.length > 0 && !menuDismissed;
-	useEffect(() => { if (focused && !main) input.current?.focus(); }, [focused, main]);
-	useEffect(() => { const focus = () => { if (main) input.current?.focus(); }; window.addEventListener("focus-main", focus); return () => window.removeEventListener("focus-main", focus); }, [main]);
-	const send = async () => {
-		if (!text.trim() || pending || !connected || composing.current) return;
-		setPending(true); setError(null);
-		try { await api(`/api/sessions/${encodeURIComponent(sessionId)}/prompt`, { body: { text, mode: running ? mode : "auto" } satisfies PromptRequest }); setText(""); setMenuDismissed(false); }
-		catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
-		finally { setPending(false); }
-	};
-	const chooseCommand = (command: CommandDTO) => { setText(`/${command.name} `); setMenuDismissed(false); input.current?.focus(); noteComposerInput(); };
-	return <div className="composer">
-		{menuOpen && <div className="command-menu" role="listbox" aria-label={t.slashCommands}>{matches.map((command, index) => <button role="option" aria-selected={index === selected} key={command.name} className={index === selected ? "selected" : ""} onMouseDown={event => event.preventDefault()} onClick={() => chooseCommand(command)}><strong>/{command.name}</strong><span>{command.description ?? command.source}</span></button>)}</div>}
-		<textarea ref={input} aria-label={t.messageLabel(sessionId)} placeholder={running && mode === "steer" ? t.steerPlaceholder : t.placeholder} value={text} rows={2} disabled={pending} onChange={event => { setText(event.target.value); setSelected(0); setMenuDismissed(false); noteComposerInput(); }} onCompositionStart={() => { composing.current = true; noteComposerInput(); }} onCompositionEnd={() => { composing.current = false; compositionEnded.current = performance.now(); }} onKeyDown={event => {
-			if (event.nativeEvent.isComposing || composing.current || event.keyCode === 229) return;
-			if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (menuOpen) setMenuDismissed(true); else if (running && escapeAborts) void abort(); return; }
-			if (menuOpen && (event.key === "ArrowDown" || event.key === "ArrowUp")) { event.preventDefault(); setSelected(index => (index + (event.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length); return; }
-			if (menuOpen && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) { if (performance.now() - compositionEnded.current < 80) return; event.preventDefault(); chooseCommand(matches[selected] ?? matches[0]); return; }
-			if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (performance.now() - compositionEnded.current >= 80) void send(); }
-		}} />
-		<div className="composer-actions"><span className="composer-meta mono" title={t.keyboardHint}>{meta}</span>{onNewChat && <button type="button" className="link-button composer-new-chat" title={shell.newChatHint} onClick={onNewChat}>{shell.newChat}</button>}<span className="spacer" />{running && <button className={`btn small ${mode === "steer" ? "steer-active" : ""}`} aria-pressed={mode === "steer"} title={t.modeHint} onClick={() => setMode(value => value === "auto" ? "steer" : "auto")}>{mode === "steer" ? t.steer : t.followUp}</button>}<button className="btn primary small" disabled={!connected || pending || !text.trim()} onClick={() => void send()}>{pending ? t.sending : t.send}</button></div>
-		{error && <div className="error-text" role="alert">{error}</div>}
-	</div>;
-}
-
 function SubagentPanel({ agents, selected, select, close, sessionId, connected }: { agents: Record<string, SubagentView>; selected: string | null; select: (id: string) => void; close: () => void; sessionId: string; connected: boolean }) {
 	const t = useT().session.agents;
 	const { format } = useI18n();
@@ -142,6 +95,12 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 	const follow = useRef(true);
 	const [drawer, setDrawer] = useState(false);
 	const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+	const [draft, setDraft] = useDraft(sessionId);
+	const [restored, setRestored] = useState(false);
+	const [stopping, setStopping] = useState(false);
+	/** Item the run was stopped after; a local "Stopped" marker goes there unless omp's aborted message already shows one. */
+	const [stopAnchor, setStopAnchor] = useState<string | null>(null);
+	const input = useRef<HTMLTextAreaElement>(null);
 	const scroll = useRef<HTMLDivElement>(null);
 	const content = useRef<HTMLDivElement>(null);
 	const running = view.status.phase !== "idle";
@@ -158,6 +117,9 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 	const start = Math.max(0, end - PAGE_SIZE);
 	const items = combined.items.slice(start, end);
 	const cursor = history ? history.earlierCursor : view.earlierCursor;
+	const stopIndex = stopAnchor === null ? -1 : combined.items.findIndex(item => item.id === stopAnchor);
+	const stopMarker = stopIndex >= 0 && !combined.items.slice(stopIndex).some(item => item.kind === "assistant" && item.stopReason === "aborted");
+	const lastAssistantId = useMemo(() => combined.items.findLast(item => item.kind === "assistant")?.id ?? null, [combined.items]);
 	const jump = () => { setEndId(null); follow.current = true; setFollowing(true); requestAnimationFrame(() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }); };
 	useLayoutEffect(() => { if (follow.current && endId === null && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [view, focused, endId]);
 	useEffect(() => { const observer = new ResizeObserver(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }); if (content.current) observer.observe(content.current); return () => observer.disconnect(); }, []);
@@ -176,25 +138,38 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 		} catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
 		finally { setLoadingHistory(false); }
 	};
+	const toComposer = useCallback((texts: string[]) => { setDraft(current => appendParagraphs(current, texts)); input.current?.focus(); }, [setDraft]);
+	const lastItemId = view.items.at(-1)?.id ?? null;
 	const abort = useCallback(async () => {
-		try { await api(`${base}/abort`, { method: "POST" }); setActionError(null); }
+		setStopping(true);
+		try {
+			const result = await api<AbortResult>(`${base}/abort`, { method: "POST" });
+			setActionError(null); setStopAnchor(lastItemId);
+			if (result.restored.length) { toComposer(result.restored); setRestored(true); }
+		}
+		catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
+		finally { setStopping(false); }
+	}, [base, lastItemId, toComposer]);
+	const respond = useCallback(async (requestId: string, response: UiResponse) => { await api(`${base}/respond`, { body: { requestId, response } satisfies RespondRequest }); }, [base]);
+	const edit = useCallback(async (itemId: string, text: string) => { await api(`${base}/edit`, { body: { itemId, text } satisfies EditRequest }); }, [base]);
+	const retryTurn = useCallback(async () => {
+		try { await api(`${base}/retry`, { method: "POST" }); setActionError(null); }
 		catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
 	}, [base]);
-	const respond = useCallback(async (requestId: string, response: UiResponse) => { await api(`${base}/respond`, { body: { requestId, response } satisfies RespondRequest }); }, [base]);
+	const actions = useMemo<MessageActions>(() => ({ running, connected, main, lastAssistantId, edit, retry: retryTurn }), [running, connected, main, lastAssistantId, edit, retryTurn]);
 	const openAgent = useCallback((id: string) => { setSelectedAgent(id); setDrawer(true); }, []);
 	return <section className="session-view" aria-label={t.label(sessionId)} onKeyDown={event => { if (event.key === "Escape" && escapeAborts && running && !event.nativeEvent.isComposing && !document.querySelector("[data-modal]")) { event.preventDefault(); void abort(); } }}>
-		{(running || view.status.phase === "compacting" || !view.status.settled || Object.keys(view.subagents).length > 0) && <div className="session-activity">{(running || view.status.phase === "compacting" || !view.status.settled) && <span className="activity-state"><span className={`phase-indicator ${running ? "spinning" : ""}`} />{view.status.phase === "running" ? t.working : view.status.phase === "compacting" ? t.compacting : t.waitingForAgents}</span>}{Object.keys(view.subagents).length > 0 && <button className={`btn small ${drawer ? "steer-active" : ""}`} aria-expanded={drawer} onClick={() => { setDrawer(value => !value); if (!selectedAgent) setSelectedAgent(Object.keys(view.subagents)[0] ?? null); }}>{t.agents.title} <span className="agent-count">{format.number(Object.keys(view.subagents).length)}</span></button>}{running && <button className="btn small danger" disabled={!connected} title={escapeAborts ? t.stopEscapeHint : t.stopHint} onClick={() => void abort()}>{t.stop}</button>}</div>}
+		{(running || view.status.phase === "compacting" || !view.status.settled || Object.keys(view.subagents).length > 0) && <div className="session-activity">{(running || view.status.phase === "compacting" || !view.status.settled) && <span className="activity-state"><span className={`phase-indicator ${running ? "spinning" : ""}`} />{view.status.phase === "running" ? t.working : view.status.phase === "compacting" ? t.compacting : t.waitingForAgents}</span>}{Object.keys(view.subagents).length > 0 && <button className={`btn small ${drawer ? "steer-active" : ""}`} aria-expanded={drawer} onClick={() => { setDrawer(value => !value); if (!selectedAgent) setSelectedAgent(Object.keys(view.subagents)[0] ?? null); }}>{t.agents.title} <span className="agent-count">{format.number(Object.keys(view.subagents).length)}</span></button>}{running && <button className="btn small danger" disabled={!connected || stopping} title={escapeAborts ? t.stopEscapeHint : t.stopHint} onClick={() => void abort()}>{t.stop}</button>}</div>}
 		{(!connected || error) && <div className="session-connection" role="status">{error ?? t.connecting(sessionId)}{blocked && <button className="btn small" onClick={retry}>{t.retry}</button>}</div>}
 		<div className="transcript-scroll" ref={scroll} onScroll={() => { const element = scroll.current; if (!element) return; const atBottom = endId === null && element.scrollHeight - element.scrollTop - element.clientHeight < 60; follow.current = atBottom; setFollowing(atBottom); }}><div className="transcript-content" ref={content}>
 			{(start > 0 || cursor) && <button className="history-button" disabled={loadingHistory || !connected} onClick={() => void earlier()}>{loadingHistory ? t.loadingHistory : t.earlierMessages}</button>}
-			{items.map(item => <TranscriptItem key={item.id} item={item} view={combined} respond={connected ? respond : undefined} openAgent={openAgent} />)}
+			{items.map(item => <Fragment key={item.id}><TranscriptItem item={item} view={combined} respond={connected ? respond : undefined} openAgent={openAgent} actions={actions} />{stopMarker && item.id === stopAnchor && <div className="stopped-marker">{t.message.stopped}</div>}</Fragment>)}
 			{connected && !items.length && <div className="session-empty"><span className="brand">{t.emptyTitle}</span><p>{t.emptyDescription}</p></div>}
 			{endId !== null && <button className="history-button" onClick={() => { const next = combined.items[end + PAGE_SIZE]; setEndId(next?.id ?? null); if (scroll.current) scroll.current.scrollTop = 0; }}>{t.newerMessages}</button>}
 		</div></div>
-		{!following && <button className="jump-latest" onClick={jump}>{t.jumpLatest}</button>}
-		<div className="session-bottom">{actionError && <div className="session-error" role="alert">{actionError}</div>}{(view.status.queue.steering.length > 0 || view.status.queue.followUp.length > 0) && <div className="queue-chips">{(["steering", "followUp"] as const).flatMap(kind => view.status.queue[kind].map((text, index) => <span key={`${kind}-${index}`} title={text} className={`queue-chip ${kind}`}>{kind === "steering" ? t.steer : t.queued} · {text}</span>))}</div>}
+		<div className="session-bottom">{!following && <button className="jump-latest" onClick={jump}>{t.jumpLatest}</button>}{actionError && <div className="session-error" role="alert">{actionError}</div>}<QueueChips sessionId={sessionId} queue={view.status.queue} connected={connected} edit={text => toComposer([text])} />
 			{Object.entries(view.status.statusLine).map(([key, line]) => <div className="extension-status" key={key}>{line}</div>)}{Object.entries(view.status.widgets).map(([key, lines]) => <details className="extension-widget" key={key}><summary>{key}</summary><pre>{lines.join("\n")}</pre></details>)}
-			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} abort={abort} escapeAborts={escapeAborts} onNewChat={onNewChat} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
+			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} input={input} text={draft} setText={setDraft} note={restored ? t.composer.restored : null} clearNote={() => setRestored(false)} abort={abort} stopping={stopping} escapeAborts={escapeAborts} onNewChat={onNewChat} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
 		</div>{drawer && <SubagentPanel agents={view.subagents} selected={selectedAgent} select={setSelectedAgent} close={() => setDrawer(false)} sessionId={sessionId} connected={connected} />}
 	</section>;
 }

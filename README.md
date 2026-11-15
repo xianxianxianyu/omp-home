@@ -38,6 +38,7 @@ Running agents on several repositories at once means juggling terminals, re-expl
 | 📨 **Reports go to the main chat first** | Worker outcomes are batched into the main chat. It wakes itself at most 3 times in a row, then waits for you. |
 | 🧾 **Decisions you can audit and revert** | Every decision taken on your behalf records why and how to undo it. |
 | 💬 **A real front end for omp** | omp runs headless in RPC mode. Thinking is folded, tool calls are cards, approvals and ask dialogs are inline, subagents have their own transcripts, and IRC messages between agents appear as notices. |
+| ⏹️ **Chat controls** | Stop a turn and get queued messages back in the editor; queue a message for after the turn or send it into the running turn; edit, remove or send a queued message now; edit any message you sent (the conversation rewinds to it) or retry the last answer; drafts per conversation, ↑ to recall, images by paste or drop. |
 | 🔍 **Lossless, searchable memory** | Every main-chat message is captured into SQLite with full-text search that works for Chinese. The main chat's working context rolls over through omp's notes, so nothing is deleted. |
 | 🛡️ **Guardrails** | Workers cannot use `ask`, push, merge into protected branches, or delete branches. This is enforced in the tool layer and by a git pre-push hook. |
 | 🔄 **Signed auto-updates** | The app checks GitHub Releases at launch, every 6 hours and on demand, and verifies every update's signature before installing it. |

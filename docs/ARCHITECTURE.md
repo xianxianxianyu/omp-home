@@ -29,6 +29,8 @@ flowchart LR
 
 A hub restart ends every omp process. Sessions resume from their JSONL with `--resume <file>`; runs cut mid-turn are flagged `interrupted` and never replayed automatically.
 
+Stopping a run uses omp's `abort_and_restore_queue`: input queued behind the run is withdrawn with it, never stranded. The human's goes back to the composer; a prompt the hub delivered (an outbox row) goes back to the outbox as a new row and is sent again. omp attributes hub-delivered prompts to the user, so the session view marks user messages whose text is an outbox prompt of that session as agent input; only the human's own messages can be edited. Editing or retrying a message the human sent rewinds omp with `branch` (omp continues in a new session file, which the hub records for resume), rebuilds the session's view from omp's history (a `reset` to every viewer), then sends the text as a new prompt; the main chat's capture record stays append-only.
+
 ## State ownership
 
 | State | Owner module | Storage |

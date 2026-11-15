@@ -272,7 +272,7 @@ window.setInterval(() => {
 				}
 				return response(task);
 			}
-			if (route === "sessions" && id && action && ["prompt", "abort", "respond", "commands", "history", "subagents"].includes(action)) {
+			if (route === "sessions" && id && action && ["prompt", "abort", "queue", "edit", "retry", "respond", "commands", "history", "subagents"].includes(action)) {
 				const result = sessionMock.request(id, action, body, parts, url.searchParams.get("before"));
 				if (action === "respond" && id === escalation.sessionId) {
 					escalation.resolvedAt = Date.now(); escalation.resolution = "human_replied";

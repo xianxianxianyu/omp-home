@@ -10,7 +10,7 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	const errors = [];
 	page.on("pageerror", error => errors.push(String(error)));
 	await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
-	await page.evaluate(() => { localStorage.removeItem("omp-home-dismissed-finished"); localStorage.removeItem("omp-home-settings-maximized"); });
+	await page.evaluate(() => { for (const key of Object.keys(localStorage)) if (["omp-home-dismissed-finished", "omp-home-settings-maximized", "omp-home-language"].includes(key) || key.startsWith("omp-home-draft:") || key.startsWith("omp-home-last-sent:")) localStorage.removeItem(key); });
 	await page.goto(new URL("/", page.url()).href, { waitUntil: "networkidle0" });
 	await page.waitForSelector('.main-pane [data-tool="bash"] .tool-status.done');
 	const main = '.main-pane';
@@ -81,7 +81,9 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await page.$eval(composer, element => { element.focus(); element.select(); });
 	await page.keyboard.press("Backspace");
 	assert.equal(await page.$eval(composer, element => element.value), "");
-	const initialUserMessages = await page.$$eval('.main-pane .user-bubble', elements => elements.length);
+	// While main runs, the primary button queues a follow-up; count chips with bubbles so a premature send shows either way.
+	const sentTexts = () => page.$$eval('.main-pane .user-bubble, .main-pane .queue-text', elements => elements.map(element => element.textContent));
+	const initialSent = (await sentTexts()).length;
 	await page.evaluate(() => {
 		window.__sessionVerification = { composition: [] };
 		const input = document.querySelector('.main-pane .composer textarea');
@@ -91,16 +93,20 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await cdp.send("Input.imeSetComposition", { text: "中文输入", selectionStart: 4, selectionEnd: 4 });
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
 	await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-	assert.equal(await page.$$eval('.main-pane .user-bubble', elements => elements.length), initialUserMessages);
+	assert.equal((await sentTexts()).length, initialSent);
 	await cdp.send("Input.insertText", { text: "中文输入安全" });
 	assert.equal(await page.$eval(composer, element => element.value), "中文输入安全");
-	assert.equal(await page.$$eval('.main-pane .user-bubble', elements => elements.length), initialUserMessages);
+	assert.equal((await sentTexts()).length, initialSent);
 	await screenshot("06-ime-composed-unsent");
+	assert.equal(await page.$eval(`${main} .composer-actions button.primary`, element => element.textContent), "Queue");
+	assert.equal(await page.$eval(`${main} .composer-send-now`, element => element.textContent), "Send now");
 	await page.click(`${main} .composer-actions button.primary`);
 	const ime = await page.evaluate(() => window.__sessionVerification);
 	assert(ime.composition.some(event => event.type === "keydown" && event.key === "Enter" && event.isComposing));
-	await page.waitForFunction(() => Array.from(document.querySelectorAll('.main-pane .user-bubble')).some(element => element.textContent === "中文输入安全"));
-	assert.equal(await page.$$eval('.main-pane .user-bubble', elements => elements.filter(element => element.textContent === "中文输入安全").length), 1);
+	await page.waitForFunction(() => Array.from(document.querySelectorAll('.main-pane .queue-chip.followUp .queue-text')).some(element => element.textContent === "中文输入安全"));
+	assert.equal((await sentTexts()).filter(text => text === "中文输入安全").length, 1);
+	assert.equal(await page.$eval(composer, element => element.value), "");
+	assert.equal(await page.$eval(`${main} .composer-stop`, element => element.textContent), "■ Stop");
 	ime.sentExactlyOnce = true;
 	ime.prematureMessages = 0;
 	await screenshot("07-ime-sent-once");
@@ -244,6 +250,7 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	assert.match(await page.$eval(`${websiteCheck} [data-step-name="full"] pre`, element => element.textContent), /24 passed, 24 total/);
 	await page.click('.workspace-row[data-workspace="website"] .actions button:first-child');
 	await page.waitForFunction(() => document.querySelectorAll('[data-modal]').length === 2);
+	await page.waitForSelector('.dialog:not(.settings-dialog) .recipe-summary');
 	assert.match(await page.$eval('.dialog:not(.settings-dialog) .recipe-summary', element => element.textContent), /pnpm test/);
 	assert.equal(await page.$eval('.dialog:not(.settings-dialog)', element => element.parentElement.parentElement === document.body), true);
 	const recipeDialog = '.dialog:not(.settings-dialog)';
@@ -410,7 +417,7 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await screenshot("26-add-repo-review-zh");
 	await page.keyboard.press("Escape");
 	await page.waitForSelector('.main-pane [data-tool="bash"] .tool-status.done');
-	assert.equal(await page.$eval('.main-pane .composer textarea', element => element.placeholder), "给 omp 一个目标，或输入 / 查看命令");
+	assert.equal(await page.$eval('.main-pane .composer textarea', element => element.placeholder), "追加一条消息，或插话调整正在进行的工作…");
 	assert.equal(await page.$eval('.main-pane [data-tool="bash"] .tool-status.done', element => element.textContent), "完成");
 	assert.match(await page.$eval('.now-view time', element => element.textContent), /\d+ 分钟前/);
 	assert.equal(await page.$eval('.now-heading h1', element => element.textContent), "此刻");
@@ -456,6 +463,13 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	assert.match(await page.evaluate(() => localStorage.getItem("omp-home-dismissed-finished")), /T-9/);
 	await page.focus(composer); await page.keyboard.press("Escape");
 	await page.waitForFunction(() => !document.querySelector('.main-pane .activity-state'));
+	// Stopping withdraws the queue into the composer instead of stranding it.
+	await page.waitForFunction(() => document.querySelector('.main-pane .composer textarea').value === "Keep the migration reversible\n\nSummarize the search test evidence\n\nThen draft a short release note\n\n中文输入安全");
+	assert.equal(await page.$eval(`${main} .composer-note`, element => element.textContent), "Queued messages returned to the editor");
+	assert.equal(await page.$$eval(`${main} .queue-chip`, elements => elements.length), 0);
+	assert.equal(await page.$eval(`${main} .stopped-marker`, element => element.textContent), "Stopped");
+	await page.$eval(composer, element => { element.focus(); element.select(); });
+	await page.keyboard.press("Backspace");
 	// After an app update the home repo's skills can lag behind; one attention card offers to apply them with backups.
 	await page.goto(new URL("/?scene=home-update", page.url()).href, { waitUntil: "networkidle0" });
 	await page.waitForSelector('[data-attention="home-templates"]');
@@ -473,12 +487,167 @@ export async function verifySession(page, outputDirectory, evaluateApp = express
 	await page.click('.main-pane .composer-actions button.primary');
 	await page.waitForSelector('.workspace-pane [data-task="T-14"]');
 	assert.equal(await page.$('.right-collapsed'), null);
+	const chatControls = await verifyChatControls(page, screenshot, evaluateApp);
 	assert.deepEqual(errors, []);
 	const result = { passed: true, screenshots: screenshots.length, screenshotFiles: screenshots, checks: ["collapsed thinking/tools", "expanded tool output", "select answered", "ask multi-question answered", "nested transcript", "subagent steer/cancel", "history paging", "edit diff", "confirm/input/editor answered", "fuzzy commands", "CDP Chinese IME does not send before explicit Send", "worker session", "Escape aborts main only; task Escape pops without aborting", "Now attention, queued/approval/live progress and finished", "History tasks and decisions", "Settings sheet via Command comma", "catalog groups, prices and model search", "thinking capabilities, unsupported levels and non-reasoning model", "live theme and accent", "live system color scheme", "appearance persistence across rapid changes", "large type and compact density", "Chinese menu, Now headings, settings navigation, composer, tool status and relative time", "language applies immediately and persists", "no English UI words on asserted Chinese surfaces", "About runtime metadata", "finished dismissal persisted", "empty right column collapses", "dispatch automatically reveals right column"], ime, errors };
 	result.checks.push("settings maximize/restore persisted", "choose suggestion → inspect → branch/model/recipe choices → add highlighted repository", "recipe saved and nested recipe modal portaled", "folder picker and already-added open", "existing repository branch select saves", "non-git folder recovery", "900×700 settings usable and 680px top-row navigation", "English and Chinese repository review");
 	result.checks.push("generated copy files and explicit local env opt-in persisted in YAML", "automatic recipe trial advances through real UI states to passed", "saved recipe becomes outdated and offers a fresh trial", "per-entry trial selection and cancellation clean up", "lint baseline failure, exit code and expandable output in English and Chinese");
 	result.checks.push("branch phases, holds, ahead/behind, stale and remote-deleted hints in English and Chinese", "Keep toggles persist in workspace and task views", "Remove parks the worktree and keeps its branch", "Discard confirms lost commits and recorded SHA, then moves to history with a timeline SHA", "retired branch reasons, dates and SHAs", "task branch block replaces cleanup menu", "main-lane read-only and uncommitted editing labels", "Now branch name and merged · cleaned note");
+	result.checks.push("running composer: Queue (Enter) and Send now (⌘Enter), Stop when empty", "Esc stop returns queued text to the composer with a note and a Stopped marker", ...chatControls);
 	await writeFile(join(outputDirectory, "result.json"), JSON.stringify(result, null, 2));
 	await cdp.detach();
 	return result;
+}
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+/** Stop, queue, edit, retry, drafts and images on a fresh mock; ends in Chinese. */
+export async function verifyChatControls(page, screenshot, evaluateApp = expression => page.evaluate(expression)) {
+	const main = ".main-pane";
+	const composer = `${main} .composer textarea`;
+	const value = selector => page.$eval(selector, element => element.value);
+	const clear = async selector => { await page.$eval(selector, element => { element.focus(); element.select(); }); await page.keyboard.press("Backspace"); };
+	const chips = () => page.$$eval(`${main} .queue-chip`, elements => elements.map(element => `${element.classList.contains("steering") ? "steering" : "followUp"}:${element.querySelector(".queue-text").textContent}`));
+	const bubbles = () => page.$$eval(`${main} .user-bubble`, elements => elements.map(element => element.textContent));
+	const message = text => page.evaluateHandle(text => Array.from(document.querySelectorAll('.main-pane .user-message.human')).find(element => element.querySelector('.user-bubble')?.textContent === text), text);
+	const chipAction = async (text, label) => {
+		const button = await page.evaluateHandle((text, label) => Array.from(document.querySelectorAll('.main-pane .queue-chip')).find(element => element.querySelector('.queue-text').textContent === text).querySelector(`button[aria-label="${label}"]`) ?? Array.from(document.querySelectorAll('.main-pane .queue-chip button')).find(element => element.closest('.queue-chip').querySelector('.queue-text').textContent === text && element.textContent === label), text, label);
+		await button.click();
+	};
+	const open = async () => {
+		await page.goto(new URL("/", page.url()).href, { waitUntil: "networkidle0" });
+		await page.waitForSelector(`${main} [data-tool="bash"] .tool-status.done`);
+	};
+	await open();
+	await page.type(composer, "A draft that is not finished");
+	await open();
+	assert.equal(await value(composer), "A draft that is not finished");
+	await clear(composer);
+	assert.equal(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith("omp-home-draft:"))), false);
+	await page.click('.topbar .settings-trigger');
+	await page.click('.settings-sheet-nav button:nth-child(3)');
+	await page.click('button[data-language="zh"]');
+	await page.waitForFunction(() => document.documentElement.lang === "zh");
+	await page.waitForFunction(() => !document.querySelector('.language-status')?.textContent.includes("正在保存"));
+	await page.keyboard.press("Escape");
+	await page.waitForFunction(() => !document.querySelector('[data-modal]') && !document.querySelector('.main-pane .session-connection') && document.querySelector('.main-pane .queue-chip'));
+	assert.deepEqual(await chips(), ["steering:Keep the migration reversible", "followUp:Summarize the search test evidence", "followUp:Then draft a short release note"]);
+	assert.equal(await page.$eval(`${main} .composer-stop`, element => element.textContent), "■ 停止");
+	// Rewinding waits for the turn: Edit stays reachable and says why it does nothing yet.
+	const first = await message("让 Atlas 的搜索支持增量索引。顺便看看 Console 的账户迁移，两个任务保持隔离。");
+	await first.hover();
+	await page.waitForFunction(element => getComputedStyle(element.querySelector('.message-actions')).opacity === "1", {}, first);
+	const blockedEdit = await first.$('.message-action');
+	assert.equal(await blockedEdit.evaluate(element => [element.textContent, element.getAttribute("aria-disabled"), element.title].join("|")), "编辑|true|先停止当前轮次");
+	await blockedEdit.click();
+	assert.equal(await page.$(`${main} .message-editor`), null);
+	assert.equal(await page.$$eval(`${main} .assistant-message .message-action`, elements => elements.filter(element => element.textContent === "重试").map(element => element.getAttribute("aria-disabled")).join()), "true");
+	await page.type(composer, "先看搜索的测试结果");
+	assert.equal(await page.$eval(`${main} .composer-actions button.primary`, element => element.textContent), "排队发送");
+	assert.equal(await page.$eval(`${main} .composer-send-now`, element => element.textContent), "立即发送");
+	await page.keyboard.down("Meta"); await page.keyboard.press("Enter"); await page.keyboard.up("Meta");
+	await page.waitForFunction(() => document.querySelector('.main-pane .composer textarea').value === "");
+	await page.type(composer, "最后整理成一页摘要");
+	await page.keyboard.press("Enter");
+	await page.waitForFunction(() => document.querySelectorAll('.main-pane .queue-chip').length === 5);
+	assert.deepEqual(await chips(), ["steering:Keep the migration reversible", "steering:先看搜索的测试结果", "followUp:Summarize the search test evidence", "followUp:Then draft a short release note", "followUp:最后整理成一页摘要"]);
+	await page.$eval(`${main} .transcript-scroll`, element => { element.scrollTop = element.scrollHeight; });
+	await page.type(composer, "顺便确认删除路径");
+	await screenshot("33-chat-running-queue");
+	await clear(composer);
+	await chipAction("Summarize the search test evidence", "立即发送");
+	await page.waitForFunction(() => Array.from(document.querySelectorAll('.main-pane .queue-chip.steering .queue-text')).some(element => element.textContent === "Summarize the search test evidence"));
+	await chipAction("Then draft a short release note", "移出队列");
+	await page.waitForFunction(() => !Array.from(document.querySelectorAll('.main-pane .queue-text')).some(element => element.textContent === "Then draft a short release note"));
+	// A failed change puts the chip back and says why.
+	await evaluateApp(`(() => { const original = window.fetch; window.fetch = async (input, init) => { if (String(input).endsWith("/queue/remove")) { window.fetch = original; return new Response(JSON.stringify({ error: "Queue is busy" }), { status: 409, headers: { "content-type": "application/json" } }); } return original(input, init); }; })()`);
+	await chipAction("最后整理成一页摘要", "移出队列");
+	await page.waitForFunction(() => document.querySelector('.main-pane .queue-error')?.textContent === "Queue is busy");
+	assert.deepEqual(await chips(), ["steering:Keep the migration reversible", "steering:先看搜索的测试结果", "steering:Summarize the search test evidence", "followUp:最后整理成一页摘要"]);
+	await chipAction("最后整理成一页摘要", "编辑");
+	await page.waitForFunction(() => document.querySelector('.main-pane .composer textarea').value === "最后整理成一页摘要");
+	assert.equal(await page.$(`${main} .queue-error`), null);
+	assert.deepEqual(await chips(), ["steering:Keep the migration reversible", "steering:先看搜索的测试结果", "steering:Summarize the search test evidence"]);
+	// Stop returns the queue after the draft.
+	await page.focus(composer); await page.keyboard.press("Escape");
+	await page.waitForFunction(() => !document.querySelector('.main-pane .activity-state'));
+	await page.waitForFunction(() => document.querySelector('.main-pane .composer textarea').value.includes("\n\n"));
+	assert.equal(await value(composer), ["最后整理成一页摘要", "Keep the migration reversible", "先看搜索的测试结果", "Summarize the search test evidence"].join("\n\n"));
+	assert.equal(await page.$eval(`${main} .composer-note`, element => element.textContent), "排队的消息已放回输入框");
+	assert.equal(await page.$eval(`${main} .stopped-marker`, element => element.textContent), "已停止");
+	assert.equal(await page.$$eval(`${main} .queue-chip`, elements => elements.length), 0);
+	await clear(composer);
+	assert.equal(await page.$(`${main} .composer-note`), null);
+	assert.equal(await page.$eval(composer, element => element.placeholder), "给 omp 一个目标，或输入 / 查看命令");
+	for (const text of ["第一条：检查索引边界", "第二条：补充回滚说明"]) {
+		await page.type(composer, text);
+		await page.keyboard.press("Enter");
+		await page.waitForFunction(text => Array.from(document.querySelectorAll('.main-pane .user-bubble')).some(element => element.textContent === text), {}, text);
+	}
+	assert.equal(await value(composer), "");
+	await page.keyboard.press("ArrowUp");
+	assert.equal(await value(composer), "第二条：补充回滚说明");
+	await clear(composer);
+	const edited = await message("第一条：检查索引边界");
+	await edited.hover();
+	await (await edited.$('.message-action')).click();
+	await page.waitForSelector(`${main} .message-editor textarea`);
+	await page.keyboard.press("Escape");
+	await page.waitForFunction(() => !document.querySelector('.main-pane .message-editor'));
+	await edited.hover();
+	await (await edited.$('.message-action')).click();
+	await page.waitForSelector(`${main} .message-editor textarea`);
+	assert.equal(await value(`${main} .message-editor textarea`), "第一条：检查索引边界");
+	assert.match(await page.$eval(`${main} .message-editor`, element => element.textContent), /之后的内容都会从对话中移除。主对话的记录仍可搜索。/);
+	await page.$eval(`${main} .message-editor`, element => element.scrollIntoView({ block: "center" }));
+	await screenshot("34-chat-edit");
+	await clear(`${main} .message-editor textarea`);
+	await page.type(`${main} .message-editor textarea`, "第一条（修改）：检查索引与删除路径");
+	await page.click(`${main} .message-editor button.primary`);
+	await page.waitForFunction(() => Array.from(document.querySelectorAll('.main-pane .user-bubble')).some(element => element.textContent === "第一条（修改）：检查索引与删除路径"));
+	const rewritten = await bubbles();
+	assert.equal(rewritten.includes("第一条：检查索引边界"), false);
+	assert.equal(rewritten.includes("第二条：补充回滚说明"), false);
+	assert.equal(rewritten.at(-1), "第一条（修改）：检查索引与删除路径");
+	assert.equal(await page.$(`${main} .message-editor`), null);
+	const lastReply = await page.$$eval(`${main} .assistant-message`, elements => elements.at(-1).dataset.item);
+	assert.equal(await page.$$eval(`${main} .assistant-message .message-action`, elements => elements.filter(element => element.textContent === "重试").length), 1);
+	const retry = await page.evaluateHandle(() => Array.from(document.querySelectorAll('.main-pane .assistant-message')).at(-1).querySelector('.message-action'));
+	assert.equal(await retry.evaluate(element => [element.textContent, element.getAttribute("aria-disabled")].join("|")), "重试|false");
+	await retry.click();
+	await page.waitForFunction(id => !document.querySelector(`.main-pane [data-item="${id}"]`) && document.querySelector('.main-pane .assistant-message:last-of-type'), {}, lastReply);
+	assert.equal((await bubbles()).filter(text => text === "第一条（修改）：检查索引与删除路径").length, 1);
+	assert.match(await page.$$eval(`${main} .assistant-message`, elements => elements.at(-1).textContent), /收到。这条消息已加入会话。/);
+	await page.browserContext().overridePermissions(new URL(page.url()).origin, ["clipboard-read", "clipboard-write", "clipboard-sanitized-write"]);
+	const copy = await page.evaluateHandle(() => Array.from(document.querySelectorAll('.main-pane .assistant-message')).at(-1).querySelectorAll('.message-action')[1]);
+	await copy.click();
+	await page.waitForFunction(element => element.textContent === "已复制", {}, copy);
+	assert.equal(await evaluateApp("navigator.clipboard.readText()"), "收到。这条消息已加入会话。");
+	// Pasted images become thumbnails and are sent as `images`.
+	await evaluateApp(`(() => { const original = window.fetch; window.__prompts = []; window.fetch = async (input, init) => { if (String(input).endsWith("/prompt")) window.__prompts.push(JSON.parse(init.body)); return original(input, init); }; })()`);
+	const paste = (name, type) => page.$eval(composer, (element, name, type, data) => { const transfer = new DataTransfer(); transfer.items.add(new File([Uint8Array.from(atob(data), char => char.charCodeAt(0))], name, { type })); element.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true })); }, name, type, PNG);
+	await paste("layout.bmp", "image/bmp");
+	await page.waitForFunction(() => document.querySelector('.main-pane .composer .error-text')?.textContent === "只能添加 PNG、JPEG、GIF 或 WebP 图片。");
+	await paste("layout.png", "image/png");
+	await paste("second.png", "image/png");
+	await page.waitForFunction(() => document.querySelectorAll('.main-pane .composer-image img').length === 2);
+	assert.equal(await page.$(`${main} .composer .error-text`), null);
+	assert.match(await page.$eval(`${main} .composer-image img`, element => element.src), /^data:image\/png;base64,/);
+	await page.click(`${main} .composer-image:last-child button`);
+	await page.waitForFunction(() => document.querySelectorAll('.main-pane .composer-image').length === 1);
+	await page.type(composer, "这张截图里的布局");
+	await page.keyboard.press("Enter");
+	await page.waitForFunction(() => Array.from(document.querySelectorAll('.main-pane .user-bubble')).some(element => element.textContent === "这张截图里的布局 · 1 个图片附件"));
+	assert.equal(await page.$$eval(`${main} .composer-image`, elements => elements.length), 0);
+	assert.deepEqual(await evaluateApp("window.__prompts.at(-1)"), { text: "这张截图里的布局", mode: "auto", images: [{ data: PNG, mimeType: "image/png" }] });
+	// In a task view Esc means Back, so the composer's Stop button is the way to stop.
+	await page.click('.now-view .attention-item[data-task="T-12"] .primary');
+	await page.waitForSelector('.workspace-pane [data-tool="bash"] .tool-status.done');
+	assert.equal(await page.$eval('.workspace-pane .composer-stop', element => element.textContent), "■ 停止");
+	await page.click('.workspace-pane .composer-stop');
+	await page.waitForFunction(() => document.querySelector('.workspace-pane .composer textarea')?.value === "Keep the migration reversible\n\nSummarize the search test evidence\n\nThen draft a short release note");
+	assert.equal(await page.$eval('.workspace-pane .stopped-marker', element => element.textContent), "已停止");
+	await page.keyboard.press("Escape");
+	await page.waitForSelector('.now-view');
+	return ["draft survives reload", "queued steer and follow-up chips; promote, remove, rollback on error, edit into composer", "Edit/Retry disabled while running with a stop-first tooltip", "Esc stop appends queued text after the draft", "↑ recalls the last sent message", "edit rewinds: later messages gone, new text sent", "retry replaces the last answer", "copy assistant text", "pasted image thumbnail, removal, type check, sent as images", "task view Stop button restores its queue; Esc stays Back"];
 }

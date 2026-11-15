@@ -64,7 +64,10 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p === "/api/sessions") schema = z.array(session);
 	else if (/^\/api\/sessions\/[^/]+\/commands$/.test(p)) schema = commands;
 	else if (/^\/api\/sessions\/[^/]+\/history$/.test(p)) schema = historyPage;
-	else if (/^\/api\/sessions\/[^/]+\/(prompt|abort|respond|subagents\/[^/]+\/(steer|cancel))$/.test(p)) schema = z.object({ ok: z.literal(true) });
+	else if (/^\/api\/sessions\/[^/]+\/abort$/.test(p)) schema = z.object({ restored: z.array(z.string()) });
+	else if (/^\/api\/sessions\/[^/]+\/queue\/remove$/.test(p)) schema = z.object({ removed: z.boolean() });
+	else if (/^\/api\/sessions\/[^/]+\/queue\/promote$/.test(p)) schema = z.object({ promoted: z.boolean() });
+	else if (/^\/api\/sessions\/[^/]+\/(prompt|edit|retry|respond|subagents\/[^/]+\/(steer|cancel))$/.test(p)) schema = z.object({ ok: z.literal(true) });
 	else if (p.startsWith("/api/sessions/")) schema = session;
 	else if (p === "/api/inbox") schema = z.object({ escalations: z.array(escalation), main });
 	else if (p.startsWith("/api/escalations/")) schema = escalation;

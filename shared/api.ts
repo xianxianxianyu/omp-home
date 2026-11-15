@@ -27,7 +27,11 @@
  *   POST /api/sessions/:id/evict            → SessionDTO
  *   POST /api/sessions/:id/retire           → SessionDTO
  *   POST /api/sessions/:id/prompt  PromptRequest → { ok: true }  (start if cold; main-chat prompts count as human input)
- *   POST /api/sessions/:id/abort            → { ok: true }
+ *   POST /api/sessions/:id/abort            → AbortResult        (stop the run and withdraw queued input; the UI puts it back in the composer)
+ *   POST /api/sessions/:id/queue/remove {message, queue} → { removed: boolean }   (withdraw one queued message, e.g. to edit it)
+ *   POST /api/sessions/:id/queue/promote {message}       → { promoted: boolean }  (queued follow-up → steer the running turn now)
+ *   POST /api/sessions/:id/edit  EditRequest  → { ok: true }    (rewind to before a user message and send new text in its place)
+ *   POST /api/sessions/:id/retry            → { ok: true }       (rewind to before the last user message and send it again)
  *   POST /api/sessions/:id/respond RespondRequest → { ok: true }  (answer a pending `request` item)
  *   GET  /api/sessions/:id/commands         → CommandDTO[]      (slash commands for the composer)
  *   GET  /api/sessions/:id/history ?before=<cursor> → TranscriptEvent of kind "prepend"
@@ -525,10 +529,35 @@ export type UiEvent =
 	| { t: "focus"; sessionId: string; escalationId: string | null; reason: string }
 	| { t: "toast"; level: "info" | "error"; text: string };
 
+export const PROMPT_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+export const MAX_PROMPT_IMAGES = 8;
+/** Decoded bytes per image. */
+export const MAX_PROMPT_IMAGE_BYTES = 5 * 1024 * 1024;
+
+export interface PromptImage {
+	/** Base64 bytes, no data: prefix. */
+	data: string;
+	mimeType: (typeof PROMPT_IMAGE_TYPES)[number];
+}
+
 export interface PromptRequest {
 	text: string;
 	/** auto: start a turn when idle, otherwise follow up after the current one. steer: inject into the running turn. */
 	mode?: "auto" | "steer" | "followUp";
+	/** At most MAX_PROMPT_IMAGES images, each ≤ MAX_PROMPT_IMAGE_BYTES decoded. */
+	images?: PromptImage[];
+}
+
+/** Queued input withdrawn by the stop, oldest first (steering before follow-ups), so nothing typed is lost or silently stuck. */
+export interface AbortResult {
+	restored: string[];
+}
+
+export interface EditRequest {
+	/** Transcript item id of a `user` item sent by the human in this session. */
+	itemId: string;
+	text: string;
+	images?: PromptImage[];
 }
 
 export interface RespondRequest {

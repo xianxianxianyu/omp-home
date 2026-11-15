@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import { z } from "zod";
 import type { ProcState } from "../shared/api.ts";
 import type { HomePaths } from "./config.ts";
 import { admit, idleVictims, launchSpec, liveWorkers, procState, type PoolEntry, type Proc } from "./core/pool.ts";
@@ -28,6 +29,8 @@ const MAIN_FAILURE_WINDOW_MS = 5 * 60_000;
 const MAIN_FAILURE_LIMIT = 5;
 /** Messages per `get_messages_page`: small pages, because protocol v1 shortens strings until a frame fits 1 MiB. */
 const HISTORY_PAGE = 32;
+/** `abort_and_restore_queue`: the queued input it withdrew, each queue oldest first. */
+const restoredQueue = z.object({ steering: z.array(z.object({ text: z.string() })), followUp: z.array(z.object({ text: z.string() })) });
 
 export interface SessionRow {
 	id: string;
@@ -77,6 +80,8 @@ export interface PoolDeps {
 	viewers(sessionId: string): number;
 	/** A new process published its stored history; precedes every `frame` of that process. */
 	seeded(sessionId: string, seed: SessionSeed): void;
+	/** The live process moved back to an earlier point of its session (`branch`) and republished its history. */
+	rewound(sessionId: string, seed: SessionSeed): void;
 	frame(sessionId: string, frame: RpcFrame): void;
 	/** Live: bridge connected and RPC set up (also after a bridge reconnect). */
 	ready(sessionId: string): void;
@@ -392,11 +397,9 @@ export class Pool {
 			await rpc.ready;
 			await rpc.request("set_subagent_subscription", { level: "events" });
 			await rpc.request("set_ask_dialog", { enabled: true });
-			const messages = await this.#history(id, rpc);
-			const commands = await rpc.request("get_available_commands");
-			const state = await rpc.request("get_state");
+			const seed = await this.#seed(id, rpc);
 			if (this.#live.get(id) !== live) return;
-			this.#d.seeded(id, { messages, commands, state });
+			this.#d.seeded(id, seed);
 			const backlog = live.backlog ?? [];
 			live.backlog = null;
 			for (const frame of backlog) this.#d.frame(id, frame);
@@ -408,6 +411,13 @@ export class Pool {
 			this.#d.log(`${id}: omp RPC setup failed: ${errorText(err)}; stopping it`);
 			void rpc.stop(SHUTDOWN_GRACE_MS);
 		}
+	}
+
+	async #seed(id: string, rpc: RpcClient): Promise<SessionSeed> {
+		const messages = await this.#history(id, rpc);
+		const commands = await rpc.request("get_available_commands");
+		const state = await rpc.request("get_state");
+		return { messages, commands, state };
 	}
 
 	/** Every stored message, oldest first. A run that already started refuses paging; keep what we have. */
@@ -525,10 +535,39 @@ export class Pool {
 		}
 	}
 
-	/** Abort the running turn, if the session is up. */
-	async abort(id: string): Promise<void> {
+	/** Stop the running turn and withdraw queued input; the withdrawn texts, steering before follow-ups. */
+	async abort(id: string): Promise<string[]> {
 		const live = this.#live.get(id);
-		if (live?.initialized && live.rpc?.alive) await live.rpc.request("abort");
+		if (!live?.initialized || !live.rpc?.alive) return [];
+		const { steering, followUp } = restoredQueue.parse(await live.rpc.request("abort_and_restore_queue"));
+		return [...steering, ...followUp].map(m => m.text);
+	}
+
+	/**
+	 * Rewind to just before user entry `entryId`: omp continues in a new session file holding the
+	 * branch up to there. The file is recorded for resume and the view is rebuilt from omp's history;
+	 * frames omp sends meanwhile wait for the rebuilt view, as during startup.
+	 */
+	async branch(id: string, entryId: string): Promise<void> {
+		const rpc = await this.client(id);
+		const live = this.#live.get(id);
+		if (!live || live.backlog) throw new HubError("conflict", messages.rewindBusy(id));
+		live.backlog = [];
+		try {
+			const result = await rpc.request("branch", { entryId });
+			if (typeof result === "object" && result !== null && "cancelled" in result && result.cancelled === true) throw new HubError("conflict", messages.rewindCancelled(id));
+			const seed = await this.#seed(id, rpc);
+			if (this.#live.get(id) !== live) throw new HubError("unavailable", messages.notRunning(id));
+			const state = typeof seed.state === "object" && seed.state !== null ? seed.state : {};
+			const ompSessionId = "sessionId" in state && typeof state.sessionId === "string" ? state.sessionId : null;
+			const sessionFile = "sessionFile" in state && typeof state.sessionFile === "string" ? state.sessionFile : null;
+			this.#d.db.run("UPDATE session SET omp_session_id = coalesce(?, omp_session_id), omp_session_file = coalesce(?, omp_session_file) WHERE id = ?", ompSessionId, sessionFile, id);
+			this.#d.rewound(id, seed);
+		} finally {
+			const backlog = live.backlog ?? [];
+			live.backlog = null;
+			if (this.#live.get(id) === live) for (const frame of backlog) this.#d.frame(id, frame);
+		}
 	}
 
 	async evict(id: string): Promise<void> {

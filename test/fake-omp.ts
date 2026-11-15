@@ -2,11 +2,17 @@
 /**
  * Stand-in for `omp --mode rpc-ui` (select with OMP_HOME_OMP_BIN): JSONL RPC on stdio plus the
  * omp-home bridge WebSocket, no model. Messages persist in `<session-dir>/fake-session.jsonl`
- * and come back through `get_messages_page` after `--resume`.
+ * and come back through `get_messages_page` after `--resume`; `branch` continues in a new
+ * session file holding the history before that user message, like omp.
+ * Prompts sent with `streamingBehavior`, and outbox prompts delivered, while a run is going wait in a
+ * steering/follow-up queue (`queue_update`, `get_state`) and run after it; `abort_and_restore_queue` withdraws them.
  *
- * Human prompts (RPC `prompt`): main echoes, except these markers in the text
+ * Human prompts (RPC `prompt`): main echoes ("echo: <text>", plus "[<mimeType> <bytes>B, …]" for images),
+ * except these markers in the text
  *   [fake:ask]              a select dialog; the turn answers "PICKED <value>"
- *   [fake:hang]             the turn runs until `abort`
+ *   [fake:hang]             the turn runs until aborted
+ *   [fake:slow]             the echo comes after 1.5 s (time to queue more input)
+ *   [fake:compact]          omp's compaction summary follows the prompt: a user message attributed to the agent
  *   [fake:subagent]         a `task` subagent "Pinger" runs to completion with its own events
  *   [fake:subagent-hang]    a detached subagent "Sleeper" runs until `cancel_subagent` (takes `steer_subagent`)
  * Agent actions (what main's model would do) are lines appended to `<session-dir>/fake-agent.txt`:
@@ -14,7 +20,7 @@
  *   /call <tool> <json>     any tool as the main agent
  * Each runs as a turn ending in an assistant line "RESULT ok|err ...".
  * Worker role: every prompt runs one turn that calls home_report, shaped by markers
- * [fake:question] [fake:noreport] [fake:hang] (until abort) [fake:env] (home_env + home_lease)
+ * [fake:question] [fake:noreport] [fake:hang] (until aborted) [fake:env] (home_env + home_lease)
  * [fake:intents] (tools "Step one" for 1.2 s, then "Step two" for 1.5 s, before reporting)
  * [fake:commit] (writes <session>.txt in its cwd and commits it, like a worker on a branch)
  * [fake:edit] (writes <session>.md in its cwd, then tries to commit it; the report says whether git refused).
@@ -112,7 +118,7 @@ const state: { ompSessionId: string; delivered: number[]; agentOffset: number } 
 };
 const save = () => fs.writeFileSync(stateFile, JSON.stringify(state));
 save();
-const historyFile = path.join(sessionDir, "fake-session.jsonl");
+let historyFile = values.resume && fs.existsSync(values.resume) ? values.resume : path.join(sessionDir, "fake-session.jsonl");
 const agentFile = path.join(sessionDir, "fake-agent.txt");
 const history: Json[] = fs.existsSync(historyFile)
 	? fs
@@ -136,6 +142,12 @@ let dispatchers = 0;
 let running = false;
 let turns: Promise<void> = Promise.resolve();
 let abortRun: (() => void) | null = null;
+/** Input waiting in omp's queue; `start` runs it once it is its turn. */
+interface Queued {
+	text: string;
+	start(): void;
+}
+const queued: { steering: Queued[]; followUp: Queued[] } = { steering: [], followUp: [] };
 const results = new Map<string, (frame: Json) => void>();
 const dialogs = new Map<string, (answer: string) => void>();
 const subagents = new Map<string, { steer(text: string): void; cancel(): void }>();
@@ -176,9 +188,28 @@ function message(msg: Json, sub: string | null = null): void {
 	}
 }
 
-function user(text: string, attribution: "user" | "agent" = "user", sub: string | null = null): void {
-	message({ role: "user", content: [{ type: "text", text }], attribution, timestamp: Date.now() }, sub);
+function user(text: string, attribution: "user" | "agent" = "user", sub: string | null = null, images: Json[] = []): void {
+	message({ role: "user", content: [...(text ? [{ type: "text", text }] : []), ...images], attribution, timestamp: Date.now() }, sub);
 	if (!sub) capture("user", text);
+}
+
+/** User messages with text on the current branch, oldest first, as `get_branch_messages` lists them; entry ids are history indexes. */
+function branchMessages(): { entryId: string; text: string }[] {
+	return history.flatMap((m, index) => {
+		const text = m.role === "user" && Array.isArray(m.content) ? m.content.flatMap(p => (typeof p === "object" && p !== null && "text" in p && typeof p.text === "string" ? [p.text] : [])).join("") : "";
+		return text ? [{ entryId: `e${index}`, text }] : [];
+	});
+}
+
+function queueUpdate(): void {
+	out({ type: "queue_update", steering: queued.steering.map(p => p.text), followUp: queued.followUp.map(p => p.text), liveSteered: 0 });
+}
+
+/** While a run goes, input waits in the steering or follow-up queue; otherwise it starts a run. */
+function submit(queue: "steering" | "followUp" | null, text: string, start: () => void): void {
+	if (!running || !queue) return start();
+	queued[queue].push({ text, start });
+	queueUpdate();
 }
 
 function assistant(text: string, stopReason = "stop", sub: string | null = null): void {
@@ -227,7 +258,7 @@ function hubTool(tool: string, params: unknown, agent: { kind: "main" | "sub"; i
 	};
 }
 
-/** One top-level run; runs are sequential like omp follow-ups. */
+/** One top-level run; runs are sequential. When it ends, queued steering, then follow-ups, run next. */
 function turn(body: (signal: AbortSignal) => Promise<{ stop: "completed" | "aborted"; text: string }>): void {
 	turns = turns.then(async () => {
 		const n = ++seq;
@@ -243,7 +274,11 @@ function turn(body: (signal: AbortSignal) => Promise<{ stop: "completed" | "abor
 		out({ type: "turn_end" });
 		out({ type: "agent_end", messages: [], isTerminal: true, yielded: true });
 		send({ t: "run_end", seq: n, stop, text, asyncJobs: 0 });
-		out({ type: "session_settled" });
+		const next = queued.steering.shift() ?? queued.followUp.shift();
+		if (next) {
+			queueUpdate();
+			next.start();
+		} else out({ type: "session_settled" });
 	});
 }
 
@@ -274,9 +309,9 @@ function endSubagent(id: string, status: "completed" | "aborted", parentToolCall
 	out({ type: "subagent_lifecycle", payload: { id, agent: "sonic", agentSource: "bundled", parentToolCallId, status, index: 0, detached: true } });
 }
 
-function workerTurn(prompt: string): void {
+function workerTurn(prompt: string, images: Json[] = []): void {
 	turn(async signal => {
-		user(prompt);
+		user(prompt, "user", null, images);
 		if (prompt.includes("[fake:hang]")) {
 			await toolCall("bash", { command: "sleep infinity" }, async () => {
 				await untilAborted(signal);
@@ -324,9 +359,9 @@ function workerTurn(prompt: string): void {
 	});
 }
 
-function mainPrompt(text: string): void {
+function mainPrompt(text: string, images: Json[]): void {
 	turn(async signal => {
-		user(text);
+		user(text, "user", null, images);
 		if (text.includes("[fake:ask]")) {
 			const answer = await dialog({ method: "select", title: "Pick a color", options: ["Red", "Blue"] });
 			assistant(`PICKED ${answer}`);
@@ -365,9 +400,12 @@ function mainPrompt(text: string): void {
 			assistant("SUBAGENT done");
 			return { stop: "completed", text: "SUBAGENT done" };
 		}
+		if (text.includes("[fake:compact]")) user("Summary of the conversation so far.", "agent");
+		if (text.includes("[fake:slow]")) await Promise.race([sleep(1500), untilAborted(signal)]);
 		if (signal.aborted) return { stop: "aborted", text: "" };
-		assistant(`echo: ${text}`);
-		return { stop: "completed", text: `echo: ${text}` };
+		const echo = ["echo:", text, images.length ? `[${images.map(i => `${String(i.mimeType)} ${Buffer.from(String(i.data), "base64").length}B`).join(", ")}]` : ""].filter(Boolean).join(" ");
+		assistant(echo);
+		return { stop: "completed", text: echo };
 	});
 }
 
@@ -424,14 +462,17 @@ function deliver(frame: Json): void {
 		}
 		return;
 	}
-	if (role === "worker") workerTurn(text);
-	else {
-		turn(async () => {
-			user(text);
-			assistant("ok");
-			return { stop: "completed", text: "ok" };
-		});
-	}
+	// Like the bridge's sendUserMessage: steer or follow up while a run goes, else start one.
+	const start =
+		role === "worker"
+			? () => workerTurn(text)
+			: () =>
+					turn(async () => {
+						user(text);
+						assistant("ok");
+						return { stop: "completed", text: "ok" };
+					});
+	submit(frame.deliver === "now" ? "steering" : "followUp", text, start);
 }
 
 function respond(id: unknown, command: string, data?: unknown): void {
@@ -464,20 +505,61 @@ function command(frame: Json): void {
 				thinkingLevel: values.thinking ?? "high",
 				isStreaming: running,
 				isCompacting: false,
-				isSettled: !running,
+				isSettled: !running && !queued.steering.length && !queued.followUp.length,
 				sessionId: state.ompSessionId,
 				sessionFile: historyFile,
 				messageCount: history.length,
-				queuedMessages: { steering: [], followUp: [], liveSteered: 0 },
+				queuedMessages: { steering: queued.steering.map(p => p.text), followUp: queued.followUp.map(p => p.text), liveSteered: 0 },
 				contextUsage: { tokens: 1500, contextWindow: 100_000, percent: 1.5 },
 				dumpTools: toolsFor(role).map(name => ({ name, description: name })),
 			});
-		case "prompt":
+		case "prompt": {
 			respond(id, type, { agentInvoked: true });
-			return role === "worker" ? workerTurn(String(frame.message)) : mainPrompt(String(frame.message));
-		case "abort":
+			const text = String(frame.message);
+			const images = Array.isArray(frame.images) ? (frame.images as Json[]) : [];
+			const behavior = frame.streamingBehavior === "steer" ? "steering" : frame.streamingBehavior === "followUp" ? "followUp" : null;
+			return submit(behavior, text, () => (role === "worker" ? workerTurn(text, images) : mainPrompt(text, images)));
+		}
+		case "abort_and_restore_queue": {
+			const restored = { steering: queued.steering.map(p => ({ text: p.text })), followUp: queued.followUp.map(p => ({ text: p.text })) };
+			const withdrew = restored.steering.length + restored.followUp.length > 0;
+			queued.steering = [];
+			queued.followUp = [];
+			if (withdrew) queueUpdate();
 			abortRun?.();
-			return respond(id, type);
+			// omp answers once the aborted run has ended.
+			void turns.then(() => respond(id, type, restored));
+			return;
+		}
+		case "remove_queued_message": {
+			const queue = frame.queue === "steering" ? queued.steering : queued.followUp;
+			const at = queue.findIndex(p => p.text === frame.message);
+			if (at >= 0) {
+				queue.splice(at, 1);
+				queueUpdate();
+			}
+			return respond(id, type, { removed: at >= 0 });
+		}
+		case "promote_queued_message": {
+			const at = queued.followUp.findIndex(p => p.text === frame.message);
+			if (at >= 0) {
+				queued.steering.push(...queued.followUp.splice(at, 1));
+				queueUpdate();
+			}
+			return respond(id, type, { promoted: at >= 0 });
+		}
+		case "get_branch_messages":
+			return respond(id, type, { messages: branchMessages() });
+		case "branch": {
+			const target = branchMessages().find(m => m.entryId === frame.entryId);
+			if (!target) return fail(id, type, "Invalid entry ID for branching");
+			history.splice(Number(target.entryId.slice(1)));
+			state.ompSessionId = randomUUID();
+			save();
+			historyFile = path.join(sessionDir, `fake-session-${state.ompSessionId}.jsonl`);
+			fs.writeFileSync(historyFile, history.map(m => `${JSON.stringify(m)}\n`).join(""));
+			return respond(id, type, { text: target.text, cancelled: false });
+		}
 		case "steer_subagent": {
 			const sub = subagents.get(String(frame.subagentId));
 			if (!sub) return fail(id, type, `subagent ${String(frame.subagentId)} is not running`);

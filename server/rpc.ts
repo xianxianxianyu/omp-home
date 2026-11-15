@@ -4,8 +4,10 @@ import type { Language } from "../shared/api.ts";
 import { render, type Message } from "./i18n.ts";
 import { runtimeMessages as m } from "./i18n-runtime.ts";
 
-/** omp RPC protocol v1: one JSON object per line on stdio; omp keeps each frame within 1 MiB. */
+/** omp RPC protocol v1: one JSON object per line on stdio; omp keeps each frame it writes within 1 MiB. */
 export const MAX_FRAME_BYTES = 1024 * 1024;
+/** omp reads command lines of any length (a prompt with images runs to tens of MiB); ours stay within its 64 MiB protocol maximum. */
+const MAX_COMMAND_BYTES = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 const STDERR_TAIL = 4096;
 
@@ -172,7 +174,7 @@ export class RpcClient {
 	send(frame: Record<string, unknown>): void {
 		if (!this.alive) throw new RpcError(m.rpcNotRunning(), "exited");
 		const line = JSON.stringify(frame);
-		if (Buffer.byteLength(line, "utf8") + 1 > MAX_FRAME_BYTES) throw new RpcError(m.rpcTooLarge(), "too_large");
+		if (Buffer.byteLength(line, "utf8") + 1 > MAX_COMMAND_BYTES) throw new RpcError(m.rpcTooLarge(), "too_large");
 		this.#child.stdin!.write(`${line}\n`);
 	}
 

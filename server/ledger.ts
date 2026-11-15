@@ -612,6 +612,43 @@ export class Ledger {
 		this.#db.run("UPDATE outbox SET acked_at = ? WHERE task_id = ? AND kind = 'prompt' AND acked_at IS NULL", this.#now(), taskId);
 	}
 
+	/** Every prompt the hub put into this session. omp shows them as user messages; they are not the human's. */
+	promptTexts(sessionId: string): Set<string> {
+		return new Set(this.#db.all<{ text: string }>("SELECT DISTINCT text FROM outbox WHERE session_id = ? AND kind = 'prompt'", sessionId).map(r => r.text));
+	}
+
+	/**
+	 * Input a stop withdrew from omp's queue, in order. A prompt the hub delivered goes back to the outbox as a
+	 * new row, because the extension skips an outbox id it already delivered; the rest is the human's, returned.
+	 */
+	requeueWithdrawn(sessionId: string, texts: readonly string[]): string[] {
+		return this.#db.tx(() => {
+			const human: string[] = [];
+			const taken = new Set<number>();
+			for (const text of texts) {
+				const row = this.#db
+					.all<OutboxRow>(
+						`SELECT o.* FROM outbox o LEFT JOIN task t ON t.id = o.task_id
+						 WHERE o.session_id = ? AND o.kind = 'prompt' AND o.text = ? AND o.acked_at IS NOT NULL AND (t.status IS NULL OR t.status != 'cancelled')
+						 ORDER BY o.id DESC`,
+						sessionId,
+						text,
+					)
+					.find(r => !taken.has(r.id));
+				if (!row) {
+					human.push(text);
+					continue;
+				}
+				taken.add(row.id);
+				// The run it was meant to follow or steer is stopped: it starts the next one.
+				const id = this.#db.run("INSERT INTO outbox (session_id, task_id, kind, deliver, text, created_at) VALUES (?, ?, 'prompt', 'next', ?, ?)", sessionId, row.task_id, text, this.#now()).id;
+				// Keeps the key's kind (a brief stays a brief on the task timeline) and stays unique.
+				if (row.dedupe_key) this.#db.run("UPDATE outbox SET dedupe_key = ? WHERE id = ?", `${row.dedupe_key}#${id}`, id);
+			}
+			return human;
+		});
+	}
+
 	unacked(sessionId: string): OutboxRow[] {
 		return this.#db.all<OutboxRow>("SELECT * FROM outbox WHERE session_id = ? AND acked_at IS NULL ORDER BY id", sessionId);
 	}

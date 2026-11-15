@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { emptyTranscript, reduceTranscript } from "../../shared/transcript.ts";
 import type { Item, ToolView, TranscriptEvent, TranscriptView } from "../../shared/transcript.ts";
-import type { CommandDTO } from "../../shared/api.ts";
+import { MAX_PROMPT_IMAGE_BYTES, MAX_PROMPT_IMAGES, PROMPT_IMAGE_TYPES } from "../../shared/api.ts";
+import type { AbortResult, CommandDTO } from "../../shared/api.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { uiResponse } from "./transcript-schema.ts";
 
@@ -52,7 +53,7 @@ function seed(sessionId: string): TranscriptView {
 	apply({ t: "subagent_event", id: "scout-1", event: { t: "item", item: nested } });
 	apply({ t: "subagent", id: "reviewer-1", patch: { agent: "reviewer", task: "Review migration risks", status: "completed", lastIntent: "Verified rollback plan", parentToolCallId: "task-1", startedAt: now - 74000, endedAt: now - 15000 } });
 	apply({ t: "subagent_event", id: "reviewer-1", event: { t: "item", item: assistant("review-1", "**Review complete.** Add the nullable column first. Backfill in batches; retain the legacy field until the next release. The rollback path remains a configuration change.", now - 15000) } });
-	apply({ t: "status", patch: { phase: "running", settled: false, model: isMain ? "openai-codex/gpt-6-astra" : "anthropic/claude-opus-5-5", contextPercent: 23, queue: { steering: ["Keep the migration reversible"], followUp: ["Summarize the search test evidence"] } } });
+	apply({ t: "status", patch: { phase: "running", settled: false, model: isMain ? "openai-codex/gpt-6-astra" : "anthropic/claude-opus-5-5", contextPercent: 23, queue: { steering: ["Keep the migration reversible"], followUp: ["Summarize the search test evidence", "Then draft a short release note"] } } });
 	return { ...view, earlierCursor: view.items[0].id };
 }
 function oldHistory(): TranscriptView {
@@ -80,14 +81,31 @@ function oldHistory(): TranscriptView {
 	return view;
 }
 
+const promptImages = z.array(z.object({ data: z.string(), mimeType: z.enum(PROMPT_IMAGE_TYPES) }).refine(image => image.data.length * 3 / 4 <= MAX_PROMPT_IMAGE_BYTES, "Image is larger than 5 MB")).max(MAX_PROMPT_IMAGES).optional();
+
 export function createMockSessions(onCommand: (command: string, sessionId: string) => void) {
 	const views = new Map<string, TranscriptView>();
 	const history = new Map<string, TranscriptView>();
 	const subscribers = new Map<string, Set<SocketHandlers>>();
 	const scripted = new Set<string>();
+	let sequence = 0;
 	const emit = (id: string, event: TranscriptEvent) => {
 		views.set(id, reduceTranscript(views.get(id) ?? emptyTranscript(), event));
 		for (const handlers of subscribers.get(id) ?? []) handlers.message(JSON.stringify(event));
+	};
+	const current = (id: string) => views.get(id) ?? seed(id);
+	const reply = (id: string, text: string, images: number) => {
+		const at = Date.now();
+		const key = `${at}-${++sequence}`;
+		emit(id, { t: "item", item: { kind: "user", id: `user-${key}`, at, text, images, from: "human" } });
+		emit(id, { t: "item", item: assistant(`reply-${key}`, text.startsWith("/") ? `Demo command \`${text}\` handled.` : images ? `收到这条消息和 ${images} 张图片。` : "收到。这条消息已加入会话。", at) });
+	};
+	/** Like omp's `branch` + prompt: drop the user message at `index` and everything after it, then send `text` in its place. */
+	const rewind = (id: string, index: number, text: string, images: number) => {
+		const view = current(id);
+		if (view.status.phase !== "idle") throw new Error("Stop the current turn first");
+		emit(id, { t: "reset", view: { ...view, items: view.items.slice(0, index) } });
+		reply(id, text, images);
 	};
 	return {
 		connect(id: string, handlers: SocketHandlers) {
@@ -100,13 +118,14 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 				if (!scripted.has(id) && views.get(id)!.tools["bash-1"]) {
 					scripted.add(id);
 					const parts = ["搜索的边界已经确认。", " **两个 worker 正在独立推进。**", "\n\n你可以展开工具查看原始证据，或打开 **Subagents** 跟进每一步。"];
-					parts.forEach((text, index) => window.setTimeout(() => emit(id, { t: "delta", id: "stream-1", index: 0, kind: "text", text }), 350 + index * 450));
+					parts.forEach((text, index) => window.setTimeout(() => { if (views.get(id)!.items.some(item => item.id === "stream-1" && item.kind === "assistant" && item.streaming)) emit(id, { t: "delta", id: "stream-1", index: 0, kind: "text", text }); }, 350 + index * 450));
 					window.setTimeout(() => {
+						const item = views.get(id)!.items.find(item => item.id === "stream-1");
+						if (item?.kind !== "assistant" || !item.streaming) return;
 						const tool = views.get(id)!.tools["bash-1"];
 						emit(id, { t: "tool_output", callId: tool.callId, output: "✓ changed paths\n✓ deleted paths\n✓ unchanged index\n3 tests passed" });
 						emit(id, { t: "tool", tool: { ...tool, status: "done", endedAt: Date.now(), output: "✓ changed paths\n✓ deleted paths\n✓ unchanged index\n3 tests passed" } });
-						const item = views.get(id)!.items.find(item => item.id === "stream-1");
-						if (item?.kind === "assistant") emit(id, { t: "item", item: { ...item, streaming: false, stopReason: "stop" } });
+						emit(id, { t: "item", item: { ...item, streaming: false, stopReason: "stop" } });
 					}, 1900);
 				}
 			}, 40);
@@ -116,13 +135,59 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 			if (action === "commands") return commands;
 			if (action === "history") { const old = history.get(id) ?? oldHistory(); const current = views.get(id) ?? seed(id); const all = [...old.items, ...current.items]; const index = before ? all.findIndex(item => item.id === before) : all.length; const end = index < 0 ? all.length : index; const items = all.slice(Math.max(0, end - 60), end); return { t: "prepend", items, tools: { ...old.tools, ...current.tools }, earlierCursor: end > 60 ? items[0].id : null } satisfies TranscriptEvent; }
 			if (action === "prompt") {
-				const prompt = z.object({ text: z.string(), mode: z.enum(["auto", "steer", "followUp"]).optional() }).parse(body);
+				const prompt = z.object({ text: z.string(), mode: z.enum(["auto", "steer", "followUp"]).optional(), images: promptImages }).parse(body);
+				if (!prompt.text.trim() && !prompt.images?.length) throw new Error("Message is empty");
 				onCommand(prompt.text.trim(), id);
-				emit(id, { t: "item", item: { kind: "user", id: `user-${Date.now()}`, at: Date.now(), text: prompt.text, images: 0, from: "human" } });
-				emit(id, { t: "item", item: assistant(`reply-${Date.now()}`, prompt.text.startsWith("/") ? `Demo command \`${prompt.text}\` handled.` : `收到。${prompt.mode === "steer" ? "我会调整当前工作。" : "这条消息已加入会话。"}`, Date.now()) });
+				const view = current(id);
+				if (view.status.phase !== "idle" && !prompt.text.startsWith("/")) {
+					// The demo turn sits in one long step, so steers and follow-ups stay queued until it is stopped.
+					const queue = prompt.mode === "steer" ? "steering" : "followUp";
+					emit(id, { t: "status", patch: { queue: { ...view.status.queue, [queue]: [...view.status.queue[queue], prompt.text] } } });
+					return { ok: true };
+				}
+				reply(id, prompt.text, prompt.images?.length ?? 0);
 				return { ok: true };
 			}
-			if (action === "abort") { emit(id, { t: "status", patch: { phase: "idle", settled: true, queue: { steering: [], followUp: [] } } }); return { ok: true }; }
+			if (action === "abort") {
+				const view = current(id);
+				const restored = [...view.status.queue.steering, ...view.status.queue.followUp];
+				if (view.status.phase !== "idle") {
+					// omp ends an interrupted run with an aborted assistant message, empty when nothing was streaming.
+					const streaming = view.items.findLast(item => item.kind === "assistant" && item.streaming);
+					const interrupted = streaming?.kind === "assistant" ? streaming : { ...assistant(`aborted-${Date.now()}-${++sequence}`, "", Date.now()), blocks: [] };
+					emit(id, { t: "item", item: { ...interrupted, streaming: false, stopReason: "aborted", error: "Interrupted by user" } });
+				}
+				emit(id, { t: "status", patch: { phase: "idle", settled: true, queue: { steering: [], followUp: [] } } });
+				return { restored } satisfies AbortResult;
+			}
+			if (action === "queue") {
+				const queue = { steering: [...current(id).status.queue.steering], followUp: [...current(id).status.queue.followUp] };
+				if (parts[4] === "promote") {
+					const { message } = z.object({ message: z.string() }).parse(body);
+					const index = queue.followUp.indexOf(message);
+					if (index >= 0) { queue.followUp.splice(index, 1); queue.steering.push(message); emit(id, { t: "status", patch: { queue } }); }
+					return { promoted: index >= 0 };
+				}
+				const request = z.object({ message: z.string(), queue: z.enum(["steering", "followUp"]) }).parse(body);
+				const index = queue[request.queue].indexOf(request.message);
+				if (index >= 0) { queue[request.queue].splice(index, 1); emit(id, { t: "status", patch: { queue } }); }
+				return { removed: index >= 0 };
+			}
+			if (action === "edit") {
+				const request = z.object({ itemId: z.string(), text: z.string().min(1), images: promptImages }).parse(body);
+				const index = current(id).items.findIndex(item => item.id === request.itemId && item.kind === "user" && item.from === "human");
+				if (index < 0) throw new Error("Message not found");
+				rewind(id, index, request.text, request.images?.length ?? 0);
+				return { ok: true };
+			}
+			if (action === "retry") {
+				const items = current(id).items;
+				const index = items.findLastIndex(item => item.kind === "user");
+				const last = items[index];
+				if (last?.kind !== "user") throw new Error("Nothing to retry");
+				rewind(id, index, last.text, last.images);
+				return { ok: true };
+			}
 			if (action === "respond") {
 				const request = z.object({ requestId: z.string(), response: uiResponse }).parse(body);
 				const response = request.response;

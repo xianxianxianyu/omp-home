@@ -298,6 +298,19 @@ export function statusFromState(data: unknown): Partial<SessionStatus> {
 }
 
 /**
+ * The omp entry of a user message, from `get_branch_messages` (user messages with text, oldest first):
+ * among those with this text, the one `sameAfter` places from the end. Null when omp has no such message.
+ */
+export function branchEntry(data: unknown, text: string, sameAfter: number): string | null {
+	const same = arr(rec(data)?.messages).flatMap(raw => {
+		const m = rec(raw);
+		const entryId = str(m?.entryId);
+		return entryId && m?.text === text ? [entryId] : [];
+	});
+	return same[same.length - 1 - sameAfter] ?? null;
+}
+
+/**
  * A view built from `get_messages_page` messages (chronological). Ids are `h<index>` so
  * they never collide with live `messageId`s; IRC notices share the live dedupe id.
  */

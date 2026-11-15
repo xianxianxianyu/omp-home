@@ -48,7 +48,8 @@ interface Conn {
 /** WebSocket endpoint for omp extensions: per-process token auth, frame parsing, outbox delivery. */
 export class Bridge {
 	readonly #d: BridgeDeps;
-	readonly #wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+	/** A main-chat `capture` carries the message's raw JSON, prompt images included (up to 8 × 5 MiB, base64). */
+	readonly #wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
 	readonly #conns = new Map<string, Conn>();
 
 	constructor(deps: BridgeDeps) {

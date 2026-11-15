@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, Language, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
+import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, Language, PromptImage, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
 import type { BridgeToHub } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { TranscriptEvent, UiResponse } from "../shared/transcript.ts";
@@ -22,11 +22,11 @@ import { Provisioner } from "./provisioner.ts";
 import { RecipeChecks } from "./recipe-check.ts";
 import type { Resources } from "./resources.ts";
 import { RpcError, type RpcFrame } from "./rpc.ts";
-import { SessionViews } from "./session-views.ts";
+import { SessionViews, type HumanMessage } from "./session-views.ts";
 import { generatePstackPackage } from "./pstack.ts";
 import { SettingsStore } from "./settings.ts";
 import { createTools } from "./tools.ts";
-import { answerEvent, responseFits } from "./transcript.ts";
+import { answerEvent, branchEntry, responseFits, statusFromState } from "./transcript.ts";
 import type { UiChannel } from "./ui.ts";
 import { Workspaces, type WorkspaceRow } from "./workspaces.ts";
 import { WorktreeLifecycle, Worktrees } from "./worktrees.ts";
@@ -79,7 +79,10 @@ export class Hub {
 		this.#ui = opts.ui;
 		this.#log = opts.log;
 		this.omp = opts.omp;
-		this.views = new SessionViews((id, level, text) => this.#ui.toast(level, `${id}: ${render(text, this.#ui.language.lastSeen)}`));
+		this.views = new SessionViews(
+			(id, level, text) => this.#ui.toast(level, `${id}: ${render(text, this.#ui.language.lastSeen)}`),
+			id => this.ledger.promptTexts(id),
+		);
 		this.db = new Db(this.paths.db);
 		this.settings = new SettingsStore(this.db, this.paths);
 		this.ledger = new Ledger(this.db);
@@ -101,6 +104,7 @@ export class Hub {
 			hadOpenRun: id => this.ledger.latestForSession(id)?.run_open === 1,
 			viewers: id => this.views.subscribers(id),
 			seeded: (id, seed) => this.views.seed(id, seed),
+			rewound: (id, seed) => this.views.rewound(id, seed),
 			frame: (id, frame) => this.#onRpcFrame(id, frame),
 			ready: id => {
 				this.bridge.flush(id);
@@ -479,19 +483,65 @@ export class Hub {
 	 * A UI prompt: starts a cold session (human admission). It counts as human input before it is
 	 * sent, so the task is reopened (unsettled) before anything else can retire its worktree.
 	 */
-	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>): Promise<void> {
+	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>, images: readonly PromptImage[] = []): Promise<void> {
 		const session = this.#activeSession(id);
 		this.pool.ensureLive(id, { human: true });
 		this.#humanInput(session, text);
 		// streamingBehavior only applies while a run streams; when idle the prompt starts a turn.
-		await this.#command(id, "prompt", { message: text, streamingBehavior: mode === "steer" ? "steer" : "followUp" });
+		await this.#command(id, "prompt", {
+			message: text,
+			...(images.length ? { images: images.map(i => ({ type: "image", data: i.data, mimeType: i.mimeType })) } : {}),
+			streamingBehavior: mode === "steer" ? "steer" : "followUp",
+		});
 	}
 
-	async abort(id: string): Promise<void> {
+	/**
+	 * Stop the run. omp withdraws the queued input with it: the human's comes back (steering, then follow-ups)
+	 * for the composer; the hub's own deliveries go back to the outbox and are sent again.
+	 */
+	async abort(id: string): Promise<string[]> {
 		this.pool.must(id);
-		await this.pool.abort(id).catch(err => {
+		const withdrawn = await this.pool.abort(id).catch(err => {
 			throw err instanceof RpcError ? new HubError("conflict", messages.abortRefused(errorMessage(err))) : err;
 		});
+		const restored = this.ledger.requeueWithdrawn(id, withdrawn);
+		if (restored.length < withdrawn.length) this.bridge.flush(id);
+		return restored;
+	}
+
+	/** Withdraw one queued message; false when it was already delivered. */
+	async removeQueued(id: string, message: string, queue: "steering" | "followUp"): Promise<boolean> {
+		const r = await this.#command(id, "remove_queued_message", { message, queue });
+		return typeof r === "object" && r !== null && "removed" in r && r.removed === true;
+	}
+
+	/** Turn a queued follow-up into steering for the running turn; false when it was already delivered. */
+	async promoteQueued(id: string, message: string): Promise<boolean> {
+		const r = await this.#command(id, "promote_queued_message", { message });
+		return typeof r === "object" && r !== null && "promoted" in r && r.promoted === true;
+	}
+
+	/** Send `text` in place of the human's message `itemId`: omp rewinds to just before it, then runs the new text. */
+	async edit(id: string, itemId: string, text: string, images: readonly PromptImage[]): Promise<void> {
+		this.#activeSession(id);
+		await this.#resend(id, this.views.humanMessage(id, itemId), text, images);
+	}
+
+	/** Run the human's last message again from the point before it. omp's RPC returns no image data, so a message with images is edited instead. */
+	async retry(id: string): Promise<void> {
+		this.#activeSession(id);
+		const message = this.views.humanMessage(id, null);
+		if (message.images) throw new HubError("conflict", messages.retryImages());
+		await this.#resend(id, message, message.text, []);
+	}
+
+	async #resend(id: string, message: HumanMessage, text: string, images: readonly PromptImage[]): Promise<void> {
+		this.pool.ensureLive(id, { human: true });
+		if (statusFromState(await this.#command(id, "get_state", {})).phase !== "idle") throw new HubError("conflict", messages.editRunning(id));
+		const entryId = branchEntry(await this.#command(id, "get_branch_messages", {}), message.text, message.sameAfter);
+		if (!entryId) throw new HubError("conflict", messages.messageNotInOmp(id));
+		await this.pool.branch(id, entryId).catch(refused);
+		await this.prompt(id, text, "auto", images);
 	}
 
 	async respond(id: string, requestId: string, response: UiResponse): Promise<void> {
@@ -542,12 +592,7 @@ export class Hub {
 	async #command(id: string, type: string, params: Record<string, unknown>): Promise<unknown> {
 		this.#activeSession(id);
 		const rpc = await this.pool.client(id);
-		try {
-			return await rpc.request(type, params);
-		} catch (err) {
-			if (err instanceof RpcError) throw new HubError("conflict", { en: `omp: ${errorText(err)}`, zh: `omp: ${errorText(err, "zh")}` });
-			throw err;
-		}
+		return rpc.request(type, params).catch(refused);
 	}
 
 	cancelTask(taskId: string, by: "main" | "human", reason: string, dedupe: string, reasonMessage?: Message): DecisionRow | null {
@@ -749,4 +794,10 @@ export class Hub {
 			omp: this.omp.status(language),
 		};
 	}
+}
+
+/** omp's refusal of a command becomes a 409 with omp's message. */
+function refused(err: unknown): never {
+	if (err instanceof RpcError) throw new HubError("conflict", { en: `omp: ${errorText(err)}`, zh: `omp: ${errorText(err, "zh")}` });
+	throw err;
 }

@@ -1,6 +1,7 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Marked } from "marked";
 import DOMPurify from "dompurify";
+import { assistantText } from "../../shared/transcript.ts";
 import type { Item, SubagentView, ToolView, TranscriptView, UiRequest, UiResponse } from "../../shared/transcript.ts";
 import { useHub } from "./hub.tsx";
 import { useI18n, useT } from "./i18n/index.tsx";
@@ -80,12 +81,87 @@ function RequestCard({ item, respond }: { item: Extract<Item, { kind: "request" 
 	</section>;
 }
 
-export const TranscriptItem = memo(function TranscriptItem({ item, view, respond, openAgent }: { item: Item; view: TranscriptView; respond?: (id: string, response: UiResponse) => Promise<void>; openAgent: (id: string) => void }) {
-	const t = useT().session.transcript;
+/** Rewind and copy actions for the session's own transcript; nested subagent transcripts get none. */
+export interface MessageActions {
+	running: boolean;
+	connected: boolean;
+	main: boolean;
+	lastAssistantId: string | null;
+	edit: (itemId: string, text: string) => Promise<void>;
+	retry: () => Promise<void>;
+}
+
+function CopyAction({ text }: { text: string }) {
+	const t = useT().session.message;
+	const { toast } = useHub();
+	const [copied, setCopied] = useState(false);
+	useEffect(() => { if (!copied) return; const timer = setTimeout(() => setCopied(false), 1500); return () => clearTimeout(timer); }, [copied]);
+	return <button type="button" className="message-action" onClick={async () => { try { await navigator.clipboard.writeText(text); setCopied(true); } catch (cause) { toast(cause instanceof Error ? cause.message : catalog => catalog.common.clipboardError, "error"); } }}>{copied ? t.copied : t.copy}</button>;
+}
+/** Edit and Retry rewind the conversation, so they wait until the turn is stopped; aria-disabled keeps them focusable with the reason as tooltip. */
+function RewindAction({ actions, label, hint, run }: { actions: MessageActions; label: string; hint: string; run: () => void | Promise<void> }) {
+	const t = useT().session.message;
+	const [busy, setBusy] = useState(false);
+	const blocked = actions.running || !actions.connected || busy;
+	return <button type="button" className="message-action" aria-disabled={blocked} title={actions.running ? t.stopFirst : hint} onClick={async () => { if (blocked) return; setBusy(true); try { await run(); } finally { setBusy(false); } }}>{label}</button>;
+}
+
+function MessageEditor({ item, actions, close }: { item: Extract<Item, { kind: "user" }>; actions: MessageActions; close: () => void }) {
+	const t = useT().session.message;
 	const { format } = useI18n();
-	if (item.kind === "user") return <article className={`message user-message ${item.from}`} data-item={item.id}><div className="message-label">{item.from === "human" ? t.you : t.delegated}</div><div className="user-bubble">{item.text}{item.images > 0 && <span className="hint"> · {t.images(item.images, format.number(item.images))}</span>}</div></article>;
+	const [text, setText] = useState(item.text);
+	const [pending, setPending] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const field = useRef<HTMLTextAreaElement>(null);
+	useEffect(() => { const element = field.current; if (element) { element.focus(); element.setSelectionRange(element.value.length, element.value.length); } }, []);
+	const blocked = actions.running || !actions.connected;
+	const save = async () => {
+		if (!text.trim() || pending || blocked) return;
+		setPending(true); setError(null);
+		try { await actions.edit(item.id, text); close(); }
+		catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+		finally { setPending(false); }
+	};
+	// data-menu: Escape here cancels the edit instead of closing the task view behind it.
+	return <form className="message-editor" data-menu aria-label={t.editLabel} onSubmit={event => { event.preventDefault(); void save(); }}>
+		<textarea ref={field} aria-label={t.editLabel} value={text} rows={3} readOnly={pending} onChange={event => setText(event.target.value)} onKeyDown={event => {
+			if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+			if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
+			else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); void save(); }
+		}} />
+		<p className="message-editor-note">{actions.main ? t.editNoteMain : t.editNote}</p>
+		{item.images > 0 && <p className="message-editor-note">{t.editImages(item.images, format.number(item.images))}</p>}
+		{error && <p className="error-text" role="alert">{error}</p>}
+		<div className="row"><span className="spacer" /><button type="button" className="btn small" disabled={pending} onClick={close}>{t.cancel}</button><button className="btn small primary" disabled={pending || blocked || !text.trim()} title={actions.running ? t.stopFirst : undefined}>{pending ? t.saving : t.save}</button></div>
+	</form>;
+}
+
+function UserMessage({ item, actions }: { item: Extract<Item, { kind: "user" }>; actions?: MessageActions }) {
+	const t = useT().session;
+	const { format } = useI18n();
+	const [editing, setEditing] = useState(false);
+	const own = item.from === "human" ? actions : undefined;
+	return <article className={`message user-message ${item.from}`} data-item={item.id}>
+		<div className="message-label">{item.from === "human" ? t.transcript.you : t.transcript.delegated}</div>
+		{editing && own ? <MessageEditor item={item} actions={own} close={() => setEditing(false)} /> : <>
+			<div className="user-bubble">{item.text}{item.images > 0 && <span className="hint"> · {t.transcript.images(item.images, format.number(item.images))}</span>}</div>
+			{own && <div className="message-actions" role="group" aria-label={t.message.actions}><RewindAction actions={own} label={t.message.edit} hint={t.message.editLabel} run={() => setEditing(true)} />{item.text && <CopyAction text={item.text} />}</div>}
+		</>}
+	</article>;
+}
+
+export const TranscriptItem = memo(function TranscriptItem({ item, view, respond, openAgent, actions }: { item: Item; view: TranscriptView; respond?: (id: string, response: UiResponse) => Promise<void>; openAgent: (id: string) => void; actions?: MessageActions }) {
+	const session = useT().session;
+	const t = session.transcript;
+	const { format } = useI18n();
+	if (item.kind === "user") return <UserMessage item={item} actions={actions} />;
 	if (item.kind === "notice") return <article className={`notice-card ${item.source}`} data-item={item.id}><div className="message-label">{item.source === "irc" ? t.from(item.from ?? t.agent) : item.source === "omp-home" ? t.homeSystem : item.from ?? t.system}</div><div>{item.text}</div></article>;
 	if (item.kind === "request") return <RequestCard item={item} respond={respond} />;
+	const aborted = item.stopReason === "aborted";
+	const text = assistantText(item);
+	const retry = actions?.lastAssistantId === item.id;
+	const actionRow = actions && !item.streaming && (retry || text.trim()) ? <div className="message-actions" role="group" aria-label={session.message.actions}>{retry && <RewindAction actions={actions} label={session.message.retry} hint={session.message.retryHint} run={actions.retry} />}{text.trim() && <CopyAction text={text} />}</div> : null;
+	if (aborted && !item.blocks.some(block => block.kind === "tool" || block.text.trim())) return <article className="message stopped-message" data-item={item.id}><div className="stopped-marker">{session.message.stopped}</div>{actionRow}</article>;
 	return <article className="message assistant-message" data-item={item.id}><div className="message-label">omp{item.streaming && <span className="streaming-dot" />}</div>{item.blocks.map((block, index) => {
 		if (block.kind === "text") return <Markdown text={block.text} key={index} />;
 		if (block.kind === "thinking") {
@@ -93,5 +169,5 @@ export const TranscriptItem = memo(function TranscriptItem({ item, view, respond
 			return <details className="thinking-block" key={index}><summary>{t.thinking(count, format.number(count))}</summary><div>{block.text}</div></details>;
 		}
 		return view.tools[block.callId] ? <ToolCard tool={view.tools[block.callId]} subagents={view.subagents} openAgent={openAgent} key={block.callId} /> : null;
-	})}{item.error && <p role="alert" className="error-text">{item.error}</p>}</article>;
+	})}{aborted ? <div className="stopped-marker">{session.message.stopped}</div> : item.error && <p role="alert" className="error-text">{item.error}</p>}{actionRow}</article>;
 });
