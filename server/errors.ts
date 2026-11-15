@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { FieldError, Language } from "../shared/api.ts";
 import { render, type Message } from "./i18n.ts";
 
-export type HubErrorCode = "invalid" | "not_found" | "conflict" | "forbidden" | "unavailable" | "unprocessable" | "setup_required" | "not_implemented";
+export type HubErrorCode = "invalid" | "not_found" | "conflict" | "forbidden" | "too_large" | "unavailable" | "unprocessable" | "setup_required" | "not_implemented";
 
 const STATUS: Record<HubErrorCode, number> = {
 	invalid: 400,
@@ -10,6 +10,7 @@ const STATUS: Record<HubErrorCode, number> = {
 	not_found: 404,
 	conflict: 409,
 	setup_required: 409,
+	too_large: 413,
 	unprocessable: 422,
 	not_implemented: 501,
 	unavailable: 503,

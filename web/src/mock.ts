@@ -1,6 +1,6 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { BranchDTO, BranchesDTO, ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeCheckDTO, RecipeCheckStep, RecipeDTO, RepoInspection, RepoSuggestion, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
+import type { BranchDTO, BranchesDTO, ChatRecordDTO, DecisionDTO, EscalationDTO, ModelCatalogDTO, RecipeCheckDTO, RecipeCheckStep, RecipeDTO, RepoInspection, RepoSuggestion, PathStatDTO, ResourcesDTO, SearchHit, SessionDTO, SettingsDTO, SetupPreview, StateDTO, TaskDetail, Topic, UiEvent, WorkspaceDTO } from "../../shared/api.ts";
 import { installSocketFactory } from "./transport.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { createMockSessions } from "./mock-sessions.ts";
@@ -176,6 +176,9 @@ function state(): StateDTO { return { version: "mock", omp: { version: "18.20.0"
 const bodySchema = z.record(z.string(), z.unknown());
 const text = (body: Record<string, unknown>, key: string, fallback = "") => typeof body[key] === "string" ? body[key] : fallback;
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } }); }
+/** Folders the mock has handed out (uploaded folders, the fake Finder copy), so stat and attachment blocks can tell them from files. */
+const folders = new Set([`${root}/atlas/src/search`, `${root}/atlas/fixtures`]);
+let uploads = 0;
 const sessionMock = createMockSessions((command, sessionId) => {
 	if (command === "/focus") { escalation.resolvedAt = null; escalation.resolution = null; emit({ t: "focus", sessionId: "W-12", escalationId: escalation.id, reason: escalation.reason }); invalidate(["inbox", "state"]); }
 	else if (command === "/pause") { main.paused = true; main.wakesUsed = main.wakesMax; invalidate(["state", "inbox"]); }
@@ -193,7 +196,7 @@ const sessionMock = createMockSessions((command, sessionId) => {
 			invalidate(["inbox", "state", "tasks", `task:${task.id}`]);
 		}
 	}
-});
+}, path => folders.has(path));
 const intents = ["Reading changed-file ownership", "Verifying incremental index updates", "Reviewing search test evidence"];
 let intentIndex = 0;
 window.setInterval(() => {
@@ -217,6 +220,17 @@ window.setInterval(() => {
 			}
 			if (route === "models") { if (url.searchParams.get("refresh") === "1") catalog.fetchedAt = Date.now(); return response(catalog); }
 			if (route === "pick-folder") return response({ path: `${root}/website` });
+			if (route === "uploads" && method === "POST") {
+				const headers = new Headers(init?.headers);
+				const relativePath = decodeURIComponent(headers.get("x-relative-path") ?? headers.get("x-file-name") ?? "file");
+				const base = `${home}/.omp-home/uploads/${new Date().toISOString().slice(0, 10)}/${headers.get("x-upload-group") ?? `upload-${++uploads}`}`;
+				const folder = headers.has("x-relative-path") && relativePath.includes("/") ? `${base}/${relativePath.split("/")[0]}` : null;
+				if (folder) folders.add(folder);
+				return response({ path: `${base}/${relativePath}`, ...(folder ? { folder } : {}) });
+			}
+			// Tests set this flag to stand in for files copied in Finder.
+			if (route === "clipboard" && id === "files") return response({ paths: localStorage.getItem("omp-home-mock-clipboard-files") === "1" ? [`${root}/atlas/docs/search-results.pdf`, `${root}/atlas/fixtures`] : [] });
+			if (route === "paths" && id === "stat") return response({ items: z.array(z.string()).parse(body.paths).map(path => ({ path, kind: path.startsWith(`${root}/missing/`) ? "missing" as const : folders.has(path) ? "folder" as const : "file" as const })) } satisfies PathStatDTO);
 			if (route === "settings") {
 				if (method === "PUT") {
 					const nextAppearance = body.appearance === undefined ? settings.appearance : { ...settings.appearance, ...bodySchema.parse(body.appearance) };

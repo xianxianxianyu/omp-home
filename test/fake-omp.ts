@@ -7,7 +7,8 @@
  * Prompts sent with `streamingBehavior`, and outbox prompts delivered, while a run is going wait in a
  * steering/follow-up queue (`queue_update`, `get_state`) and run after it; `abort_and_restore_queue` withdraws them.
  *
- * Human prompts (RPC `prompt`): main echoes ("echo: <text>", plus "[<mimeType> <bytes>B, …]" for images),
+ * Human prompts (RPC `prompt`) are recorded as JSONL `{ text, images: [{ mimeType, data }] }` in `<session-dir>/fake-prompts.jsonl`.
+ * Main echoes them ("echo: <text>", plus "[<mimeType> <bytes>B, …]" for images),
  * except these markers in the text
  *   [fake:ask]              a select dialog; the turn answers "PICKED <value>"
  *   [fake:hang]             the turn runs until aborted
@@ -517,6 +518,7 @@ function command(frame: Json): void {
 			respond(id, type, { agentInvoked: true });
 			const text = String(frame.message);
 			const images = Array.isArray(frame.images) ? (frame.images as Json[]) : [];
+			fs.appendFileSync(path.join(sessionDir, "fake-prompts.jsonl"), `${JSON.stringify({ text, images: images.map(i => ({ mimeType: i.mimeType, data: i.data })) })}\n`);
 			const behavior = frame.streamingBehavior === "steer" ? "steering" : frame.streamingBehavior === "followUp" ? "followUp" : null;
 			return submit(behavior, text, () => (role === "worker" ? workerTurn(text, images) : mainPrompt(text, images)));
 		}

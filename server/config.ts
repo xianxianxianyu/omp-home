@@ -74,6 +74,8 @@ export interface HomePaths {
 	run: string;
 	pstackPackage: string;
 	backup: string;
+	/** Files the browser UI uploaded so omp can read them by path; day folders older than 30 days go at startup. */
+	uploads: string;
 	repos: string;
 	agents: string;
 	overlay(role: "main" | "worker"): string;
@@ -94,6 +96,7 @@ export function homePaths(home: string): HomePaths {
 		run,
 		pstackPackage: path.join(run, "pstack"),
 		backup: path.join(data, "backup"),
+		uploads: path.join(data, "uploads"),
 		repos: path.join(home, "repos"),
 		agents: path.join(home, "AGENTS.md"),
 		overlay: role => path.join(run, `${role}.yml`),

@@ -74,6 +74,9 @@ export function parseResponse(path: string, data: unknown): unknown {
 	else if (p === "/api/decisions") schema = z.array(decision);
 	else if (p.startsWith("/api/decisions/")) schema = decision;
 	else if (p === "/api/pick-folder") schema = z.object({ path: nullableText });
+	else if (p === "/api/uploads") schema = z.object({ path: z.string(), folder: z.string().optional() });
+	else if (p === "/api/clipboard/files") schema = z.object({ paths: z.array(z.string()) });
+	else if (p === "/api/paths/stat") schema = z.object({ items: z.array(z.object({ path: z.string(), kind: z.enum(["file", "folder", "missing"]) })) });
 	else if (p === "/api/workspaces/suggestions") schema = z.array(repoSuggestion);
 	else if (p === "/api/workspaces/inspect") schema = repoInspection;
 	else if (/^\/api\/workspaces\/[^/]+\/branches$/.test(p)) schema = branches;

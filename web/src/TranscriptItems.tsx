@@ -1,8 +1,11 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Marked } from "marked";
 import DOMPurify from "dompurify";
+import { parseAttachmentBlock } from "../../shared/attachments.ts";
 import { assistantText } from "../../shared/transcript.ts";
 import type { Item, SubagentView, ToolView, TranscriptView, UiRequest, UiResponse } from "../../shared/transcript.ts";
+import { PathChips, SentPathChips } from "./attachments.tsx";
+import type { AttachedPath } from "./attachments.tsx";
 import { useHub } from "./hub.tsx";
 import { useI18n, useT } from "./i18n/index.tsx";
 
@@ -87,7 +90,7 @@ export interface MessageActions {
 	connected: boolean;
 	main: boolean;
 	lastAssistantId: string | null;
-	edit: (itemId: string, text: string) => Promise<void>;
+	edit: (itemId: string, text: string, attachments: AttachedPath[]) => Promise<void>;
 	retry: () => Promise<void>;
 }
 
@@ -109,21 +112,24 @@ function RewindAction({ actions, label, hint, run }: { actions: MessageActions; 
 function MessageEditor({ item, actions, close }: { item: Extract<Item, { kind: "user" }>; actions: MessageActions; close: () => void }) {
 	const t = useT().session.message;
 	const { format } = useI18n();
-	const [text, setText] = useState(item.text);
+	const [text, setText] = useState(() => parseAttachmentBlock(item.text).text);
+	const [paths, setPaths] = useState(() => parseAttachmentBlock(item.text).attachments);
 	const [pending, setPending] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const field = useRef<HTMLTextAreaElement>(null);
 	useEffect(() => { const element = field.current; if (element) { element.focus(); element.setSelectionRange(element.value.length, element.value.length); } }, []);
 	const blocked = actions.running || !actions.connected;
+	const empty = !text.trim() && !paths.length;
 	const save = async () => {
-		if (!text.trim() || pending || blocked) return;
+		if (empty || pending || blocked) return;
 		setPending(true); setError(null);
-		try { await actions.edit(item.id, text); close(); }
+		try { await actions.edit(item.id, text, paths); close(); }
 		catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
 		finally { setPending(false); }
 	};
 	// data-menu: Escape here cancels the edit instead of closing the task view behind it.
 	return <form className="message-editor" data-menu aria-label={t.editLabel} onSubmit={event => { event.preventDefault(); void save(); }}>
+		<PathChips items={paths} remove={path => setPaths(current => current.filter(item => item.path !== path))} />
 		<textarea ref={field} aria-label={t.editLabel} value={text} rows={3} readOnly={pending} onChange={event => setText(event.target.value)} onKeyDown={event => {
 			if (event.nativeEvent.isComposing || event.keyCode === 229) return;
 			if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
@@ -132,7 +138,7 @@ function MessageEditor({ item, actions, close }: { item: Extract<Item, { kind: "
 		<p className="message-editor-note">{actions.main ? t.editNoteMain : t.editNote}</p>
 		{item.images > 0 && <p className="message-editor-note">{t.editImages(item.images, format.number(item.images))}</p>}
 		{error && <p className="error-text" role="alert">{error}</p>}
-		<div className="row"><span className="spacer" /><button type="button" className="btn small" disabled={pending} onClick={close}>{t.cancel}</button><button className="btn small primary" disabled={pending || blocked || !text.trim()} title={actions.running ? t.stopFirst : undefined}>{pending ? t.saving : t.save}</button></div>
+		<div className="row"><span className="spacer" /><button type="button" className="btn small" disabled={pending} onClick={close}>{t.cancel}</button><button className="btn small primary" disabled={pending || blocked || empty} title={actions.running ? t.stopFirst : undefined}>{pending ? t.saving : t.save}</button></div>
 	</form>;
 }
 
@@ -141,11 +147,13 @@ function UserMessage({ item, actions }: { item: Extract<Item, { kind: "user" }>;
 	const { format } = useI18n();
 	const [editing, setEditing] = useState(false);
 	const own = item.from === "human" ? actions : undefined;
+	const { text, attachments } = parseAttachmentBlock(item.text);
 	return <article className={`message user-message ${item.from}`} data-item={item.id}>
 		<div className="message-label">{item.from === "human" ? t.transcript.you : t.transcript.delegated}</div>
 		{editing && own ? <MessageEditor item={item} actions={own} close={() => setEditing(false)} /> : <>
-			<div className="user-bubble">{item.text}{item.images > 0 && <span className="hint"> · {t.transcript.images(item.images, format.number(item.images))}</span>}</div>
-			{own && <div className="message-actions" role="group" aria-label={t.message.actions}><RewindAction actions={own} label={t.message.edit} hint={t.message.editLabel} run={() => setEditing(true)} />{item.text && <CopyAction text={item.text} />}</div>}
+			{attachments.length > 0 && <SentPathChips items={attachments} />}
+			{(text || item.images > 0 || !attachments.length) && <div className="user-bubble">{text}{item.images > 0 && <span className="hint"> · {t.transcript.images(item.images, format.number(item.images))}</span>}</div>}
+			{own && <div className="message-actions" role="group" aria-label={t.message.actions}><RewindAction actions={own} label={t.message.edit} hint={t.message.editLabel} run={() => setEditing(true)} />{text && <CopyAction text={text} />}</div>}
 		</>}
 	</article>;
 }

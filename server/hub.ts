@@ -2,9 +2,11 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { CommandDTO, DecisionDTO, EscalationDTO, InboxDTO, Language, PromptImage, PromptRequest, SessionDTO, StateDTO, TaskDetail, TaskProgress, TaskSummary, Topic } from "../shared/api.ts";
+import type { Attachment } from "../shared/attachments.ts";
 import type { BridgeToHub } from "../shared/bridge-wire.ts";
 import type { CheckoutSpec } from "../shared/tools.ts";
 import type { TranscriptEvent, UiResponse } from "../shared/transcript.ts";
+import { composeMessage, reattachedImages, sweepUploads, type OutgoingMessage } from "./attachments.ts";
 import { Bridge, type CallFrame, type CallResult } from "./bridge.ts";
 import { homePaths, type HomePaths } from "./config.ts";
 import { progressPhase } from "./core/task.ts";
@@ -162,6 +164,7 @@ export class Hub {
 	/** Startup reconciliation, in order; each step is idempotent. Then start the main chat. */
 	async start(): Promise<void> {
 		this.settings.writeOverlays();
+		sweepUploads(this.paths.uploads);
 		generatePstackPackage(this.settings.get().pstackRoot, this.paths.pstackPackage);
 		await this.pool.reconcile();
 		for (const task of this.ledger.runningTasks()) {
@@ -483,14 +486,18 @@ export class Hub {
 	 * A UI prompt: starts a cold session (human admission). It counts as human input before it is
 	 * sent, so the task is reopened (unsettled) before anything else can retire its worktree.
 	 */
-	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>, images: readonly PromptImage[] = []): Promise<void> {
+	async prompt(id: string, text: string, mode: NonNullable<PromptRequest["mode"]>, images: readonly PromptImage[] = [], attachments: readonly Attachment[] = []): Promise<void> {
+		await this.#send(id, await composeMessage(text, images, attachments), mode);
+	}
+
+	async #send(id: string, message: OutgoingMessage, mode: NonNullable<PromptRequest["mode"]>): Promise<void> {
 		const session = this.#activeSession(id);
 		this.pool.ensureLive(id, { human: true });
-		this.#humanInput(session, text);
+		this.#humanInput(session, message.text);
 		// streamingBehavior only applies while a run streams; when idle the prompt starts a turn.
 		await this.#command(id, "prompt", {
-			message: text,
-			...(images.length ? { images: images.map(i => ({ type: "image", data: i.data, mimeType: i.mimeType })) } : {}),
+			message: message.text,
+			...(message.images.length ? { images: message.images.map(i => ({ type: "image", data: i.data, mimeType: i.mimeType })) } : {}),
 			streamingBehavior: mode === "steer" ? "steer" : "followUp",
 		});
 	}
@@ -522,26 +529,31 @@ export class Hub {
 	}
 
 	/** Send `text` in place of the human's message `itemId`: omp rewinds to just before it, then runs the new text. */
-	async edit(id: string, itemId: string, text: string, images: readonly PromptImage[]): Promise<void> {
+	async edit(id: string, itemId: string, text: string, images: readonly PromptImage[], attachments: readonly Attachment[]): Promise<void> {
 		this.#activeSession(id);
-		await this.#resend(id, this.views.humanMessage(id, itemId), text, images);
+		const message = this.views.humanMessage(id, itemId);
+		await this.#resend(id, message, await composeMessage(text, images, attachments));
 	}
 
-	/** Run the human's last message again from the point before it. omp's RPC returns no image data, so a message with images is edited instead. */
+	/**
+	 * Run the human's last message again from the point before it: its text as omp stored it, attachment block included.
+	 * omp's RPC returns no image data, so images come back only from attached files; a message with pasted images is edited instead.
+	 */
 	async retry(id: string): Promise<void> {
 		this.#activeSession(id);
 		const message = this.views.humanMessage(id, null);
-		if (message.images) throw new HubError("conflict", messages.retryImages());
-		await this.#resend(id, message, message.text, []);
+		const images = message.images ? await reattachedImages(message.text, message.images) : [];
+		if (!images) throw new HubError("conflict", messages.retryImages());
+		await this.#resend(id, message, { text: message.text, images });
 	}
 
-	async #resend(id: string, message: HumanMessage, text: string, images: readonly PromptImage[]): Promise<void> {
+	async #resend(id: string, message: HumanMessage, next: OutgoingMessage): Promise<void> {
 		this.pool.ensureLive(id, { human: true });
 		if (statusFromState(await this.#command(id, "get_state", {})).phase !== "idle") throw new HubError("conflict", messages.editRunning(id));
 		const entryId = branchEntry(await this.#command(id, "get_branch_messages", {}), message.text, message.sameAfter);
 		if (!entryId) throw new HubError("conflict", messages.messageNotInOmp(id));
 		await this.pool.branch(id, entryId).catch(refused);
-		await this.prompt(id, text, "auto", images);
+		await this.#send(id, next, "auto");
 	}
 
 	async respond(id: string, requestId: string, response: UiResponse): Promise<void> {

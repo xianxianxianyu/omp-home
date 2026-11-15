@@ -31,12 +31,8 @@ export class ApiError extends Error {
 	}
 }
 
-export async function api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-	const res = await fetch(path, {
-		method: init?.method ?? (init?.body === undefined ? "GET" : "POST"),
-		headers: { authorization: `Bearer ${token}`, [LANGUAGE_HEADER]: getLanguage(), ...(init?.body === undefined ? {} : { "content-type": "application/json" }) },
-		body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-	});
+async function request<T>(path: string, init: { method: string; headers?: Record<string, string>; body?: BodyInit }): Promise<T> {
+	const res = await fetch(path, { method: init.method, headers: { authorization: `Bearer ${token}`, [LANGUAGE_HEADER]: getLanguage(), ...init.headers }, body: init.body });
 	const text = await res.text();
 	const data: unknown = text ? JSON.parse(text) : null;
 	if (!res.ok) {
@@ -44,6 +40,20 @@ export async function api<T>(path: string, init?: { method?: string; body?: unkn
 		throw new ApiError(res.status, error.success ? error.data.error : res.statusText, error.success ? error.data.errors : []);
 	}
 	return parseResponse(path, data) as T;
+}
+
+export async function api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+	if (init?.body === undefined) return request<T>(path, { method: init?.method ?? "GET" });
+	return request<T>(path, { method: init.method ?? "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(init.body) });
+}
+
+/** Stores a browser File on the hub so omp can read it by path; files sharing a `group` land in one folder under their relative paths. */
+export function upload(file: File, folder?: { group: string; relativePath: string }): Promise<{ path: string; folder?: string }> {
+	return request("/api/uploads", { method: "POST", body: file, headers: {
+		"content-type": "application/octet-stream",
+		"x-file-name": encodeURIComponent(file.name),
+		...(folder ? { "x-upload-group": folder.group, "x-relative-path": encodeURIComponent(folder.relativePath) } : {}),
+	} });
 }
 
 export function wsUrl(path: string): string {

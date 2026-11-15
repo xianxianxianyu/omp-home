@@ -1,8 +1,11 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AbortResult, CommandDTO, EditRequest, RespondRequest } from "../../shared/api.ts";
+import { parseAttachmentBlock } from "../../shared/attachments.ts";
 import { emptyTranscript, reduceTranscript } from "../../shared/transcript.ts";
 import type { Item, SubagentView, TranscriptEvent, TranscriptView, UiResponse } from "../../shared/transcript.ts";
 import { api } from "./api.ts";
+import { mergePaths } from "./attachments.tsx";
+import type { AttachedPath } from "./attachments.tsx";
 import { useHub } from "./hub.tsx";
 import { useI18n, useT } from "./i18n/index.tsx";
 import { connectSocket } from "./transport.ts";
@@ -96,6 +99,7 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 	const [drawer, setDrawer] = useState(false);
 	const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
 	const [draft, setDraft] = useDraft(sessionId);
+	const [draftPaths, setDraftPaths] = useState<AttachedPath[]>([]);
 	const [restored, setRestored] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	/** Item the run was stopped after; a local "Stopped" marker goes there unless omp's aborted message already shows one. */
@@ -138,7 +142,13 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 		} catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
 		finally { setLoadingHistory(false); }
 	};
-	const toComposer = useCallback((texts: string[]) => { setDraft(current => appendParagraphs(current, texts)); input.current?.focus(); }, [setDraft]);
+	/** Withdrawn or edited messages carry their attachments as a block; the text goes back to the editor and the paths back to chips. */
+	const toComposer = useCallback((texts: string[]) => {
+		const parsed = texts.map(text => parseAttachmentBlock(text));
+		setDraft(current => appendParagraphs(current, parsed.map(item => item.text)));
+		setDraftPaths(current => mergePaths(current, parsed.flatMap(item => item.attachments)));
+		input.current?.focus();
+	}, [setDraft]);
 	const lastItemId = view.items.at(-1)?.id ?? null;
 	const abort = useCallback(async () => {
 		setStopping(true);
@@ -151,7 +161,7 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 		finally { setStopping(false); }
 	}, [base, lastItemId, toComposer]);
 	const respond = useCallback(async (requestId: string, response: UiResponse) => { await api(`${base}/respond`, { body: { requestId, response } satisfies RespondRequest }); }, [base]);
-	const edit = useCallback(async (itemId: string, text: string) => { await api(`${base}/edit`, { body: { itemId, text } satisfies EditRequest }); }, [base]);
+	const edit = useCallback(async (itemId: string, text: string, attachments: AttachedPath[]) => { await api(`${base}/edit`, { body: { itemId, text, ...(attachments.length ? { attachments: attachments.map(({ path }) => ({ path })) } : {}) } satisfies EditRequest }); }, [base]);
 	const retryTurn = useCallback(async () => {
 		try { await api(`${base}/retry`, { method: "POST" }); setActionError(null); }
 		catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
@@ -169,7 +179,7 @@ export function SessionView({ sessionId, focused, main = false, escapeAborts = m
 		</div></div>
 		<div className="session-bottom">{!following && <button className="jump-latest" onClick={jump}>{t.jumpLatest}</button>}{actionError && <div className="session-error" role="alert">{actionError}</div>}<QueueChips sessionId={sessionId} queue={view.status.queue} connected={connected} edit={text => toComposer([text])} />
 			{Object.entries(view.status.statusLine).map(([key, line]) => <div className="extension-status" key={key}>{line}</div>)}{Object.entries(view.status.widgets).map(([key, lines]) => <details className="extension-widget" key={key}><summary>{key}</summary><pre>{lines.join("\n")}</pre></details>)}
-			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} input={input} text={draft} setText={setDraft} note={restored ? t.composer.restored : null} clearNote={() => setRestored(false)} abort={abort} stopping={stopping} escapeAborts={escapeAborts} onNewChat={onNewChat} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
+			<Composer key={sessionId} sessionId={sessionId} connected={connected} running={running} commands={commands} focused={focused} main={main} input={input} text={draft} setText={setDraft} paths={draftPaths} setPaths={setDraftPaths} note={restored ? t.composer.restored : null} clearNote={() => setRestored(false)} abort={abort} stopping={stopping} escapeAborts={escapeAborts} onNewChat={onNewChat} meta={[view.status.model, view.status.contextPercent !== null ? t.context(format.percent(Math.round(view.status.contextPercent) / 100)) : null].filter(Boolean).join(" · ")} />
 		</div>{drawer && <SubagentPanel agents={view.subagents} selected={selectedAgent} select={setSelectedAgent} close={() => setDrawer(false)} sessionId={sessionId} connected={connected} />}
 	</section>;
 }

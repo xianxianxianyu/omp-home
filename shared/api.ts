@@ -32,6 +32,12 @@
  *   POST /api/sessions/:id/queue/promote {message}       → { promoted: boolean }  (queued follow-up → steer the running turn now)
  *   POST /api/sessions/:id/edit  EditRequest  → { ok: true }    (rewind to before a user message and send new text in its place)
  *   POST /api/sessions/:id/retry            → { ok: true }       (rewind to before the last user message and send it again)
+ *   POST /api/uploads   raw bytes; headers x-file-name, x-relative-path?, x-upload-group? → { path, folder? }   (browser-only fallback:
+ *                                                      store a dropped/picked file under <home>/.omp-home/uploads/<day>/<group>/<relative path>;
+ *                                                      header values encodeURIComponent'd; one client-chosen group ([A-Za-z0-9_-]{1,64}) per
+ *                                                      folder drop; folder = the group's top folder when the relative path has one; ≤ 100 MB → 413)
+ *   GET  /api/clipboard/files               → { paths: string[] }   (file/folder URLs on the macOS pasteboard, e.g. copied in Finder)
+ *   POST /api/paths/stat {paths}            → PathStatDTO           (what each path is now, in request order; ≤ MAX_ATTACHMENTS; never reads contents)
  *   POST /api/sessions/:id/respond RespondRequest → { ok: true }  (answer a pending `request` item)
  *   GET  /api/sessions/:id/commands         → CommandDTO[]      (slash commands for the composer)
  *   GET  /api/sessions/:id/history ?before=<cursor> → TranscriptEvent of kind "prepend"
@@ -66,6 +72,7 @@
  *   /api/events   server → client JSON UiEvent; the client re-fetches the named topics over HTTP.
  *   /api/sessions/:id/stream  server → client JSON TranscriptEvent (`reset` first, then increments); starts the session if cold.
  */
+import type { Attachment } from "./attachments.ts";
 import type { UiResponse } from "./transcript.ts";
 import type { CheckoutSpec } from "./tools.ts";
 
@@ -546,6 +553,8 @@ export interface PromptRequest {
 	mode?: "auto" | "steer" | "followUp";
 	/** At most MAX_PROMPT_IMAGES images, each ≤ MAX_PROMPT_IMAGE_BYTES decoded. */
 	images?: PromptImage[];
+	/** Files and folders on this machine, by absolute path. See shared/attachments.ts for how they reach omp. */
+	attachments?: Attachment[];
 }
 
 /** Queued input withdrawn by the stop, oldest first (steering before follow-ups), so nothing typed is lost or silently stuck. */
@@ -558,6 +567,12 @@ export interface EditRequest {
 	itemId: string;
 	text: string;
 	images?: PromptImage[];
+	attachments?: Attachment[];
+}
+
+export interface PathStatDTO {
+	/** Request order. A non-absolute or unreadable path is "missing"; symlinks count as what they point to. */
+	items: { path: string; kind: "file" | "folder" | "missing" }[];
 }
 
 export interface RespondRequest {

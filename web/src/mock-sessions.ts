@@ -3,6 +3,7 @@ import { emptyTranscript, reduceTranscript } from "../../shared/transcript.ts";
 import type { Item, ToolView, TranscriptEvent, TranscriptView } from "../../shared/transcript.ts";
 import { MAX_PROMPT_IMAGE_BYTES, MAX_PROMPT_IMAGES, PROMPT_IMAGE_TYPES } from "../../shared/api.ts";
 import type { AbortResult, CommandDTO } from "../../shared/api.ts";
+import { MAX_ATTACHMENTS, parseAttachmentBlock, withAttachmentBlock } from "../../shared/attachments.ts";
 import type { SocketHandlers } from "./transport.ts";
 import { uiResponse } from "./transcript-schema.ts";
 
@@ -35,7 +36,8 @@ function seed(sessionId: string): TranscriptView {
 		{ callId: "dispatch-1", name: "home_dispatch", intent: "Routing isolated search work", args: { title: "Make search indexing incremental", workspace: "atlas", playbook: "feature" }, output: '{"task":"T-11","session":"W-11","status":"working"}', status: "done", startedAt: now - 80000, endedAt: now - 78000 },
 		{ callId: "task-1", name: "task", intent: "Reviewing boundaries in parallel", args: { tasks: [{ agent: "scout", task: "Trace the indexing boundary" }, { agent: "reviewer", task: "Review migration risks" }] }, output: "Spawned scout-1 and reviewer-1. Results arrive automatically.", status: "done", startedAt: now - 76000, endedAt: now - 75000 },
 	];
-	apply({ t: "item", item: { kind: "user", id: "user-1", at: now - 100000, text: isMain ? "让 Atlas 的搜索支持增量索引。顺便看看 Console 的账户迁移，两个任务保持隔离。" : "Review the account migration. Preserve existing data and show the reversible path.", images: 0, from: "human" } });
+	const firstRequest = isMain ? withAttachmentBlock("让 Atlas 的搜索支持增量索引。顺便看看 Console 的账户迁移，两个任务保持隔离。", [{ path: "/tmp/omp-home-demo/atlas/docs/search-design.md", folder: false }, { path: "/tmp/omp-home-demo/atlas/src/search", folder: true }]) : "Review the account migration. Preserve existing data and show the reversible path.";
+	apply({ t: "item", item: { kind: "user", id: "user-1", at: now - 100000, text: firstRequest, images: 0, from: "human" } });
 	const reply = assistant("assistant-1", isMain ? "我会把工作拆成两个独立任务，先检查现有边界，再让 worker 在各自的 worktree 里推进。\n\n**你只需要处理真正需要判断的决定。** 进展和证据会留在这里。" : "The migration is isolated in this worktree. I recommend **adding the new column first**, then backfilling and removing the legacy column in a separate release.", now - 95000);
 	reply.blocks.unshift({ kind: "thinking", text: "先确认两个仓库的状态和工作边界。搜索索引可以增量更新，但账户迁移涉及数据契约，需要保持可回退性。独立 worktree 可以避免并行写入和环境互相污染。主聊天只接收证据并处理可逆决定，不替用户批准生产数据变更。" });
 	reply.blocks.push(...tools.map(tool => ({ kind: "tool" as const, callId: tool.callId })));
@@ -82,8 +84,10 @@ function oldHistory(): TranscriptView {
 }
 
 const promptImages = z.array(z.object({ data: z.string(), mimeType: z.enum(PROMPT_IMAGE_TYPES) }).refine(image => image.data.length * 3 / 4 <= MAX_PROMPT_IMAGE_BYTES, "Image is larger than 5 MB")).max(MAX_PROMPT_IMAGES).optional();
+const promptAttachments = z.array(z.object({ path: z.string() })).max(MAX_ATTACHMENTS).optional();
 
-export function createMockSessions(onCommand: (command: string, sessionId: string) => void) {
+/** `isFolder` stands in for the hub's stat when it writes the attachment block. */
+export function createMockSessions(onCommand: (command: string, sessionId: string) => void, isFolder: (path: string) => boolean) {
 	const views = new Map<string, TranscriptView>();
 	const history = new Map<string, TranscriptView>();
 	const subscribers = new Map<string, Set<SocketHandlers>>();
@@ -98,7 +102,8 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 		const at = Date.now();
 		const key = `${at}-${++sequence}`;
 		emit(id, { t: "item", item: { kind: "user", id: `user-${key}`, at, text, images, from: "human" } });
-		emit(id, { t: "item", item: assistant(`reply-${key}`, text.startsWith("/") ? `Demo command \`${text}\` handled.` : images ? `收到这条消息和 ${images} 张图片。` : "收到。这条消息已加入会话。", at) });
+		const files = parseAttachmentBlock(text).attachments.length;
+		emit(id, { t: "item", item: assistant(`reply-${key}`, text.startsWith("/") ? `Demo command \`${text}\` handled.` : images ? `收到这条消息和 ${images} 张图片。` : files ? `收到这条消息和 ${files} 个附件。` : "收到。这条消息已加入会话。", at) });
 	};
 	/** Like omp's `branch` + prompt: drop the user message at `index` and everything after it, then send `text` in its place. */
 	const rewind = (id: string, index: number, text: string, images: number) => {
@@ -135,17 +140,18 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 			if (action === "commands") return commands;
 			if (action === "history") { const old = history.get(id) ?? oldHistory(); const current = views.get(id) ?? seed(id); const all = [...old.items, ...current.items]; const index = before ? all.findIndex(item => item.id === before) : all.length; const end = index < 0 ? all.length : index; const items = all.slice(Math.max(0, end - 60), end); return { t: "prepend", items, tools: { ...old.tools, ...current.tools }, earlierCursor: end > 60 ? items[0].id : null } satisfies TranscriptEvent; }
 			if (action === "prompt") {
-				const prompt = z.object({ text: z.string(), mode: z.enum(["auto", "steer", "followUp"]).optional(), images: promptImages }).parse(body);
-				if (!prompt.text.trim() && !prompt.images?.length) throw new Error("Message is empty");
+				const prompt = z.object({ text: z.string(), mode: z.enum(["auto", "steer", "followUp"]).optional(), images: promptImages, attachments: promptAttachments }).parse(body);
+				if (!prompt.text.trim() && !prompt.images?.length && !prompt.attachments?.length) throw new Error("Message is empty");
+				const text = withAttachmentBlock(prompt.text, (prompt.attachments ?? []).map(({ path }) => ({ path, folder: isFolder(path) })));
 				onCommand(prompt.text.trim(), id);
 				const view = current(id);
 				if (view.status.phase !== "idle" && !prompt.text.startsWith("/")) {
 					// The demo turn sits in one long step, so steers and follow-ups stay queued until it is stopped.
 					const queue = prompt.mode === "steer" ? "steering" : "followUp";
-					emit(id, { t: "status", patch: { queue: { ...view.status.queue, [queue]: [...view.status.queue[queue], prompt.text] } } });
+					emit(id, { t: "status", patch: { queue: { ...view.status.queue, [queue]: [...view.status.queue[queue], text] } } });
 					return { ok: true };
 				}
-				reply(id, prompt.text, prompt.images?.length ?? 0);
+				reply(id, text, prompt.images?.length ?? 0);
 				return { ok: true };
 			}
 			if (action === "abort") {
@@ -174,10 +180,11 @@ export function createMockSessions(onCommand: (command: string, sessionId: strin
 				return { removed: index >= 0 };
 			}
 			if (action === "edit") {
-				const request = z.object({ itemId: z.string(), text: z.string().min(1), images: promptImages }).parse(body);
+				const request = z.object({ itemId: z.string(), text: z.string(), images: promptImages, attachments: promptAttachments }).parse(body);
+				if (!request.text.trim() && !request.attachments?.length) throw new Error("Message is empty");
 				const index = current(id).items.findIndex(item => item.id === request.itemId && item.kind === "user" && item.from === "human");
 				if (index < 0) throw new Error("Message not found");
-				rewind(id, index, request.text, request.images?.length ?? 0);
+				rewind(id, index, withAttachmentBlock(request.text, (request.attachments ?? []).map(({ path }) => ({ path, folder: isFolder(path) }))), request.images?.length ?? 0);
 				return { ok: true };
 			}
 			if (action === "retry") {

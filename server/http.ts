@@ -6,7 +6,9 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import { MAX_PROMPT_IMAGE_BYTES, MAX_PROMPT_IMAGES, PROMPT_IMAGE_TYPES, type AbortResult, type Language, type StateDTO } from "../shared/api.ts";
+import { MAX_ATTACHMENTS } from "../shared/attachments.ts";
 import { IdError, parseDecisionId, parseEscalationId, parseSessionId, parseTaskId, parseWorkspaceId, parseWorktreeId } from "../shared/ids.ts";
+import { clipboardFiles, pathKinds, storeUpload } from "./attachments.ts";
 import { DEFAULT_HOME, saveConfig, type HubConfig } from "./config.ts";
 import { errorText, fieldErrors, HubError, localizeFieldErrors } from "./errors.ts";
 import { pickFolder } from "./folder-picker.ts";
@@ -30,12 +32,13 @@ export interface ServerOptions {
 	log(message: string): void;
 }
 
-type Handler = (ctx: { params: string[]; url: URL; body: unknown; language: Language }) => unknown;
+type Handler = (ctx: { params: string[]; url: URL; body: unknown; language: Language; req: http.IncomingMessage }) => unknown;
 interface Route {
 	method: string;
 	pattern: RegExp;
 	handler: Handler;
-	bodyLimit: number;
+	/** Largest JSON body; "raw": the handler reads the request stream itself. */
+	bodyLimit: number | "raw";
 }
 
 const MIME: Record<string, string> = {
@@ -84,12 +87,26 @@ const imagesSchema = z
 	)
 	.max(MAX_PROMPT_IMAGES)
 	.default([]);
+const attachmentsSchema = z
+	.array(
+		z.strictObject({
+			path: z
+				.string()
+				.refine(p => path.isAbsolute(p), { ...localizedCheck(validationMessages.absolutePath()), abort: true })
+				// A line break would end the attachment block early.
+				.refine(p => !/[\u0000-\u001f\u007f]/.test(p), { ...localizedCheck(validationMessages.plainPath()), abort: true })
+				.refine(p => fs.existsSync(p), localizedCheck(validationMessages.doesNotExist())),
+		}),
+	)
+	.max(MAX_ATTACHMENTS)
+	.default([]);
 const promptSchema = z
-	.strictObject({ text: z.string().max(20_000), images: imagesSchema, mode: z.enum(["auto", "steer", "followUp"]).optional() })
-	.refine(p => p.text.length > 0 || p.images.length > 0, { ...localizedCheck(validationMessages.textOrImages()), path: ["text"] });
+	.strictObject({ text: z.string().max(20_000), images: imagesSchema, attachments: attachmentsSchema, mode: z.enum(["auto", "steer", "followUp"]).optional() })
+	.refine(p => p.text.length > 0 || p.images.length > 0 || p.attachments.length > 0, { ...localizedCheck(validationMessages.textOrAttachments()), path: ["text"] });
 const editSchema = z
-	.strictObject({ itemId: z.string().min(1), text: z.string().max(20_000), images: imagesSchema })
-	.refine(p => p.text.length > 0 || p.images.length > 0, { ...localizedCheck(validationMessages.textOrImages()), path: ["text"] });
+	.strictObject({ itemId: z.string().min(1), text: z.string().max(20_000), images: imagesSchema, attachments: attachmentsSchema })
+	.refine(p => p.text.length > 0 || p.images.length > 0 || p.attachments.length > 0, { ...localizedCheck(validationMessages.textOrAttachments()), path: ["text"] });
+const pathStatSchema = z.strictObject({ paths: z.array(z.string()).max(MAX_ATTACHMENTS) });
 const queueRemoveSchema = z.strictObject({ message: z.string(), queue: z.enum(["steering", "followUp"]) });
 const queuePromoteSchema = z.strictObject({ message: z.string() });
 const respondSchema = z.strictObject({
@@ -244,9 +261,9 @@ export class HubServer {
 			return;
 		}
 		try {
-			const body = method === "GET" ? undefined : await readJson(req, match.r.bodyLimit);
+			const body = method === "GET" || match.r.bodyLimit === "raw" ? undefined : await readJson(req, match.r.bodyLimit);
 			const params = match.m!.slice(1).map(p => decodeURIComponent(p));
-			const result = await match.r.handler({ params, url, body, language });
+			const result = await match.r.handler({ params, url, body, language, req });
 			send(200, result);
 		} catch (err) {
 			if (err instanceof HubError) send(err.status, { error: err.localized(language), code: err.code, ...(err.errors ? { errors: localizeFieldErrors(err.errors, language) } : {}) });
@@ -342,7 +359,7 @@ export class HubServer {
 		};
 	}
 
-	#route(method: string, pattern: string, handler: Handler, bodyLimit = BODY_LIMIT): void {
+	#route(method: string, pattern: string, handler: Handler, bodyLimit: Route["bodyLimit"] = BODY_LIMIT): void {
 		this.#routes.push({ method, pattern: new RegExp(`^${pattern.replace(/:[a-z]+/g, "([^/]+)")}$`), handler, bodyLimit });
 	}
 
@@ -473,7 +490,7 @@ export class HubServer {
 			"/api/sessions/:id/prompt",
 			async ({ params, body }) => {
 				const p = parse(promptSchema, body);
-				await hub().prompt(parseSessionId(params[0]), p.text, p.mode ?? "auto", p.images);
+				await hub().prompt(parseSessionId(params[0]), p.text, p.mode ?? "auto", p.images, p.attachments);
 				return { ok: true };
 			},
 			MESSAGE_BODY_LIMIT,
@@ -489,7 +506,7 @@ export class HubServer {
 			"/api/sessions/:id/edit",
 			async ({ params, body }) => {
 				const p = parse(editSchema, body);
-				await hub().edit(parseSessionId(params[0]), p.itemId, p.text, p.images);
+				await hub().edit(parseSessionId(params[0]), p.itemId, p.text, p.images, p.attachments);
 				return { ok: true };
 			},
 			MESSAGE_BODY_LIMIT,
@@ -498,6 +515,9 @@ export class HubServer {
 			await hub().retry(parseSessionId(params[0]));
 			return { ok: true };
 		});
+		r("POST", "/api/uploads", ({ req }) => storeUpload(hub().paths.uploads, req), "raw");
+		r("GET", "/api/clipboard/files", () => clipboardFiles());
+		r("POST", "/api/paths/stat", ({ body }) => pathKinds(parse(pathStatSchema, body).paths));
 		r("POST", "/api/sessions/:id/respond", async ({ params, body }) => {
 			const p = parse(respondSchema, body);
 			await hub().respond(parseSessionId(params[0]), p.requestId, p.response);
